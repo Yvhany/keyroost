@@ -17,8 +17,10 @@
 //! the serial-number read.
 //!
 //! Seeds never touch argv or logs; cleartext seed payloads are scrubbed by the
-//! byte layer, and this module redacts seed-bearing APDU bodies from the debug
-//! trace.
+//! byte layer, and this module redacts secret-bearing traffic from the debug
+//! trace in *both* directions: seed-bearing request bodies on the way out, and
+//! `ENUM_CODES` responses (which carry account names and live OTP codes) on the
+//! way back — on the HID and PC/SC transports alike.
 
 use keyroost_token2otp as t2;
 use keyroost_token2otp::entry::{serialize_enum_all, ParseError};
@@ -156,12 +158,43 @@ enum HidIo {
     Hidapi(hidapi::HidDevice),
 }
 
+/// True when the *response* to `apdu` carries user secrets — account names and
+/// live OTP codes — and so must be redacted from the debug trace.
+///
+/// Only the `ENUM_CODES` / `ENUM_CODES_CONTINUE` reads (INS `0xC5`, P1 `0x05`,
+/// P2 `0x00`/`0x01`) return entry data. `WRITE_SEED` shares P1 `0x05` but its
+/// request (not response) is the secret-bearing side and answers with a status
+/// word only; every other command returns public config, the public ECDH key,
+/// the serial, or a bare status word. Keyed off the *original* command so a
+/// `61xx` GET-RESPONSE continuation (which resends a different header) still
+/// inherits the correct verdict.
+fn response_is_sensitive(apdu: &[u8]) -> bool {
+    matches!(
+        (apdu.get(1), apdu.get(2), apdu.get(3)),
+        (Some(&0xC5), Some(&0x05), Some(&0x00) | Some(&0x01))
+    )
+}
+
+/// True when `apdu`'s *request* body carries the encrypted seed blob and should
+/// be redacted from the send trace (`WRITE_SEED` / `WRITE_HOTP_SEED`, spec
+/// §1.3). Shared by both transports so a seed never reaches the trace on either
+/// path.
+fn request_is_sensitive(apdu: &[u8]) -> bool {
+    matches!(apdu.get(1), Some(0xC5))
+        && matches!(apdu.get(2), Some(0x05) | Some(0x00))
+        && matches!(apdu.get(3), Some(0x02) | Some(0x00))
+}
+
 /// USB-HID transport for the Token2 OTP applet (spec §4).
 pub struct HidOtpTransport {
     io: HidIo,
     timeout: Duration,
     button_prompt: Option<ButtonPrompt>,
     debug: bool,
+    /// Set per-command before the response read loop: when the in-flight
+    /// command's response carries secrets ([`response_is_sensitive`]), the raw
+    /// per-frame dump and the parsed-response dump are redacted.
+    resp_sensitive: bool,
 }
 
 impl HidOtpTransport {
@@ -190,6 +223,7 @@ impl HidOtpTransport {
             timeout: Duration::from_secs(20),
             button_prompt: None,
             debug: false,
+            resp_sensitive: false,
         })
     }
 
@@ -257,8 +291,12 @@ impl HidOtpTransport {
             }
         };
         if self.debug {
-            let hex: String = buf[..n].iter().map(|b| format!("{b:02x}")).collect();
-            eprintln!("[token2otp HID raw-frame] ({n} bytes) {hex}");
+            if self.resp_sensitive {
+                eprintln!("[token2otp HID raw-frame] ({n} bytes) <redacted>");
+            } else {
+                let hex: String = buf[..n].iter().map(|b| format!("{b:02x}")).collect();
+                eprintln!("[token2otp HID raw-frame] ({n} bytes) {hex}");
+            }
         }
         Ok(n)
     }
@@ -284,10 +322,12 @@ impl OtpTransport for HidOtpTransport {
     ) -> Result<(Vec<u8>, u16), OtpTransportError> {
         // Seed-bearing commands (WRITE_SEED / WRITE_HOTP_SEED) carry the ECDH
         // blob; redact those from the trace (matches the OATH PUT redaction).
-        let sensitive = matches!(apdu.get(1), Some(0xC5))
-            && matches!(apdu.get(2), Some(0x05) | Some(0x00))
-            && matches!(apdu.get(3), Some(0x02) | Some(0x00));
-        self.trace("send", apdu, sensitive);
+        self.trace("send", apdu, request_is_sensitive(apdu));
+
+        // Decide once whether the response frames carry secrets (ENUM_CODES
+        // entries: account names + live OTP codes) so the per-frame and parsed
+        // dumps below redact them. Kept for the whole transaction.
+        self.resp_sensitive = response_is_sensitive(apdu);
 
         for frame in hidframe::build_send_frames(apdu) {
             self.write_report(&frame)?;
@@ -320,10 +360,17 @@ impl OtpTransport for HidOtpTransport {
             .into_response()
             .ok_or(OtpTransportError::EmptyResponse)?;
         if self.debug {
-            let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
-            eprintln!("[token2otp HID parsed] data={hex} sw={sw:#06x}");
+            if self.resp_sensitive {
+                eprintln!(
+                    "[token2otp HID parsed] data=<{} bytes redacted> sw={sw:#06x}",
+                    data.len()
+                );
+            } else {
+                let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
+                eprintln!("[token2otp HID parsed] data={hex} sw={sw:#06x}");
+            }
         }
-        self.trace("recv", &data, false);
+        self.trace("recv", &data, self.resp_sensitive);
         Ok((data, sw))
     }
 
@@ -431,9 +478,17 @@ impl PcScOtpTransport {
     }
 
     fn raw_transmit(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u16), OtpTransportError> {
+        // Keyed off the original command: a `61xx` GET-RESPONSE continuation
+        // resends a different header into `to_send`, but the secret verdict must
+        // follow the command the user actually issued.
+        let resp_sensitive = response_is_sensitive(apdu);
         if self.debug {
-            let hex: String = apdu.iter().map(|b| format!("{b:02x}")).collect();
-            eprintln!("[token2otp PCSC send] {hex}");
+            if request_is_sensitive(apdu) {
+                eprintln!("[token2otp PCSC send] <{} bytes redacted>", apdu.len());
+            } else {
+                let hex: String = apdu.iter().map(|b| format!("{b:02x}")).collect();
+                eprintln!("[token2otp PCSC send] {hex}");
+            }
         }
         // Remember which applet a SELECT switches us to (SELECT = `00 A4 04 00
         // Lc aid...`), so the reset-recovery path below can re-SELECT it. This
@@ -504,8 +559,12 @@ impl PcScOtpTransport {
                 Err(e) => return Err(OtpTransportError::Pcsc(e)),
             };
             if self.debug {
-                let hex: String = resp.iter().map(|b| format!("{b:02x}")).collect();
-                eprintln!("[token2otp PCSC recv] {hex}");
+                if resp_sensitive {
+                    eprintln!("[token2otp PCSC recv] <{} bytes redacted>", resp.len());
+                } else {
+                    let hex: String = resp.iter().map(|b| format!("{b:02x}")).collect();
+                    eprintln!("[token2otp PCSC recv] {hex}");
+                }
             }
             if resp.len() < 2 {
                 return Err(OtpTransportError::EmptyResponse);
@@ -992,5 +1051,59 @@ pub fn otp_type_str(t: OtpType) -> &'static str {
     match t {
         OtpType::Hotp => "HOTP",
         OtpType::Totp => "TOTP",
+    }
+}
+
+#[cfg(test)]
+mod trace_redaction_tests {
+    use super::response_is_sensitive;
+    use keyroost_token2otp::cmd;
+
+    #[test]
+    fn enum_reads_have_sensitive_responses() {
+        // ENUM_CODES and its continuation return account names + live OTP codes.
+        assert!(response_is_sensitive(&cmd::ENUM_CODES));
+        assert!(response_is_sensitive(&cmd::ENUM_CODES_CONTINUE));
+        // Trailing body bytes (subcommand, timestamp) don't change the verdict.
+        let mut enum_with_body = cmd::ENUM_CODES.to_vec();
+        enum_with_body.extend_from_slice(&[cmd::SUB_READ_ONE, b'a', b'c', b'c', b't']);
+        assert!(response_is_sensitive(&enum_with_body));
+    }
+
+    #[test]
+    fn write_seed_response_is_not_sensitive() {
+        // WRITE_SEED shares P1=0x05 but answers with a status word only, so its
+        // response carries no secret even though its *request* does.
+        assert!(!response_is_sensitive(&cmd::WRITE_SEED));
+    }
+
+    #[test]
+    fn public_and_status_only_responses_are_not_sensitive() {
+        // ECDH pubkey and device config are public; the serial read and a bare
+        // GET RESPONSE / SELECT return non-secret bytes or a status word.
+        assert!(!response_is_sensitive(&cmd::GET_ECDH_PUBKEY));
+        assert!(!response_is_sensitive(&cmd::READ_CONFIG));
+        assert!(!response_is_sensitive(&cmd::READ_SERIAL_INS));
+        assert!(!response_is_sensitive(&[0x00, 0xC0, 0x00, 0x00, 0x20])); // GET RESPONSE
+        assert!(!response_is_sensitive(&[0x00, 0xA4, 0x04, 0x00])); // SELECT
+    }
+
+    #[test]
+    fn short_apdu_is_not_sensitive() {
+        assert!(!response_is_sensitive(&[]));
+        assert!(!response_is_sensitive(&[0x80, 0xC5]));
+        assert!(!response_is_sensitive(&[0x80, 0xC5, 0x05]));
+    }
+
+    #[test]
+    fn seed_write_requests_are_redacted() {
+        use super::request_is_sensitive;
+        // The request body carries the ECDH-sealed seed on both write paths.
+        assert!(request_is_sensitive(&cmd::WRITE_SEED));
+        assert!(request_is_sensitive(&cmd::WRITE_HOTP_SEED));
+        // A read command's request has no secret and stays in the clear.
+        assert!(!request_is_sensitive(&cmd::GET_ECDH_PUBKEY));
+        assert!(!request_is_sensitive(&cmd::READ_CONFIG));
+        assert!(!request_is_sensitive(&[0x00, 0xA4, 0x04, 0x00]));
     }
 }
