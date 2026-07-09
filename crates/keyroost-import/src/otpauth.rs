@@ -134,8 +134,10 @@ pub fn parse(uri: &str) -> Result<OtpAuth, OtpAuthError> {
     if !typ.eq_ignore_ascii_case("totp") {
         return Err(OtpAuthError::UnsupportedType(typ.to_owned()));
     }
-    let label =
-        percent_decode(label_raw).map_err(|_| OtpAuthError::Malformed("label percent-encoding"))?;
+    // The label is a URI path segment, not a form-encoded query value, so a
+    // literal '+' must be preserved (only query values decode '+' to space).
+    let label = percent_decode_keep_plus(label_raw)
+        .map_err(|_| OtpAuthError::Malformed("label percent-encoding"))?;
 
     // Defaults per the spec. The decoded secret text is held in Zeroizing so it
     // is wiped on *every* exit — including an error in a later param (algorithm,
@@ -219,13 +221,23 @@ pub fn parse(uri: &str) -> Result<OtpAuth, OtpAuthError> {
     })
 }
 
+/// Percent-decode a query value: `+` decodes to a space (form-encoding).
 fn percent_decode(s: &str) -> Result<String, ()> {
+    percent_decode_impl(s, true)
+}
+
+/// Percent-decode a URI path segment (the label): `+` is a literal plus.
+fn percent_decode_keep_plus(s: &str) -> Result<String, ()> {
+    percent_decode_impl(s, false)
+}
+
+fn percent_decode_impl(s: &str, plus_is_space: bool) -> Result<String, ()> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'+' => {
+            b'+' if plus_is_space => {
                 out.push(b' ');
                 i += 1;
             }
@@ -278,6 +290,18 @@ mod tests {
             parse("https://example.com"),
             Err(OtpAuthError::NotOtpAuth)
         ));
+    }
+
+    #[test]
+    fn plus_in_label_is_literal_but_space_in_query() {
+        // In a path segment (the label) '+' is a literal plus, not a space —
+        // only application/x-www-form-urlencoded *query* values decode '+' to
+        // space. A '%20' in the label is still a space.
+        let p = parse("otpauth://totp/alice+work%20a?secret=JBSWY3DPEHPK3PXP&issuer=Acme+Co")
+            .unwrap();
+        assert_eq!(p.account.as_deref(), Some("alice+work a"));
+        // The issuer query param keeps form-encoding: '+' becomes a space.
+        assert_eq!(p.issuer.as_deref(), Some("Acme Co"));
     }
 
     #[test]
