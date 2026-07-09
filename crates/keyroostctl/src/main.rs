@@ -2726,16 +2726,19 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
                     }
                 }
             } else {
-                let uri = match uri.as_deref() {
-                    // `-` reads the URI (whose secret= parameter is the seed)
-                    // from stdin so it stays out of /proc/*/cmdline and history.
+                // The URI embeds the seed in its secret= parameter; hold it in
+                // Zeroizing so our copy is scrubbed after parse_otpauth (which
+                // wipes its own copies).
+                let uri: zeroize::Zeroizing<String> = match uri.as_deref() {
+                    // `-` reads the URI from stdin so it stays out of
+                    // /proc/*/cmdline and shell history.
                     Some("-") => {
                         use std::io::BufRead;
-                        let mut line = String::new();
+                        let mut line = zeroize::Zeroizing::new(String::new());
                         std::io::stdin().lock().read_line(&mut line)?;
-                        line.trim_end_matches(['\r', '\n']).to_owned()
+                        zeroize::Zeroizing::new(line.trim_end_matches(['\r', '\n']).to_owned())
                     }
-                    Some(u) => u.to_owned(),
+                    Some(u) => zeroize::Zeroizing::new(u.to_owned()),
                     None => return Err("import requires an otpauth:// URI or --qr <image>".into()),
                 };
                 keyroost_import::parse_otpauth(&uri)?.into()
