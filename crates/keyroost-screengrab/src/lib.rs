@@ -36,6 +36,18 @@ pub fn capture_virtual_screen() -> Result<Frame, String> {
             return Err("no virtual screen to capture".into());
         }
 
+        // Size the RGBA readback buffer up front with checked arithmetic, before
+        // allocating any GDI objects. On a 32-bit build `usize` is 32-bit, so a
+        // very large multi-monitor virtual desktop could overflow `w * h * 4`;
+        // GetDIBits writes `w * h * 4` bytes based on the header dimensions, so
+        // an undersized buffer from a wrapped length would be a heap overflow.
+        // (This crate is published to crates.io, where a consumer's release
+        // profile may not enable overflow-checks — so don't rely on those.)
+        let buf_len = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or("virtual screen dimensions too large to capture")?;
+
         let screen = GetDC(std::ptr::null_mut());
         if screen.is_null() {
             return Err("GetDC(screen) failed".into());
@@ -67,7 +79,7 @@ pub fn capture_virtual_screen() -> Result<Frame, String> {
             biCompression: BI_RGB,
             ..core::mem::zeroed()
         };
-        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+        let mut buf = vec![0u8; buf_len];
         let lines = GetDIBits(
             mem,
             bmp,
