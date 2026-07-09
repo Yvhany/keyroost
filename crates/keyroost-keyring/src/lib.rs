@@ -313,6 +313,14 @@ impl Keyring {
     }
 
     /// Persist to a specific path, creating parent dirs. Opt-in.
+    /// Concurrency: this is a load-modify-save with no file lock. The temp-file
+    /// + atomic-rename below means a save can never *corrupt* the registry (a
+    /// reader always sees a complete old or new file), but two processes editing
+    /// concurrently (e.g. the CLI and GUI both adding a name) are last-writer-
+    /// wins — the earlier edit is lost. That is accepted: `keys.json` is a
+    /// per-user convenience registry written rarely and interactively, so the
+    /// collision window is tiny and the only loss is one un-persisted rename, not
+    /// data integrity. Add advisory locking only if that assumption stops holding.
     pub fn save_to(&self, path: &Path) -> Result<(), KeyringError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;

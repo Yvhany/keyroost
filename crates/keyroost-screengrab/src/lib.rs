@@ -64,7 +64,17 @@ pub fn capture_virtual_screen() -> Result<Frame, String> {
             ReleaseDC(std::ptr::null_mut(), screen);
             return Err("could not allocate a capture buffer".into());
         }
+        // SelectObject returns the previously selected object, or NULL on
+        // failure. A memory DC always has a default 1x1 bitmap selected, so a
+        // null here means the call failed and the bitmap isn't selected — the
+        // blit/readback would produce garbage, so clean up and bail.
         let prev = SelectObject(mem, bmp as _);
+        if prev.is_null() {
+            DeleteObject(bmp as _);
+            DeleteDC(mem);
+            ReleaseDC(std::ptr::null_mut(), screen);
+            return Err("SelectObject(capture bitmap) failed".into());
+        }
 
         let blit_ok = BitBlt(mem, 0, 0, w, h, screen, x, y, SRCCOPY) != 0;
 
