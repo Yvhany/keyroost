@@ -29,22 +29,23 @@ tool. Workspace contains:
 | Crate | Purpose | External deps |
 |---|---|---|
 | `keyroost-proto` | Pure-Rust protocol layer (SM4, SHA-1, APDU builders, MAC) | none |
-| `keyroost-transport` | PC/SC reader discovery, Molto2 session, YubiKey CCID serial, OATH + OpenPGP applets | `pcsc` |
-| `keyroost-hid` | USB HID enumeration of FIDO devices via sysfs | none |
-| `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential mgmt | none |
-| `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer (APDU + TLV) | none |
-| `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | none |
-| `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management (status, GENERAL AUTHENTICATE, key-gen, cert import, PIN/PUK/mgmt-key, reset) + SPKI/PEM | none |
+| `keyroost-transport` | PC/SC reader discovery, Molto2 session, YubiKey CCID serial, OATH + OpenPGP applets | `pcsc`; `aes`/`des`/`cipher`/`getrandom`/`zeroize` (PIV mgmt-key auth); `hidapi` (non-Linux HID) |
+| `keyroost-hid` | USB HID enumeration of FIDO devices via sysfs | `hidapi` (non-Linux only; Linux uses sysfs) |
+| `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential mgmt | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`), `rand_core`, `zeroize`; `hidapi` (non-Linux HID) |
+| `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer (APDU + TLV) | `zeroize` |
+| `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | `zeroize` |
+| `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management (status, GENERAL AUTHENTICATE, key-gen, cert import, PIN/PUK/mgmt-key, reset) + SPKI/PEM | `zeroize` |
 | `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO management byte layer (APDU + HID framing, ECDH+AES seed encryption) | RustCrypto (`sha2`/`aes`/`cbc`/`p256`), `zeroize` |
 | `keyroost-token2prog` | Pure-Rust Token2 2nd-gen single-profile programmable-token protocol (SM4 seed/MAC, config TLV); reuses `keyroost-proto` | none |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`); serial matching, no hardware | `serde`, `serde_json` |
 | `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) | in-tree only |
 | `keyroost-rsakey` | Host-side RSA-2048 keygen + PKCS#1/PKCS#8 (PEM/DER) loading for OpenPGP import | `rsa`, `rand` (scoped exception) |
-| `keyroost-import` | otpauth:// + Aegis / 2FAS / otpauth-list parsers | `serde`, `serde_json` (behind `bulk` feature) |
+| `keyroost-import` | otpauth:// + Aegis / 2FAS / otpauth-list parsers | `zeroize`; `serde`/`serde_json` (behind `bulk`); `scrypt`/`aes-gcm`/`base64` (behind `encrypted`, for Aegis vaults) |
 | `keyroost-qr` | QR 2FA import from PNG/JPEG screenshots + Google Authenticator migration batches (behind `qr` feature) | `rqrr`, `png`, `jpeg-decoder` |
-| `keyroost-winwebauthn` | Windows-only non-admin FIDO2 helper: detect a FIDO key, open Windows' security-key settings, relaunch elevated; inert on non-Windows | none |
-| `keyroostctl` | CLI binary | `clap` |
-| `keyroost` | egui desktop GUI | `eframe`, `egui` |
+| `keyroost-screengrab` | Windows-only GDI screen capture for QR-from-screen; the sole `unsafe` FFI crate; inert on non-Windows | `windows-sys` (Windows only) |
+| `keyroost-winwebauthn` | Windows-only non-admin FIDO2 helper: detect a FIDO key, open Windows' security-key settings, relaunch elevated; inert on non-Windows | `windows-sys` (Windows only) |
+| `keyroostctl` | CLI binary | `clap` (+ `clap_complete`/`clap_mangen`) |
+| `keyroost` | egui desktop GUI | `eframe`, `egui`, plus platform UI deps (`arboard`, `rfd`, `pollster`; Linux `ashpd`/`x11rb`; `png`) |
 
 ## Where to start reading
 
@@ -92,9 +93,14 @@ workflow during bring-up is:
 
 - **Don't push to remote without explicit user permission.** Local commits are
   fine; `git push` only when the user says so.
-- **Vendor over depend.** SM4, SHA-1, base32, hex, and otpauth parsing are all
-  in-tree. PCSC, clap, eframe, serde are the only acceptable external deps.
-  No new deps without a discussion first.
+- **Vendor over depend.** SM4, SHA-1, base32, hex, CBOR, TLV, and otpauth
+  parsing are all in-tree. External deps are limited to a small, deliberate set
+  of scoped exceptions — the transport/UI boundary (`pcsc`, `clap`,
+  `eframe`/`egui` + platform UI crates, `serde`), FFI-only crates
+  (`hidapi` off-Linux, `windows-sys` on Windows), and vetted RustCrypto/`rsa`/
+  `scrypt`/`aes-gcm`/`zeroize`/`getrandom` where hand-rolling the primitive
+  would be irresponsible (see the per-crate deps in the table above). No new
+  deps without a discussion first.
 - **No documentation files unless explicitly asked.** The two files in `docs/`
   exist for legal posture and bring-up; don't add more without asking.
 - **Tests first when changing the protocol layer.** The known-answer suite in
@@ -107,7 +113,7 @@ workflow during bring-up is:
 ## Running
 
 ```bash
-# all 50+ tests
+# the whole workspace test suite
 cargo test --workspace --offline
 
 # CLI
@@ -140,7 +146,7 @@ host secrets as untouchable. A PreToolUse hook (`.claude/hooks/guard.sh`)
 enforces the rules below; **don't try to work around the guard** — if it
 blocks something, that's intended.
 
-- **Destructive FIDO ops** (`keyroostctl fido-reset`, `fido-creds-delete`) are
+- **Destructive FIDO ops** (`keyroostctl fido reset`, `fido creds-delete`) are
   irreversible. This checkout is used only with disposable **test keys**, so
   the guard no longer blocks them — still treat them with care and never point
   them at a security key in real use.
@@ -150,8 +156,8 @@ blocks something, that's intended.
 - **PIN entry is the user's job.** PINs come from `--pin-env` / `--pin-stdin`
   the user sets in their own shell. Don't ask for the PIN, don't place it in
   argv, don't read it back.
-- **Credential listings are private.** `fido-creds-list` reveals which services
+- **Credential listings are private.** `fido creds-list` reveals which services
   the user has accounts with. Don't run it speculatively; if the user shares
   output, don't echo usernames / RP names beyond what the task needs.
-- **Safe to run freely against any key:** `keyroostctl list`, `keyroostctl fido-info`,
-  `keyroostctl fido-pin-retries` (read-only, no PIN, no counter change).
+- **Safe to run freely against any key:** `keyroostctl list`, `keyroostctl fido info`,
+  `keyroostctl fido pin-retries` (read-only, no PIN, no counter change).
