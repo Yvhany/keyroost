@@ -876,9 +876,10 @@ fn strip_leading_zero(field: &[u8]) -> &[u8] {
 fn pad_exponent(e: &[u8], reqlen: usize) -> Vec<u8> {
     let e = strip_leading_zero(e);
     // An exponent wider than the card's declared field can't be imported
-    // faithfully — truncating it would import a *different* key. Host-supplied
-    // input (e is from the caller's key, reqlen from the card), so assert
-    // rather than silently corrupt.
+    // faithfully — truncating it would import a *different* key. `reqlen` is
+    // derived from the card's declared `e_bits`, so a malformed/hostile
+    // attribute could make this fire; callers with a device-supplied `e_bits`
+    // must gate on [`rsa_exponent_fits`] first (the transport layer does).
     assert!(
         e.len() <= reqlen,
         "RSA exponent is wider than the card's declared exponent field"
@@ -886,6 +887,17 @@ fn pad_exponent(e: &[u8], reqlen: usize) -> Vec<u8> {
     let mut out = vec![0u8; reqlen];
     out[reqlen - e.len()..].copy_from_slice(e);
     out
+}
+
+/// True when exponent `e` fits the card's declared exponent field, `e_bits`
+/// wide. [`import_rsa_key`] / [`extended_header_list`] **panic** when it does
+/// not, so a caller passing a device-supplied `e_bits` (e.g. from
+/// [`parse_rsa_algorithm_attributes`]) must check this first and reject — a
+/// card advertising an implausibly small exponent field would otherwise abort
+/// the process mid-import.
+#[must_use]
+pub fn rsa_exponent_fits(e: &[u8], e_bits: u16) -> bool {
+    strip_leading_zero(e).len() <= e_bits.div_ceil(8) as usize
 }
 
 /// Build just the `0x4D` Extended Header List object for an RSA key import
@@ -1451,6 +1463,18 @@ pub fn parse_generated_public_key(buf: &[u8]) -> Result<PublicKey, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rsa_exponent_fits_bounds() {
+        // Standard F4 exponent 0x01_00_01 is 3 bytes; a 17-bit field rounds up
+        // to 3 bytes and fits. Leading zeros are stripped before measuring.
+        assert!(rsa_exponent_fits(&[0x01, 0x00, 0x01], 17));
+        assert!(rsa_exponent_fits(&[0x00, 0x01, 0x00, 0x01], 32));
+        // A hostile/garbled card attribute claiming an 8-bit (or zero) exponent
+        // field cannot hold 0x01_00_01 — reject rather than panic in the builder.
+        assert!(!rsa_exponent_fits(&[0x01, 0x00, 0x01], 8));
+        assert!(!rsa_exponent_fits(&[0x01, 0x00, 0x01], 0));
+    }
 
     // --- APDU framing ----------------------------------------------------
 

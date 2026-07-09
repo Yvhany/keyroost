@@ -124,6 +124,11 @@ pub enum TransportError {
     /// short-APDU body. Caught before building the APDU (the pure builder would
     /// otherwise panic); reachable from an imported otpauth:// URI or QR code.
     OathCredentialTooLong,
+    /// The RSA key's public exponent is wider than the OpenPGP card's declared
+    /// exponent field (`e_bits`). Caught before building the import (the pure
+    /// builder would otherwise panic); guards against a malformed card
+    /// attribute as well as a genuine key/card mismatch.
+    OpenPgpExponentTooWide,
 }
 
 impl fmt::Display for TransportError {
@@ -227,6 +232,11 @@ impl fmt::Display for TransportError {
                 f,
                 "OATH credential name/secret is too long for the card \
                  (name + secret must fit a 255-byte command)"
+            ),
+            TransportError::OpenPgpExponentTooWide => write!(
+                f,
+                "the key's RSA public exponent is wider than this OpenPGP card's \
+                 declared exponent field"
             ),
         }
     }

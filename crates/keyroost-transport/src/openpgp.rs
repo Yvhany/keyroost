@@ -284,6 +284,13 @@ impl OpenPgpSession {
     ) -> Result<(), TransportError> {
         let attrs = self.rsa_attributes(crt)?;
 
+        // The card declares its exponent-field width; the pure builder pads the
+        // key's exponent to it and panics if the exponent is wider (a malformed
+        // attribute like e_bits=8 would otherwise abort mid-import). Reject it.
+        if !pgp::rsa_exponent_fits(key.e, attrs.e_bits) {
+            return Err(TransportError::OpenPgpExponentTooWide);
+        }
+
         // Setting KEYROOST_OPENPGP_FORCE_CHAINING forces the command-chaining path
         // (so the fallback can be exercised on a card that also accepts extended
         // length, e.g. for verification). Otherwise: extended length first.
