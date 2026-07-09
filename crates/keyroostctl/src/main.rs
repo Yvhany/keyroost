@@ -6664,6 +6664,48 @@ mod cli_tests {
     }
 
     #[test]
+    fn security_sensitive_flags_decode_to_expected_fields() {
+        // Grammar-only `is_ok()` tests can't catch a field-mapping regression
+        // (exactly what the --device collision was). Assert the *decoded values*
+        // for the flags where a silent mis-wire is dangerous.
+
+        // A destructive op's --yes must actually land in its confirm field —
+        // and be false when omitted (so the op can't run unconfirmed).
+        match parse(&["keyroostctl", "molto", "reset", "--yes"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Molto {
+                cmd: MoltoCmd::Reset { yes, .. },
+                ..
+            }) => assert!(yes),
+            _ => panic!("expected molto reset"),
+        }
+        match parse(&["keyroostctl", "molto", "reset"]).unwrap().command {
+            Some(Cmd::Molto {
+                cmd: MoltoCmd::Reset { yes, .. },
+                ..
+            }) => assert!(!yes),
+            _ => panic!("expected molto reset"),
+        }
+
+        // A stdin secret source must route to its own field, not somewhere else.
+        match parse(&["keyroostctl", "fido", "pin-set", "--new-pin-stdin"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Fido {
+                cmd: FidoCmd::PinSet { new_pin_stdin, .. },
+            }) => assert!(new_pin_stdin),
+            _ => panic!("expected fido pin-set"),
+        }
+
+        // Global flags decode as themselves.
+        let g = parse(&["keyroostctl", "--json", "--debug", "piv", "status"]).unwrap();
+        assert!(g.json && g.debug && g.device.is_none());
+    }
+
+    #[test]
     fn oath_add_positional_name_does_not_hijack_device_selector() {
         // Regression: a subcommand's `name` arg must not be consumed as the
         // global device selector. That happened when the global selector shared
