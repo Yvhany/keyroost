@@ -1848,14 +1848,10 @@ impl App {
                         app.authenticated = true;
                         app.log(Severity::Ok, "authenticated");
                     }
-                    Err(TransportError::AuthFailed { tries_remaining }) => {
-                        app.log(
-                            Severity::Err,
-                            format!(
-                                "authentication failed (wrong customer key); {} attempt(s) left",
-                                tries_remaining
-                            ),
-                        );
+                    // The Display impl renders the tries-remaining count (or
+                    // "unknown" when the card gave none).
+                    Err(e @ TransportError::AuthFailed { .. }) => {
+                        app.log(Severity::Err, e.to_string());
                     }
                     Err(e) => app.log(Severity::Err, format!("auth failed: {}", e)),
                 }

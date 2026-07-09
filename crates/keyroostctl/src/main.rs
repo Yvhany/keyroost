@@ -2525,12 +2525,10 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
             let key = customer_key_bytes(key)?;
             match session.authenticate(&key) {
                 Ok(()) => println!("authenticated"),
-                Err(TransportError::AuthFailed { tries_remaining }) => {
-                    return Err(format!(
-                        "authentication failed (wrong customer key); {} attempt(s) left",
-                        tries_remaining
-                    )
-                    .into());
+                // The Display impl renders the tries-remaining count (or
+                // "unknown" when the card gave none).
+                Err(e @ TransportError::AuthFailed { .. }) => {
+                    return Err(e.to_string().into());
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -2562,13 +2560,8 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
     print_info(&info);
     match session.authenticate(&key) {
         Ok(()) => println!("authenticated"),
-        Err(TransportError::AuthFailed { tries_remaining }) => {
-            return Err(format!(
-                "authentication failed (wrong customer key); {} attempt(s) left",
-                tries_remaining
-            )
-            .into());
-        }
+        // The Display impl renders the tries-remaining count (or "unknown").
+        Err(e @ TransportError::AuthFailed { .. }) => return Err(e.to_string().into()),
         Err(e) => return Err(e.into()),
     }
 

@@ -68,7 +68,7 @@ pub enum TransportError {
         sw2: u8,
     },
     /// Authentication failed; device reports tries remaining.
-    AuthFailed { tries_remaining: u8 },
+    AuthFailed { tries_remaining: Option<u8> },
     /// Response payload was shorter than expected.
     ShortResponse {
         label: &'static str,
@@ -151,13 +151,17 @@ impl fmt::Display for TransportError {
             TransportError::Apdu { label, sw1, sw2 } => {
                 write!(f, "device rejected {}: SW={:02X}{:02X}", label, sw1, sw2)
             }
-            TransportError::AuthFailed { tries_remaining } => {
-                write!(
+            TransportError::AuthFailed { tries_remaining } => match tries_remaining {
+                Some(n) => write!(
                     f,
                     "authentication failed (wrong customer key); {} attempt(s) remaining",
-                    tries_remaining
-                )
-            }
+                    n
+                ),
+                None => write!(
+                    f,
+                    "authentication failed (wrong customer key); attempts remaining unknown"
+                ),
+            },
             TransportError::ShortResponse {
                 label,
                 got,
@@ -1074,19 +1078,27 @@ fn molto2_cmd_sensitive(apdu: &[u8]) -> bool {
     matches!(apdu.get(1), Some(0xC5) | Some(0xD7) | Some(0xCE))
 }
 
-/// Decode the remaining-attempts counter from SW2 of a `63xx` auth-failure.
+/// Decode the ISO-7816 `63 Cx` "warning, x retries remaining" status word.
 ///
-/// The Molto2 reports it in the ISO-7816 `63 Cx` form, where the low nibble
-/// `x` is the number of attempts left — verified on hardware, which returned
-/// `63 C7` with 7 tries remaining. Reading the raw SW2 byte reported `0xC7`
-/// (199). For a device that instead reports a plain count (no `Cx` marker) the
-/// byte is passed through unchanged.
-fn auth_tries_remaining(sw2: u8) -> u8 {
-    if sw2 & 0xF0 == 0xC0 {
-        sw2 & 0x0F
-    } else {
-        sw2
-    }
+/// Returns `Some(x)` only for the genuine `Cx` form. Any other `63 xx` —
+/// notably `63 00`, "warning, no information given" — yields `None`: an
+/// *unknown* count, not zero. This is the single decoder for every applet
+/// (Molto2 auth, OpenPGP and PIV PINs); keep interpretation changes here.
+pub(crate) fn sw_tries_remaining(sw: u16) -> Option<u8> {
+    ((sw & 0xFFF0) == 0x63C0).then(|| (sw & 0x000F) as u8)
+}
+
+/// Decode the remaining-attempts counter from SW2 of a Molto2 `63xx`
+/// auth-failure.
+///
+/// The Molto2 reports it in the ISO-7816 `63 Cx` form — verified on hardware,
+/// which returned `63 C7` with 7 tries remaining. A device that instead
+/// reports a plain small count (no `Cx` marker) is accepted as a legacy
+/// fallback; `63 00` and anything else decodes to `None` (unknown), never to
+/// a fabricated "0 attempts left".
+fn auth_tries_remaining(sw2: u8) -> Option<u8> {
+    sw_tries_remaining(0x6300 | u16::from(sw2))
+        .or_else(|| ((0x01..=0x0F).contains(&sw2)).then_some(sw2))
 }
 
 /// Hex-dump a response APDU for `--debug` traces, hiding the payload of
@@ -1173,11 +1185,25 @@ mod redaction_tests {
         // The Molto2 reports the auth retry counter in ISO-7816 `63 Cx` form
         // (low nibble = tries remaining) — verified on hardware, which returned
         // `63 C7` with 7 attempts left. Reading the raw SW2 byte reported 199.
-        assert_eq!(auth_tries_remaining(0xC7), 7);
-        assert_eq!(auth_tries_remaining(0xC0), 0);
-        assert_eq!(auth_tries_remaining(0xCA), 10);
+        assert_eq!(auth_tries_remaining(0xC7), Some(7));
+        assert_eq!(auth_tries_remaining(0xC0), Some(0));
+        assert_eq!(auth_tries_remaining(0xCA), Some(10));
         // A device that reports a plain count (< 0xCx form) is passed through.
-        assert_eq!(auth_tries_remaining(0x03), 3);
+        assert_eq!(auth_tries_remaining(0x03), Some(3));
+        // `63 00` is ISO "warning, no information" — the count is unknown,
+        // not zero; reporting Some(0) would falsely tell the user the key is
+        // out of attempts.
+        assert_eq!(auth_tries_remaining(0x00), None);
+        assert_eq!(auth_tries_remaining(0x81), None);
+    }
+
+    #[test]
+    fn sw_tries_remaining_only_decodes_cx_form() {
+        assert_eq!(sw_tries_remaining(0x63C5), Some(5));
+        assert_eq!(sw_tries_remaining(0x63C0), Some(0));
+        assert_eq!(sw_tries_remaining(0x6300), None);
+        assert_eq!(sw_tries_remaining(0x6983), None);
+        assert_eq!(sw_tries_remaining(0x9000), None);
     }
 
     #[test]

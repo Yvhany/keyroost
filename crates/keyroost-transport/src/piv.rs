@@ -137,8 +137,8 @@ impl PivSession {
     /// (blocked) → `Some(0)`, `9000` (already verified) / anything else → `None`.
     fn pin_retries(&mut self) -> Option<u8> {
         let (_, sw) = self.transmit_full(&piv::verify_pin_status()).ok()?;
-        if sw & 0xFFF0 == 0x63C0 {
-            Some((sw & 0x000F) as u8)
+        if let Some(n) = crate::sw_tries_remaining(sw) {
+            Some(n)
         } else if sw == 0x6983 {
             Some(0)
         } else {
@@ -581,9 +581,9 @@ fn ok_or_write(label: &'static str, sw: u16) -> Result<(), TransportError> {
 fn map_pin_sw(sw: u16) -> Result<(), TransportError> {
     if sw == piv::SW_OK {
         Ok(())
-    } else if sw & 0xFFF0 == 0x63C0 {
+    } else if let Some(n) = crate::sw_tries_remaining(sw) {
         Err(TransportError::PivPinRejected {
-            tries_remaining: Some((sw & 0x000F) as u8),
+            tries_remaining: Some(n),
         })
     } else if sw == piv::SW_AUTH_BLOCKED {
         Err(TransportError::PivPinRejected {

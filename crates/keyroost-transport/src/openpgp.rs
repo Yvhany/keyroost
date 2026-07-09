@@ -162,9 +162,9 @@ impl OpenPgpSession {
             return Ok(());
         }
         // Spec form: 63Cx = verification failed, x tries remaining.
-        if (sw & 0xFFF0) == 0x63C0 {
+        if let Some(n) = crate::sw_tries_remaining(sw) {
             return Err(TransportError::OpenPgpPinRejected {
-                tries_remaining: Some((sw & 0x000F) as u8),
+                tries_remaining: Some(n),
             });
         }
         // YubiKey form: a failed VERIFY returns 6982/6983 without an embedded
@@ -199,9 +199,9 @@ impl OpenPgpSession {
     /// wrong PIN (`63Cx`, or `6982`/`6983` followed by a PW-status read), else a
     /// generic APDU error labelled `label`.
     fn pin_rejected(&mut self, sw: u16, pw_ref: u8, label: &'static str) -> TransportError {
-        if (sw & 0xFFF0) == 0x63C0 {
+        if let Some(n) = crate::sw_tries_remaining(sw) {
             return TransportError::OpenPgpPinRejected {
-                tries_remaining: Some((sw & 0x000F) as u8),
+                tries_remaining: Some(n),
             };
         }
         if sw == 0x6982 || sw == 0x6983 {
