@@ -654,9 +654,10 @@ pub fn parse_list(buf: &[u8]) -> Result<Vec<CredentialInfo>, ParseError> {
         let Some(&prefix) = value.first() else {
             continue;
         };
-        let (Some(oath_type), Some(algorithm)) =
-            (OathType::from_prefix(prefix), Algorithm::from_prefix(prefix))
-        else {
+        let (Some(oath_type), Some(algorithm)) = (
+            OathType::from_prefix(prefix),
+            Algorithm::from_prefix(prefix),
+        ) else {
             continue;
         };
         let Ok(name) = core::str::from_utf8(&value[1..]) else {

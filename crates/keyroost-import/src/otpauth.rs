@@ -297,8 +297,8 @@ mod tests {
         // In a path segment (the label) '+' is a literal plus, not a space —
         // only application/x-www-form-urlencoded *query* values decode '+' to
         // space. A '%20' in the label is still a space.
-        let p = parse("otpauth://totp/alice+work%20a?secret=JBSWY3DPEHPK3PXP&issuer=Acme+Co")
-            .unwrap();
+        let p =
+            parse("otpauth://totp/alice+work%20a?secret=JBSWY3DPEHPK3PXP&issuer=Acme+Co").unwrap();
         assert_eq!(p.account.as_deref(), Some("alice+work a"));
         // The issuer query param keeps form-encoding: '+' becomes a space.
         assert_eq!(p.issuer.as_deref(), Some("Acme Co"));
