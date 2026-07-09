@@ -280,6 +280,14 @@ pub fn put_fits(params: &PutParams<'_>) -> bool {
 /// [`put_fits`] first for attacker-controlled input.
 #[must_use]
 pub fn put(params: &PutParams<'_>) -> Vec<u8> {
+    // Keep `put_fits` mechanically honest: it must never reject params this
+    // function can encode. (The reverse drift — `put_fits` accepting params
+    // that overflow — is caught by the boundary test and the size asserts
+    // below.)
+    debug_assert!(
+        put_fits(params),
+        "put() called with params put_fits() rejects"
+    );
     // `key` and `data` hold the raw HMAC secret; wipe these intermediates on
     // drop. (The returned APDU also carries the secret and is wrapped in
     // Zeroizing by the transport layer.)
@@ -838,6 +846,29 @@ mod tests {
         assert!(!put_fits(&params_with("x", 300)));
         let name_200: &'static str = Box::leak("n".repeat(200).into_boxed_str());
         assert!(!put_fits(&params_with(name_200, 64)));
+    }
+
+    #[test]
+    fn put_fits_boundary_matches_put_encoding() {
+        // Mechanical tie between put_fits()'s arithmetic and put()'s actual
+        // encoding, with every optional TLV present: at the exact 255-byte
+        // body boundary put_fits must say yes AND put must encode without
+        // panicking; one byte over, put_fits must say no. If a future TLV is
+        // added to put() without updating put_fits, the "fits" case here
+        // trips put()'s internal size assert and fails this test.
+        let name_at: &'static str = Box::leak("n".repeat(100).into_boxed_str());
+        // Body = NAME(2+100) + KEY(2+2+140) + PROPERTY(2+1) + IMF(2+4) = 255.
+        let mut at = params_with(name_at, 140);
+        at.require_touch = true;
+        at.imf = 1;
+        assert!(put_fits(&at));
+        let apdu = put(&at);
+        assert!(!apdu.is_empty());
+
+        let mut over = at;
+        let name_over: &'static str = Box::leak("n".repeat(101).into_boxed_str());
+        over.name = name_over;
+        assert!(!put_fits(&over));
     }
 
     #[test]

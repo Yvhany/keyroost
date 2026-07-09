@@ -76,14 +76,18 @@ pub fn pbkdf2_hmac_sha1(password: &[u8], salt: &[u8], iterations: u32, dk_len: u
                 *t_b ^= *u_b;
             }
         }
-        out.extend_from_slice(&t);
+        // Append only what is still needed: `out` must never outgrow its exact
+        // `dk_len` allocation, because a mid-derivation realloc would strand
+        // the already-derived key bytes in the freed buffer where no zeroize
+        // can reach them (dk_len 21..=39 would otherwise grow 20 → 40).
+        let need = dk_len - out.len();
+        out.extend_from_slice(&t[..need.min(t.len())]);
         // These per-block intermediates are password-derived; wipe them.
         salted.zeroize();
         u.zeroize();
         t.zeroize();
         block_index += 1;
     }
-    out.truncate(dk_len);
     out
 }
 
@@ -136,6 +140,22 @@ mod tests {
         assert_eq!(
             hex(&pbkdf2_hmac_sha1(b"password", b"salt", 4096, 20)),
             "4b007901b765489abead49d926f721d065a429c1"
+        );
+    }
+
+    #[test]
+    fn pbkdf2_rfc6070_partial_second_block() {
+        // dk_len = 25 needs one full block plus 5 bytes of a second — the case
+        // where the output buffer must not reallocate mid-derivation (RFC 6070
+        // vector #5).
+        assert_eq!(
+            hex(&pbkdf2_hmac_sha1(
+                b"passwordPASSWORDpassword",
+                b"saltSALTsaltSALTsaltSALTsaltSALTsalt",
+                4096,
+                25
+            )),
+            "3d2eec4fe41c849b80c8d83662c0e44a8b291a964cf2f07038"
         );
     }
 }
