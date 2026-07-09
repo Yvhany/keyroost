@@ -127,7 +127,40 @@ pub mod aegis {
 
     #[derive(Deserialize)]
     struct Root {
-        db: serde_json::Value,
+        db: DbField,
+    }
+
+    /// The `db` field: a plaintext object (parsed straight into [`Db`]) or, for
+    /// an encrypted vault, a base64 string we reject.
+    ///
+    /// Deserialized manually via `deserialize_any` so it dispatches on the JSON
+    /// token type directly — the plaintext entries land in the zeroize-on-drop
+    /// `Db`/`EntryInfo` without ever transiting a `serde_json::Value` tree
+    /// (whose `String` seeds would otherwise drop unscrubbed).
+    enum DbField {
+        Plain(Db),
+        Encrypted,
+    }
+
+    impl<'de> serde::Deserialize<'de> for DbField {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            use serde::de::{self, MapAccess, Visitor};
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = DbField;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("an Aegis db object or an encrypted base64 string")
+                }
+                fn visit_str<E: de::Error>(self, _v: &str) -> Result<DbField, E> {
+                    // The encrypted blob is not a secret and is not retained.
+                    Ok(DbField::Encrypted)
+                }
+                fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<DbField, A::Error> {
+                    Db::deserialize(de::value::MapAccessDeserializer::new(map)).map(DbField::Plain)
+                }
+            }
+            d.deserialize_any(V)
+        }
     }
 
     #[derive(Deserialize)]
@@ -163,9 +196,9 @@ pub mod aegis {
 
     pub fn parse(json: &str) -> Result<Vec<BulkEntry>, BulkError> {
         let root: Root = serde_json::from_str(json)?;
-        let db: Db = match &root.db {
-            serde_json::Value::Object(_) => serde_json::from_value(root.db)?,
-            serde_json::Value::String(_) => {
+        let db: Db = match root.db {
+            DbField::Plain(db) => db,
+            DbField::Encrypted => {
                 #[cfg(feature = "encrypted")]
                 {
                     return Err(BulkError::Encrypted(
@@ -179,7 +212,6 @@ pub mod aegis {
                     ));
                 }
             }
-            _ => return Err(BulkError::UnsupportedFormat("unexpected `db` shape")),
         };
         let mut out = Vec::with_capacity(db.entries.len());
         for (i, e) in db.entries.into_iter().enumerate() {
@@ -208,7 +240,7 @@ pub mod aegis {
     /// the file is already plaintext. Cheap and side-effect-free.
     pub fn is_encrypted(json: &str) -> Result<bool, BulkError> {
         let root: Root = serde_json::from_str(json)?;
-        Ok(matches!(root.db, serde_json::Value::String(_)))
+        Ok(matches!(root.db, DbField::Encrypted))
     }
 
     /// Decrypt an Aegis encrypted vault and return the inner plaintext JSON,
