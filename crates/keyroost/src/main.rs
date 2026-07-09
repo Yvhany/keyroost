@@ -634,6 +634,12 @@ fn wipe(s: &mut String) {
 /// memory until the undo history is cleared. This clears it. Safe to call every
 /// frame and on a widget that was never typed into (it only touches that
 /// widget's stored state, if any).
+///
+/// Limitation: egui's `clear_undoer` *replaces* the undoer, so the snapshot
+/// `String`s are freed, not zeroized — the API gives no access to the stored
+/// text, so the old bytes can linger in freed heap pages until reused. This
+/// still removes the secret from egui's live, trivially-queryable state; it is
+/// not (and cannot be, from outside egui) a memory-scrubbing guarantee.
 fn clear_edit_undo(ctx: &egui::Context, id: egui::Id) {
     if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
         state.clear_undoer();
@@ -1075,11 +1081,6 @@ impl Worker {
             .name("keyroost-worker".into())
             .spawn(move || {
                 while let Ok(job) = job_rx.recv() {
-                    // A panicking job must not kill the worker: that would
-                    // disconnect the result channel and wedge the busy guard
-                    // (spawn_job would reject every future job forever). Catch
-                    // it and deliver an error apply instead, so the frame loop
-                    // still clears the busy bookkeeping and the thread lives on.
                     // A panicking job must not kill the worker: that would
                     // disconnect the result channel and wedge the busy guard
                     // (spawn_job would reject every future job forever). Catch
