@@ -1966,6 +1966,7 @@ name = "keyroost-oath"
 version = "0.7.4"
 dependencies = [
  "keyroost-proto",
+ "zeroize",
 ]
 
 [[package]]
@@ -1973,6 +1974,7 @@ name = "keyroost-openpgp"
 version = "0.7.4"
 dependencies = [
  "keyroost-proto",
+ "zeroize",
 ]
 
 [[package]]
@@ -1980,6 +1982,7 @@ name = "keyroost-piv"
 version = "0.7.4"
 dependencies = [
  "keyroost-proto",
+ "zeroize",
 ]
 
 [[package]]
