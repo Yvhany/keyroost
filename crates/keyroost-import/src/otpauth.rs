@@ -137,8 +137,11 @@ pub fn parse(uri: &str) -> Result<OtpAuth, OtpAuthError> {
     let label =
         percent_decode(label_raw).map_err(|_| OtpAuthError::Malformed("label percent-encoding"))?;
 
-    // Defaults per the spec.
-    let mut secret_b32: Option<String> = None;
+    // Defaults per the spec. The decoded secret text is held in Zeroizing so it
+    // is wiped on *every* exit — including an error in a later param (algorithm,
+    // digits, period) after `secret=` was seen, or a duplicate `secret=` that
+    // overwrites the first — not only on the success path.
+    let mut secret_b32: Option<zeroize::Zeroizing<String>> = None;
     let mut issuer_param: Option<String> = None;
     let mut algorithm = HmacAlgo::Sha1;
     let mut digits = OtpDigits::Six;
@@ -149,7 +152,7 @@ pub fn parse(uri: &str) -> Result<OtpAuth, OtpAuthError> {
         let v = percent_decode(v)
             .map_err(|_| OtpAuthError::Malformed("query value percent-encoding"))?;
         match k {
-            "secret" => secret_b32 = Some(v),
+            "secret" => secret_b32 = Some(zeroize::Zeroizing::new(v)),
             "issuer" => issuer_param = Some(v),
             "algorithm" => match v.to_ascii_uppercase().as_str() {
                 "SHA1" => algorithm = HmacAlgo::Sha1,
@@ -179,15 +182,11 @@ pub fn parse(uri: &str) -> Result<OtpAuth, OtpAuthError> {
         other => return Err(OtpAuthError::UnsupportedPeriod(other)),
     };
 
-    let mut secret_b32 = secret_b32.ok_or(OtpAuthError::MissingSecret)?;
+    // The percent-decoded base32 text is the seed in another spelling; it rides
+    // in `secret_b32` (Zeroizing) and is wiped when it drops at function exit.
+    // The binary copy rides in `OtpAuth`, which also wipes on drop.
+    let secret_b32 = secret_b32.ok_or(OtpAuthError::MissingSecret)?;
     let decoded = base32_decode(&secret_b32);
-    // The percent-decoded base32 text is the seed in another spelling — wipe
-    // it as soon as the binary copy exists (the binary copy rides in `OtpAuth`,
-    // which wipes on drop).
-    {
-        use zeroize::Zeroize;
-        secret_b32.zeroize();
-    }
     let mut secret = decoded.map_err(|_| OtpAuthError::InvalidSecret)?;
     // The Molto2 caps seeds at 63 bytes, and the protocol layer asserts the
     // same range; reject here so a malformed URI in an imported file fails
