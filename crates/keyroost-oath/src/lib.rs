@@ -648,10 +648,20 @@ pub fn parse_list(buf: &[u8]) -> Result<Vec<CredentialInfo>, ParseError> {
             continue;
         }
         let value = tlv.value;
-        let prefix = *value.first().ok_or(ParseError::Truncated)?;
-        let oath_type = OathType::from_prefix(prefix).ok_or(ParseError::BadPrefix(prefix))?;
-        let algorithm = Algorithm::from_prefix(prefix).ok_or(ParseError::BadPrefix(prefix))?;
-        let name = core::str::from_utf8(&value[1..]).map_err(|_| ParseError::InvalidUtf8)?;
+        // Skip an individual undecodable entry (empty, unknown prefix, or a
+        // non-UTF-8 name) rather than failing the whole listing — one corrupt
+        // credential must not hide every other credential on the key.
+        let Some(&prefix) = value.first() else {
+            continue;
+        };
+        let (Some(oath_type), Some(algorithm)) =
+            (OathType::from_prefix(prefix), Algorithm::from_prefix(prefix))
+        else {
+            continue;
+        };
+        let Ok(name) = core::str::from_utf8(&value[1..]) else {
+            continue;
+        };
         out.push(CredentialInfo {
             name: name.to_owned(),
             oath_type,
@@ -946,10 +956,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_list_rejects_bad_prefix() {
-        // prefix 0x99: type nibble 0x90 unknown.
-        let buf = [0x72, 0x02, 0x99, b'a'];
-        assert_eq!(parse_list(&buf), Err(ParseError::BadPrefix(0x99)));
+    fn parse_list_skips_bad_entries_keeps_good() {
+        // A corrupt entry (bad prefix 0x99, then a non-UTF-8 name) must not hide
+        // the valid entries that follow — skip it and return the good ones.
+        let buf = [
+            0x72, 0x02, 0x99, b'a', // bad type nibble 0x90 -> skipped
+            0x72, 0x02, 0x21, 0xFF, // TOTP|SHA1 but invalid UTF-8 name -> skipped
+            0x72, 0x03, 0x21, b'o', b'k', // TOTP|SHA1 "ok" -> kept
+        ];
+        let creds = parse_list(&buf).unwrap();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].name, "ok");
+        assert_eq!(creds[0].oath_type, OathType::Totp);
     }
 
     #[test]
