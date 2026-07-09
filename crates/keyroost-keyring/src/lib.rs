@@ -2,7 +2,7 @@
 //!
 //! Lets a user attach a memorable label (e.g. `signing-yubikey`) to a physical
 //! key, matched by its stable **serial number**, so commands can target a key
-//! by `--name` instead of a `/dev/hidrawN` path that changes on every replug.
+//! by `--device` instead of a `/dev/hidrawN` path that changes on every replug.
 //!
 //! This crate is pure config + matching logic: it has no hardware or PC/SC
 //! dependencies and never enumerates devices itself. The caller supplies the
@@ -127,7 +127,7 @@ impl From<io::Error> for KeyringError {
     }
 }
 
-/// Errors resolving a `--name` to a connected device.
+/// Errors resolving a `--device` name to a connected device.
 #[derive(Debug)]
 pub enum ResolveError {
     UnknownName { name: String, known: Vec<String> },
@@ -420,7 +420,7 @@ impl Keyring {
         self.by_serial(serial).map(|k| k.name.as_str())
     }
 
-    /// Resolve a `--name` to a connected device by matching serials.
+    /// Resolve a `--device` name to a connected device by matching serials.
     pub fn resolve<'a>(
         &self,
         name: &str,
