@@ -120,6 +120,10 @@ pub enum TransportError {
     /// Building a certificate/CSR structure failed (bad subject, expiry before
     /// start, or an algorithm that cannot sign).
     X509(keyroost_piv::x509::X509Error),
+    /// An OATH credential's name and/or secret would overflow the 255-byte
+    /// short-APDU body. Caught before building the APDU (the pure builder would
+    /// otherwise panic); reachable from an imported otpauth:// URI or QR code.
+    OathCredentialTooLong,
 }
 
 impl fmt::Display for TransportError {
@@ -219,6 +223,11 @@ impl fmt::Display for TransportError {
                 write!(f, "the host OS random-number source failed")
             }
             TransportError::X509(e) => write!(f, "{}", e),
+            TransportError::OathCredentialTooLong => write!(
+                f,
+                "OATH credential name/secret is too long for the card \
+                 (name + secret must fit a 255-byte command)"
+            ),
         }
     }
 }

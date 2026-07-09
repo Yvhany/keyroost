@@ -188,6 +188,12 @@ impl OathSession {
 
     /// Provision (add) a credential.
     pub fn put(&mut self, params: &oath::PutParams<'_>) -> Result<(), TransportError> {
+        // Reject an over-long name/secret (e.g. from an imported otpauth:// URI)
+        // before the pure builder — which panics past the 255-byte short-APDU
+        // limit — is reached.
+        if !oath::put_fits(params) {
+            return Err(TransportError::OathCredentialTooLong);
+        }
         // The PUT body carries the raw TOTP/HOTP seed — wipe it after transmit.
         let apdu = Zeroizing::new(oath::put(params));
         let (_, sw) = self.transmit_full(&apdu)?;

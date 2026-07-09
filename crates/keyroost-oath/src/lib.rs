@@ -245,7 +245,39 @@ pub struct PutParams<'a> {
 /// Build a `PUT` APDU to provision a credential.
 ///
 /// Data layout: `NAME(0x71) || KEY(0x73) [|| PROPERTY(0x78) ][|| IMF(0x7A)]`.
+/// The maximum value a short-form OATH TLV (and the short APDU body) can hold.
+const MAX_SHORT_LEN: usize = 255;
+
+/// True when [`put`] can serialize `params` without exceeding the 255-byte
+/// short-APDU limits — the NAME TLV value, the KEY TLV value, and the total
+/// body. `put` **panics** past these bounds, so callers handling untrusted
+/// input (an imported `otpauth://` URI or QR code, whose name/secret lengths
+/// are attacker-controlled) must check this first and reject rather than build.
+#[must_use]
+pub fn put_fits(params: &PutParams<'_>) -> bool {
+    let name = params.name.len();
+    // KEY value = prefix byte + digits byte + secret.
+    let key_val = 2 + params.secret.len();
+    if name > MAX_SHORT_LEN || key_val > MAX_SHORT_LEN {
+        return false;
+    }
+    // Body = NAME TLV + KEY TLV (+ optional PROPERTY and IMF TLVs), each TLV
+    // being tag(1) + len(1) + value.
+    let mut body = (2 + name) + (2 + key_val);
+    if params.require_touch {
+        body += 2 + 1;
+    }
+    if params.imf != 0 {
+        body += 2 + core::mem::size_of::<u32>();
+    }
+    body <= MAX_SHORT_LEN
+}
+
 /// The KEY value is `[ (type<<4)|algo, digits, secret... ]`.
+///
+/// # Panics
+/// Panics if the name/secret would overflow the 255-byte short-APDU body; call
+/// [`put_fits`] first for attacker-controlled input.
 #[must_use]
 pub fn put(params: &PutParams<'_>) -> Vec<u8> {
     // `key` and `data` hold the raw HMAC secret; wipe these intermediates on
@@ -737,6 +769,38 @@ mod tests {
             select(),
             vec![0x00, 0xA4, 0x04, 0x00, 0x07, 0xA0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01]
         );
+    }
+
+    fn params_with(name: &'static str, secret_len: usize) -> PutParams<'static> {
+        // Leak a fixed secret buffer of the requested length (test-only).
+        let secret: &'static [u8] = Box::leak(vec![0x01u8; secret_len].into_boxed_slice());
+        PutParams {
+            name,
+            secret,
+            oath_type: OathType::Totp,
+            algorithm: Algorithm::Sha1,
+            digits: 6,
+            require_touch: false,
+            imf: 0,
+        }
+    }
+
+    #[test]
+    fn put_fits_accepts_normal_credentials() {
+        assert!(put_fits(&params_with("alice@example.com", 20)));
+        assert!(put_fits(&params_with("x", 64)));
+    }
+
+    #[test]
+    fn put_fits_rejects_oversize_and_put_would_not_panic_when_checked() {
+        // A 300-byte name (e.g. from a hostile otpauth URI) overflows the NAME
+        // TLV; a huge secret overflows the KEY TLV; a name+secret that each fit
+        // but jointly exceed 255 overflows the body.
+        let long_name: &'static str = Box::leak("n".repeat(300).into_boxed_str());
+        assert!(!put_fits(&params_with(long_name, 20)));
+        assert!(!put_fits(&params_with("x", 300)));
+        let name_200: &'static str = Box::leak("n".repeat(200).into_boxed_str());
+        assert!(!put_fits(&params_with(name_200, 64)));
     }
 
     #[test]
