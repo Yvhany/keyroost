@@ -151,6 +151,60 @@ impl fmt::Display for PublicDataError {
     }
 }
 
+/// Error decoding a `get info` (`0x41`) response body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InfoError {
+    /// The response was shorter than the serial-length + separator + time
+    /// layout demands. `need` is the minimum length required given `data[3]`.
+    TooShort { got: usize, need: usize },
+}
+
+impl fmt::Display for InfoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InfoError::TooShort { got, need } => {
+                write!(f, "get-info response too short: got {got}, need {need}")
+            }
+        }
+    }
+}
+
+/// Parse a `get info` (`0x41`) response body (status word already stripped)
+/// into `(serial, utc_time)`.
+///
+/// Layout (see `docs/PROTOCOL.md`): a 3-byte header, then `data[3]` = serial
+/// length `N`, then `N` ASCII serial bytes, a 2-byte separator, and a 4-byte
+/// big-endian UTC time (unix epoch seconds). The serial is decoded lossily so a
+/// non-ASCII byte can't error the read; all indexing is bounds-checked against
+/// a truncated or malformed device response.
+pub fn parse_info(data: &[u8]) -> Result<(String, u32), InfoError> {
+    if data.len() < 4 {
+        return Err(InfoError::TooShort {
+            got: data.len(),
+            need: 4,
+        });
+    }
+    let serial_len = data[3] as usize;
+    let serial_end = 4 + serial_len;
+    // serial bytes + 2-byte separator + 4-byte time must all fit.
+    let need = serial_end + 6;
+    if data.len() < need {
+        return Err(InfoError::TooShort {
+            got: data.len(),
+            need,
+        });
+    }
+    let serial = String::from_utf8_lossy(&data[4..serial_end]).into_owned();
+    let time_offset = serial_end + 2;
+    let utc_time = u32::from_be_bytes([
+        data[time_offset],
+        data[time_offset + 1],
+        data[time_offset + 2],
+        data[time_offset + 3],
+    ]);
+    Ok((serial, utc_time))
+}
+
 /// Parse a [`read_public_data`] response (status word already stripped).
 ///
 /// Expected envelope, hardware-captured: `95 1F 70 1D` followed by exactly
@@ -396,6 +450,46 @@ pub fn sw_auth_failed(sw1: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_info_decodes_serial_and_time() {
+        // 3-byte header, serial_len=8, "37806840", 2-byte separator, time BE.
+        let mut data = vec![0xAA, 0xBB, 0xCC, 0x08];
+        data.extend_from_slice(b"37806840");
+        data.extend_from_slice(&[0x00, 0x00]); // separator
+        data.extend_from_slice(&0x6A4F_2111u32.to_be_bytes());
+        let (serial, utc) = parse_info(&data).unwrap();
+        assert_eq!(serial, "37806840");
+        assert_eq!(utc, 0x6A4F_2111);
+    }
+
+    #[test]
+    fn parse_info_rejects_truncated_without_panicking() {
+        // Under the 4-byte header.
+        assert_eq!(
+            parse_info(&[0x00, 0x01, 0x02]),
+            Err(InfoError::TooShort { got: 3, need: 4 })
+        );
+        // serial_len says 8 but the body is missing the separator + time.
+        let mut data = vec![0x00, 0x00, 0x00, 0x08];
+        data.extend_from_slice(b"1234"); // only 4 of 8 serial bytes + nothing else
+        assert!(matches!(parse_info(&data), Err(InfoError::TooShort { .. })));
+        // A serial_len of 0xFF must not index out of bounds.
+        assert!(matches!(
+            parse_info(&[0x00, 0x00, 0x00, 0xFF, 0x01, 0x02]),
+            Err(InfoError::TooShort { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_info_serial_is_lossy_not_fatal() {
+        // A non-UTF-8 serial byte decodes lossily rather than erroring.
+        let mut data = vec![0x00, 0x00, 0x00, 0x02, 0xFF, 0x41]; // serial = [0xFF, 'A']
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]); // sep + time
+        let (serial, utc) = parse_info(&data).unwrap();
+        assert!(serial.ends_with('A'));
+        assert_eq!(utc, 1);
+    }
 
     fn default_sm4_key() -> [u8; 16] {
         derive_sm4_key(DEFAULT_CUSTOMER_KEY)

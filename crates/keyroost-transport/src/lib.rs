@@ -417,33 +417,16 @@ impl Session {
     pub fn read_info(&mut self) -> Result<DeviceInfo, TransportError> {
         let cmd = commands::get_info();
         let data = self.transmit(&cmd)?;
-        // Layout observed in molto2.py:
-        //   <something><something><something><serial_len> <serial> <2 bytes ??> <4-byte BE time>
-        // The Python code reads info[3] as serial length, then info[4..4+len], then skips 2,
-        // then reads 4 bytes BE time.
-        if data.len() < 4 {
-            return Err(TransportError::ShortResponse {
+        // The response byte layout (3-byte header, serial-length, serial,
+        // 2-byte separator, 4-byte BE time) is parsed by the pure, fuzzed
+        // `parse_info` in keyroost-proto so it's testable without hardware.
+        let (serial, utc_time) = commands::parse_info(&data).map_err(|e| match e {
+            commands::InfoError::TooShort { got, need } => TransportError::ShortResponse {
                 label: "get info",
-                got: data.len(),
-                expected_min: 4,
-            });
-        }
-        let serial_len = data[3] as usize;
-        let serial_end = 4 + serial_len;
-        if data.len() < serial_end + 2 + 4 {
-            return Err(TransportError::ShortResponse {
-                label: "get info",
-                got: data.len(),
-                expected_min: serial_end + 6,
-            });
-        }
-        let serial = String::from_utf8_lossy(&data[4..serial_end]).into_owned();
-        let time_offset = serial_end + 2;
-        let utc_time = u32::from_be_bytes(
-            data[time_offset..time_offset + 4]
-                .try_into()
-                .map_err(|_| TransportError::MalformedResponse("time field"))?,
-        );
+                got,
+                expected_min: need,
+            },
+        })?;
         Ok(DeviceInfo { serial, utc_time })
     }
 

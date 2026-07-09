@@ -113,3 +113,10 @@ path = "fuzz_targets/aegis_encrypted.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "molto_parse"
+path = "fuzz_targets/molto_parse.rs"
+test = false
+doc = false
+bench = false
