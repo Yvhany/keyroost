@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 use keyroost_proto::apdu::{build_apdu, build_apdu_get};
+use zeroize::Zeroizing;
 
 pub mod spki;
 pub mod x509;
@@ -712,8 +713,8 @@ pub fn unblock_pin(puk: &[u8], new_pin: &[u8]) -> Vec<u8> {
 #[must_use]
 pub fn set_management_key(alg: MgmtAlg, key: &[u8], require_touch: bool) -> Vec<u8> {
     assert!(key.len() <= 255, "management key too long");
-    // Body: <alg> 9B <keylen> <key>.
-    let mut body = Vec::with_capacity(3 + key.len());
+    // Body: <alg> 9B <keylen> <key>. Holds the new management key; wipe on drop.
+    let mut body = Zeroizing::new(Vec::with_capacity(3 + key.len()));
     body.push(alg.id());
     body.push(KEY_REF_MANAGEMENT);
     body.push(key.len() as u8);
@@ -781,13 +782,15 @@ pub fn clear_certificate(slot: Slot) -> Vec<u8> {
 /// card. Callers validate length first (the transport layer's `check_pin_len`);
 /// this asserts the same 6–8 contract so a direct byte-layer consumer that skips
 /// validation fails loudly here instead of transmitting the wrong secret.
-fn pad_pin(pin: &[u8]) -> Vec<u8> {
+fn pad_pin(pin: &[u8]) -> Zeroizing<Vec<u8>> {
     assert!(
         (6..=8).contains(&pin.len()),
         "PIV PIN/PUK must be 6-8 bytes (got {})",
         pin.len()
     );
-    let mut out = [0xFFu8; 8].to_vec();
+    // Zeroizing so this padded secret (and any body built from it) is wiped on
+    // drop; the final APDU is wrapped in Zeroizing by the transport layer.
+    let mut out = Zeroizing::new(vec![0xFFu8; 8]);
     out[..pin.len()].copy_from_slice(pin);
     out
 }

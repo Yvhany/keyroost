@@ -15,6 +15,8 @@ const OUT: usize = 20;
 /// HMAC-SHA1 of `data` under `key` (RFC 2104).
 #[must_use]
 pub fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; OUT] {
+    use zeroize::Zeroize;
+
     // Keys longer than the block size are first hashed down.
     let mut k = [0u8; BLOCK];
     if key.len() > BLOCK {
@@ -38,7 +40,16 @@ pub fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; OUT] {
     let mut outer = Vec::with_capacity(BLOCK + OUT);
     outer.extend_from_slice(&opad);
     outer.extend_from_slice(&inner_hash);
-    sha1(&outer)
+    let mac = sha1(&outer);
+
+    // Scrub the key-derived scratch (the padded key and the ipad/opad blocks
+    // carry `key ^ const`); the result `mac` is not secret on its own.
+    k.zeroize();
+    ipad.zeroize();
+    opad.zeroize();
+    inner.zeroize();
+    outer.zeroize();
+    mac
 }
 
 /// PBKDF2-HMAC-SHA1 (RFC 2898) producing `dk_len` bytes.
@@ -47,6 +58,8 @@ pub fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; OUT] {
 /// key and the RFC 6070 20-byte test vectors.
 #[must_use]
 pub fn pbkdf2_hmac_sha1(password: &[u8], salt: &[u8], iterations: u32, dk_len: usize) -> Vec<u8> {
+    use zeroize::Zeroize;
+
     let mut out = Vec::with_capacity(dk_len);
     let mut block_index: u32 = 1;
     while out.len() < dk_len {
@@ -64,6 +77,10 @@ pub fn pbkdf2_hmac_sha1(password: &[u8], salt: &[u8], iterations: u32, dk_len: u
             }
         }
         out.extend_from_slice(&t);
+        // These per-block intermediates are password-derived; wipe them.
+        salted.zeroize();
+        u.zeroize();
+        t.zeroize();
         block_index += 1;
     }
     out.truncate(dk_len);

@@ -23,6 +23,7 @@
 //! `SET_CODE` / `VALIDATE` exchange (the transport layer only transmits them).
 
 use keyroost_proto::apdu::{build_apdu, build_apdu_get};
+use zeroize::Zeroizing;
 
 pub mod crypto;
 
@@ -247,10 +248,13 @@ pub struct PutParams<'a> {
 /// The KEY value is `[ (type<<4)|algo, digits, secret... ]`.
 #[must_use]
 pub fn put(params: &PutParams<'_>) -> Vec<u8> {
-    let mut data = Vec::new();
+    // `key` and `data` hold the raw HMAC secret; wipe these intermediates on
+    // drop. (The returned APDU also carries the secret and is wrapped in
+    // Zeroizing by the transport layer.)
+    let mut data = Zeroizing::new(Vec::new());
     push_tlv(&mut data, Tag::Name, params.name.as_bytes());
 
-    let mut key = Vec::with_capacity(2 + params.secret.len());
+    let mut key = Zeroizing::new(Vec::with_capacity(2 + params.secret.len()));
     key.push(prefix_byte(params.oath_type, params.algorithm));
     key.push(params.digits);
     key.extend_from_slice(params.secret);
@@ -408,12 +412,12 @@ pub fn parse_select(buf: &[u8]) -> Result<SelectInfo, ParseError> {
 /// Derive the 16-byte OATH access key from a password and the device id (salt).
 #[must_use]
 pub fn derive_access_key(password: &str, device_id: &[u8]) -> [u8; ACCESS_KEY_LEN] {
-    let dk = crypto::pbkdf2_hmac_sha1(
+    let dk = Zeroizing::new(crypto::pbkdf2_hmac_sha1(
         password.as_bytes(),
         device_id,
         ACCESS_KEY_ITERATIONS,
         ACCESS_KEY_LEN,
-    );
+    ));
     let mut key = [0u8; ACCESS_KEY_LEN];
     key.copy_from_slice(&dk);
     key
@@ -462,12 +466,13 @@ pub fn verify_validate(
 /// random; the response proves the host computed the key correctly.
 #[must_use]
 pub fn set_code(access_key: &[u8], challenge: &[u8]) -> Vec<u8> {
-    let mut key_tlv = Vec::with_capacity(1 + access_key.len());
+    // key_tlv and data embed the derived access key; wipe on drop.
+    let mut key_tlv = Zeroizing::new(Vec::with_capacity(1 + access_key.len()));
     key_tlv.push(prefix_byte(OathType::Totp, Algorithm::Sha1));
     key_tlv.extend_from_slice(access_key);
 
     let resp = respond(access_key, challenge);
-    let mut data = Vec::new();
+    let mut data = Zeroizing::new(Vec::new());
     push_tlv(&mut data, Tag::Key, &key_tlv);
     push_tlv(&mut data, Tag::Challenge, challenge);
     push_tlv(&mut data, Tag::Response, &resp);

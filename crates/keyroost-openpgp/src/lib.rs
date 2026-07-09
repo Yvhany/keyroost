@@ -23,6 +23,7 @@
 //! long-form lengths. The parser here handles both forms; see [`parse_tlvs`].
 
 use keyroost_proto::apdu::{build_apdu, build_apdu_get};
+use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
 // Application identifier
@@ -502,7 +503,8 @@ pub fn pso_decipher_chained(data: &[u8], max_chunk: usize) -> Vec<Vec<u8>> {
 /// builder only frames the bytes — it never sources, stores, or logs them.
 #[must_use]
 pub fn change_reference_data(pw_ref: u8, old: &[u8], new: &[u8]) -> Vec<u8> {
-    let mut data = Vec::with_capacity(old.len() + new.len());
+    // `data` concatenates both PINs; wipe it on drop.
+    let mut data = Zeroizing::new(Vec::with_capacity(old.len() + new.len()));
     data.extend_from_slice(old);
     data.extend_from_slice(new);
     build_apdu(
@@ -940,7 +942,10 @@ pub fn extended_header_list(
     }
 
     // Cardholder Private Key (5F48): the concatenated field bytes, same order.
-    let mut key_data = Vec::new();
+    // This and `body` below carry the RSA private-key material (p, q, and the
+    // CRT components); wipe them on drop. (`template` holds only field lengths,
+    // and the returned 4D object is wrapped in Zeroizing by import_rsa_key.)
+    let mut key_data = Zeroizing::new(Vec::new());
     key_data.extend_from_slice(&e);
     key_data.extend_from_slice(p);
     key_data.extend_from_slice(q);
@@ -954,10 +959,10 @@ pub fn extended_header_list(
     }
 
     // Assemble the 4D value, then wrap the whole thing in the 4D tag/length.
-    let mut body = Vec::new();
+    let mut body = Zeroizing::new(Vec::new());
     body.extend_from_slice(&crt_body);
     body.extend_from_slice(&ber_tlv(0x7F48, &template));
-    body.extend_from_slice(&ber_tlv(0x5F48, &key_data));
+    body.extend_from_slice(&Zeroizing::new(ber_tlv(0x5F48, &key_data)));
 
     ber_tlv(0x4D, &body)
 }
@@ -1008,7 +1013,7 @@ pub fn import_rsa_key(
     format: RsaImportFormat,
     e_bits: u16,
 ) -> Vec<u8> {
-    let header_list = extended_header_list(crt, key, format, e_bits);
+    let header_list = Zeroizing::new(extended_header_list(crt, key, format, e_bits));
     build_apdu_extended(0x00, INS_PUT_DATA_ODD, 0x3F, 0xFF, &header_list)
 }
 
@@ -1061,7 +1066,7 @@ pub fn import_rsa_key_chained(
     e_bits: u16,
     max_chunk: usize,
 ) -> Vec<Vec<u8>> {
-    let header_list = extended_header_list(crt, key, format, e_bits);
+    let header_list = Zeroizing::new(extended_header_list(crt, key, format, e_bits));
     put_data_odd_chained(0x3F, 0xFF, &header_list, max_chunk)
 }
 

@@ -12,3 +12,4 @@ workspace = true
 
 [dependencies]
 keyroost-proto = { path = "../keyroost-proto", version = "0.7.4" }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
