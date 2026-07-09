@@ -437,7 +437,11 @@ pub fn parse_select(buf: &[u8]) -> Result<SelectInfo, ParseError> {
     Ok(SelectInfo {
         version: find_tag(&tlvs, Tag::Version).unwrap_or_default().to_vec(),
         device_id: find_tag(&tlvs, Tag::Name).unwrap_or_default().to_vec(),
-        challenge: find_tag(&tlvs, Tag::Challenge).map(<[u8]>::to_vec),
+        // A present-but-empty CHALLENGE TLV means no password — treat only a
+        // non-empty challenge as "password required" (a real one is 8 bytes).
+        challenge: find_tag(&tlvs, Tag::Challenge)
+            .filter(|c| !c.is_empty())
+            .map(<[u8]>::to_vec),
     })
 }
 
@@ -1012,6 +1016,14 @@ mod tests {
         // Without a CHALLENGE TLV, no password is required.
         let buf2 = [0x79, 0x03, 0x05, 0x07, 0x00, 0x71, 0x02, 0xAB, 0xCD];
         assert!(!parse_select(&buf2).unwrap().password_required());
+
+        // An *empty* CHALLENGE TLV (0x74 0x00) also means no password — it must
+        // not be reported as "password required" with a zero-byte challenge
+        // (which would then be fed to HMAC).
+        let buf3 = [0x79, 0x03, 0x05, 0x07, 0x00, 0x71, 0x02, 0xAB, 0xCD, 0x74, 0x00];
+        let info3 = parse_select(&buf3).unwrap();
+        assert!(!info3.password_required());
+        assert!(info3.challenge.is_none());
     }
 
     #[test]
