@@ -126,7 +126,11 @@ impl std::fmt::Display for FrameError {
             ),
             FrameError::ShortFrame => write!(f, "HID frame shorter than its 3-byte header"),
             FrameError::ResponseTooLong => {
-                write!(f, "HID response exceeded the {}-byte reassembly limit", MAX_RESPONSE)
+                write!(
+                    f,
+                    "HID response exceeded the {}-byte reassembly limit",
+                    MAX_RESPONSE
+                )
             }
         }
     }

@@ -12143,7 +12143,10 @@ mod tests {
         // Simulate egui recording undo history as the user types a PIN. An undo
         // point is committed only once a state has been stable for `stable_time`
         // (1s default), so feed the same secret across a ≥1s gap.
-        let secret = (egui::text::CCursorRange::default(), "1234-secret-pin".to_string());
+        let secret = (
+            egui::text::CCursorRange::default(),
+            "1234-secret-pin".to_string(),
+        );
         let mut state = egui::TextEdit::load_state(&ctx, id).unwrap_or_default();
         let mut undoer = state.undoer();
         undoer.feed_state(0.0, &empty);
@@ -12182,7 +12185,9 @@ mod tests {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
 
-        app.spawn_job("boom", || -> ApplyFn { panic!("simulated device-op panic") });
+        app.spawn_job("boom", || -> ApplyFn {
+            panic!("simulated device-op panic")
+        });
         assert!(app.busy(), "busy set right after dispatch");
 
         // The worker still delivers an apply despite the panic.

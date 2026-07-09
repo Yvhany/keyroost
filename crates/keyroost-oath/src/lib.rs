@@ -1020,7 +1020,9 @@ mod tests {
         // An *empty* CHALLENGE TLV (0x74 0x00) also means no password — it must
         // not be reported as "password required" with a zero-byte challenge
         // (which would then be fed to HMAC).
-        let buf3 = [0x79, 0x03, 0x05, 0x07, 0x00, 0x71, 0x02, 0xAB, 0xCD, 0x74, 0x00];
+        let buf3 = [
+            0x79, 0x03, 0x05, 0x07, 0x00, 0x71, 0x02, 0xAB, 0xCD, 0x74, 0x00,
+        ];
         let info3 = parse_select(&buf3).unwrap();
         assert!(!info3.password_required());
         assert!(info3.challenge.is_none());

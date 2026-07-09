@@ -99,7 +99,11 @@ pub fn config_path() -> Option<PathBuf> {
     {
         if let Some(appdata) = std::env::var_os("APPDATA") {
             if !appdata.is_empty() {
-                return Some(PathBuf::from(appdata).join("keyroost").join("settings.json"));
+                return Some(
+                    PathBuf::from(appdata)
+                        .join("keyroost")
+                        .join("settings.json"),
+                );
             }
         }
         if let Some(profile) = std::env::var_os("USERPROFILE") {

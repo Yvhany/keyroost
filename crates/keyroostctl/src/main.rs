@@ -3456,7 +3456,11 @@ fn pick_device_interactively(
     for (i, d) in devices.iter().enumerate() {
         let serial = serials.get(i).and_then(|s| s.as_deref());
         let label = match keyring.name_for(serial) {
-            Some(name) => format!("{}  ({})", sanitize_terminal(name), sanitize_terminal(&d.product_name)),
+            Some(name) => format!(
+                "{}  ({})",
+                sanitize_terminal(name),
+                sanitize_terminal(&d.product_name)
+            ),
             None => sanitize_terminal(&d.product_name),
         };
         writeln!(out, "  {}) {:<30} {}", i + 1, label, d.path.display())?;
@@ -5871,7 +5875,10 @@ fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::erro
     println!();
     // versions/extensions/option-keys come from the device's getInfo CBOR;
     // flatten any control bytes before they reach the terminal.
-    println!("Versions:  {}", sanitize_terminal(&info.versions.join(", ")));
+    println!(
+        "Versions:  {}",
+        sanitize_terminal(&info.versions.join(", "))
+    );
     if !info.extensions.is_empty() {
         println!(
             "Extensions: {}",
@@ -6030,7 +6037,12 @@ fn run_fido_creds_list(
             } else {
                 format!("  [{} credential(s)]", creds.len())
             };
-            println!("{}{}{}", sanitize_terminal(&rp.id), name_suffix, count_suffix);
+            println!(
+                "{}{}{}",
+                sanitize_terminal(&rp.id),
+                name_suffix,
+                count_suffix
+            );
             for c in &creds {
                 let name_field = match &c.user.name {
                     Some(n) => format!("  name={:?}", n),
