@@ -39,6 +39,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
+/// Poll interval for the bounded hidapi read (macOS/Windows), in milliseconds.
+/// A report returns immediately; otherwise the read returns after this interval
+/// so the transmit loop can re-check its deadline instead of blocking forever on
+/// a silent device. Negligible overhead for a normal response (first poll
+/// returns in ~ms).
+#[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
+const HIDAPI_READ_POLL_MS: i32 = 500;
+
 /// Errors specific to the Token2 OTP applet. Kept separate from the crate-wide
 /// `TransportError` so the OTP feature can evolve without churning every other
 /// applet's error surface; the CLI maps these to exit messages.
@@ -286,11 +294,17 @@ impl HidOtpTransport {
             #[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
             HidIo::Hidapi(d) => {
                 buf.fill(0);
-                d.read(&mut buf[..hidframe::REPORT_PAYLOAD])
+                // Bounded read: hidapi is blocking by default, so without a
+                // timeout a device that goes silent mid-response would block the
+                // caller forever. `0` means the poll interval elapsed with no
+                // report; the transmit loop treats that as "retry" and re-checks
+                // its deadline. (The Linux hidraw path below has no per-read
+                // timeout without poll(2)/unsafe and stays blocking.)
+                d.read_timeout(&mut buf[..hidframe::REPORT_PAYLOAD], HIDAPI_READ_POLL_MS)
                     .map_err(|e| OtpTransportError::TransportUnavailable(e.to_string()))?
             }
         };
-        if self.debug {
+        if self.debug && n > 0 {
             if self.resp_sensitive {
                 eprintln!("[token2otp HID raw-frame] ({n} bytes) <redacted>");
             } else {
@@ -342,6 +356,10 @@ impl OtpTransport for HidOtpTransport {
                 return Err(OtpTransportError::Applet(OtpError::ButtonPressRequired));
             }
             let n = self.read_report(&mut buf)?;
+            if n == 0 {
+                // Bounded hidapi read polled with no frame; re-check the deadline.
+                continue;
+            }
             match asm.push(&buf[..n])? {
                 Step::Busy { retries } => {
                     // Fire the prompt once at the 3rd busy frame (spec §4.4).
@@ -680,7 +698,8 @@ fn probe_hid_owned(
     }
     #[cfg(not(all(target_os = "linux", not(feature = "hidapi-backend"))))]
     {
-        // hidapi's read honors its own timeout, so a direct probe can't hang.
+        // hidapi reads are now bounded via read_timeout, so a direct probe
+        // can't hang; no worker-thread wrapper is needed on this backend.
         match probe_hid(&mut t) {
             Ok(()) => Ok(t),
             Err(e) => Err((e, Some(t))),

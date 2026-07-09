@@ -9,12 +9,18 @@
 //! `CTAPHID_INIT`. KEEPALIVE frames during long-running operations are
 //! consumed transparently.
 //!
-//! Reads are blocking — the kernel hidraw driver does not surface a timeout
-//! on read(), and we deliberately avoid `unsafe` (workspace lints forbid it)
-//! so we cannot set O_NONBLOCK + poll() without taking an extra dep. In
-//! practice CTAP authenticators respond within milliseconds or send periodic
-//! KEEPALIVE frames, so a true hang only happens for an unplugged or broken
-//! device.
+//! Read bounding differs by backend. The hidapi backend (macOS/Windows) polls
+//! with a timeout ([`HIDAPI_READ_POLL_MS`]), so the overall deadline and the
+//! cooperative-cancel flag are honored even if a device goes completely silent
+//! mid-response — it cannot block a caller forever. The Linux hidraw `File`
+//! backend has no per-read timeout: the kernel driver doesn't surface one, and
+//! we deliberately avoid `unsafe` (workspace lints forbid it) so we can't set
+//! `O_NONBLOCK` + `poll(2)` without an extra dep. There, a `read()` blocks until
+//! a report arrives, so the deadline bounds *silence between* frames but not a
+//! device that sends nothing at all after the first frame — the residual
+//! total-silence hang (an unplugged/broken/hostile device) is bounded only
+//! cooperatively via the cancel flag at keepalives. In practice CTAP
+//! authenticators respond within milliseconds or send periodic KEEPALIVEs.
 
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 use std::fs::{File, OpenOptions};
@@ -32,6 +38,13 @@ pub const CTAPHID_BROADCAST_CID: u32 = 0xFFFF_FFFF;
 /// restore it to this afterwards so later commands don't inherit the long
 /// window.
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// Poll interval for the bounded hidapi read (macOS/Windows), in milliseconds.
+/// A report that arrives returns immediately; otherwise the read returns after
+/// this interval so the recv loop can re-check its deadline and cancel flag.
+/// Short enough for a responsive cancel, long enough to add no meaningful
+/// overhead to a normal transaction (the first poll returns in ~ms).
+#[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
+const HIDAPI_READ_POLL_MS: i32 = 500;
 /// Output / input HID report size on USB authenticators. Both reports are
 /// exactly 64 bytes; the leading report-ID byte (0x00) is added by the
 /// transport layer, making the host-side write 65 bytes.
@@ -226,16 +239,34 @@ impl CtapHidDevice {
     }
 
     /// Read one 64-byte input report into `buf`.
-    fn read_report(&mut self, buf: &mut [u8]) -> Result<(), HidTransportError> {
+    ///
+    /// Returns `Ok(true)` when a full report was read, `Ok(false)` when a
+    /// bounded backend polled with no report available (the caller re-checks its
+    /// overall deadline and cancel flag, then retries). The hidapi backend
+    /// (macOS/Windows) is polled with [`HIDAPI_READ_POLL_MS`] so a device that
+    /// goes silent mid-response can't block forever — hidapi is blocking by
+    /// default and no timeout is otherwise set. The Linux hidraw path has no
+    /// per-read timeout without `poll(2)` (which needs `unsafe`/a dep the crate
+    /// forbids), so it stays blocking and always returns `Ok(true)`; a truly
+    /// silent device there is bounded only cooperatively (the cancel flag, at
+    /// keepalives) — see the module docs.
+    fn read_report(&mut self, buf: &mut [u8]) -> Result<bool, HidTransportError> {
         match &mut self.io {
             #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
-            HidIo::Hidraw(f) => f.read_exact(buf)?,
+            HidIo::Hidraw(f) => {
+                f.read_exact(buf)?;
+                Ok(true)
+            }
             #[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
             HidIo::Hidapi(d) => {
                 buf.fill(0);
                 let n = d
-                    .read(buf)
+                    .read_timeout(buf, HIDAPI_READ_POLL_MS)
                     .map_err(|e| HidTransportError::Backend(e.to_string()))?;
+                if n == 0 {
+                    // Poll interval elapsed with no report; let the caller loop.
+                    return Ok(false);
+                }
                 // CTAPHID input reports are a fixed 64 bytes; a short read
                 // would otherwise let the zero-filled tail be parsed as frame
                 // content. (The hidraw path uses read_exact and can't hit this.)
@@ -246,9 +277,9 @@ impl CtapHidDevice {
                         buf.len()
                     )));
                 }
+                Ok(true)
             }
         }
-        Ok(())
     }
 
     pub fn channel_id(&self) -> u32 {
@@ -355,7 +386,16 @@ impl CtapHidDevice {
             if Instant::now() >= deadline {
                 return Err(HidTransportError::Timeout);
             }
-            self.read_report(&mut buf)?;
+            // Honor a cooperative cancel between reads (not only at KEEPALIVEs),
+            // so a silent device on the bounded backend can still be abandoned.
+            if let Some(flag) = &self.cancel {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(HidTransportError::Cancelled);
+                }
+            }
+            if !self.read_report(&mut buf)? {
+                continue; // bounded read polled with no frame; re-check deadline
+            }
             let cid = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
             let cmd = buf[4];
             if cid != expected_cid {
@@ -403,7 +443,9 @@ impl CtapHidDevice {
                 if Instant::now() >= deadline {
                     return Err(HidTransportError::Timeout);
                 }
-                self.read_report(&mut buf)?;
+                if !self.read_report(&mut buf)? {
+                    continue; // bounded read polled with no frame; re-check deadline
+                }
                 let cid2 = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
                 if cid2 != expected_cid {
                     continue;
