@@ -189,13 +189,15 @@ impl<'a, T: CtapTransport> BioEnrollment<'a, T> {
         // Each capture blocks on the user touching the sensor. The HID layer now
         // extends its deadline on every KEEPALIVE, but raise the base timeout too
         // so a device that sends sparse keepalives still gets time to capture.
+        let prev_timeout = self.dev.read_timeout();
         self.dev.set_timeout(std::time::Duration::from_secs(30));
         let params =
             timeout_ms.map(|t| Value::Map(vec![(Value::UInt(PARAM_TIMEOUT_MS), Value::UInt(t))]));
         let resp = self.dispatch(SUB_ENROLL_BEGIN, params);
-        // Restore the normal deadline so later commands don't inherit the 30s
+        // Restore the caller's deadline (not the default — an embedder's wider
+        // timeout must survive) so later commands don't inherit the 30s
         // capture window.
-        self.dev.set_timeout(crate::hid::DEFAULT_READ_TIMEOUT);
+        self.dev.set_timeout(prev_timeout);
         let resp = resp?;
         let template_id = resp
             .get_uint_key(RESP_TEMPLATE_ID)
@@ -216,6 +218,7 @@ impl<'a, T: CtapTransport> BioEnrollment<'a, T> {
         template_id: &[u8],
         timeout_ms: Option<u64>,
     ) -> Result<CaptureStatus, CtapError> {
+        let prev_timeout = self.dev.read_timeout();
         self.dev.set_timeout(std::time::Duration::from_secs(30));
         let mut p = vec![(
             Value::UInt(PARAM_TEMPLATE_ID),
@@ -225,8 +228,8 @@ impl<'a, T: CtapTransport> BioEnrollment<'a, T> {
             p.push((Value::UInt(PARAM_TIMEOUT_MS), Value::UInt(t)));
         }
         let resp = self.dispatch(SUB_ENROLL_CAPTURE_NEXT, Some(Value::Map(p)));
-        // Restore the normal deadline (see enroll_begin).
-        self.dev.set_timeout(crate::hid::DEFAULT_READ_TIMEOUT);
+        // Restore the caller's deadline (see enroll_begin).
+        self.dev.set_timeout(prev_timeout);
         let resp = resp?;
         Ok(CaptureStatus {
             last_sample_status: field_uint(&resp, RESP_LAST_ENROLL_SAMPLE_STATUS).unwrap_or(0),

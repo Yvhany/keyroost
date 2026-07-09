@@ -214,12 +214,15 @@ pub fn get_info(dev: &mut impl CtapTransport) -> Result<AuthenticatorInfo, CtapE
 /// seconds of plug-in *and* a physical touch — failures with status 0x2D
 /// usually mean the touch window has closed.
 pub fn reset(dev: &mut impl CtapTransport) -> Result<(), CtapError> {
+    // Save the caller's deadline, not the default: an embedder that widened
+    // the timeout for a slow transport must get *its* value back.
+    let prev_timeout = dev.read_timeout();
     dev.set_timeout(RESET_TIMEOUT);
     let result = dev.transact(CTAPHID_CBOR, &[CTAP2_RESET]);
-    // Restore the normal deadline unconditionally, so a later command on this
-    // device doesn't inherit the 30s reset window (which would make error paths
-    // — e.g. spammed foreign-CID frames — take 30s to surface instead of ~2s).
-    dev.set_timeout(crate::hid::DEFAULT_READ_TIMEOUT);
+    // Restore the previous deadline unconditionally, so a later command on
+    // this device doesn't inherit the 30s reset window (which would make error
+    // paths — e.g. spammed foreign-CID frames — take 30s to surface).
+    dev.set_timeout(prev_timeout);
     let resp = result?;
     let (status, _) = split_status(&resp)?;
     if status != 0 {

@@ -377,25 +377,37 @@ impl CtapHidDevice {
         Ok(())
     }
 
+    /// One bounded wait step, shared by the initiation- and continuation-frame
+    /// loops in `recv` so their retry policy can't drift apart:
+    /// - errors when `deadline` has passed — checked on every frame, not just
+    ///   KEEPALIVEs, so a misbehaving device spamming foreign-CID frames can't
+    ///   spin forever;
+    /// - honors a cooperative cancel between reads (not only at KEEPALIVEs),
+    ///   so a device that goes silent on the bounded backend — even mid-way
+    ///   through a multi-frame response — can still be abandoned promptly;
+    /// - otherwise polls one report; `Ok(false)` means no frame yet.
+    fn wait_report(
+        &mut self,
+        deadline: Instant,
+        buf: &mut [u8; CTAPHID_REPORT_SIZE],
+    ) -> Result<bool, HidTransportError> {
+        if Instant::now() >= deadline {
+            return Err(HidTransportError::Timeout);
+        }
+        if let Some(flag) = &self.cancel {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(HidTransportError::Cancelled);
+            }
+        }
+        self.read_report(buf)
+    }
+
     fn recv(&mut self, expected_cid: u32, expected_cmd: u8) -> Result<Vec<u8>, HidTransportError> {
         let mut deadline = Instant::now() + self.timeout;
         let mut buf = [0u8; CTAPHID_REPORT_SIZE];
 
         loop {
-            // Check the deadline on every frame, not just KEEPALIVEs: a
-            // misbehaving device spamming foreign-CID frames would otherwise
-            // spin here forever.
-            if Instant::now() >= deadline {
-                return Err(HidTransportError::Timeout);
-            }
-            // Honor a cooperative cancel between reads (not only at KEEPALIVEs),
-            // so a silent device on the bounded backend can still be abandoned.
-            if let Some(flag) = &self.cancel {
-                if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Err(HidTransportError::Cancelled);
-                }
-            }
-            if !self.read_report(&mut buf)? {
+            if !self.wait_report(deadline, &mut buf)? {
                 continue; // bounded read polled with no frame; re-check deadline
             }
             let cid = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -442,10 +454,7 @@ impl CtapHidDevice {
 
             let mut seq: u8 = 0;
             while payload.len() < bcnt {
-                if Instant::now() >= deadline {
-                    return Err(HidTransportError::Timeout);
-                }
-                if !self.read_report(&mut buf)? {
+                if !self.wait_report(deadline, &mut buf)? {
                     continue; // bounded read polled with no frame; re-check deadline
                 }
                 let cid2 = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -532,6 +541,10 @@ impl crate::transport::CtapTransport for CtapHidDevice {
 
     fn set_timeout(&mut self, timeout: std::time::Duration) {
         CtapHidDevice::set_timeout(self, timeout);
+    }
+
+    fn read_timeout(&self) -> std::time::Duration {
+        CtapHidDevice::read_timeout(self)
     }
 
     fn set_cancel_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {

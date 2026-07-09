@@ -25,6 +25,9 @@ impl<T: CtapTransport + ?Sized> CtapTransport for &mut T {
     fn set_timeout(&mut self, timeout: std::time::Duration) {
         (**self).set_timeout(timeout);
     }
+    fn read_timeout(&self) -> std::time::Duration {
+        (**self).read_timeout()
+    }
     fn set_cancel_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         (**self).set_cancel_flag(flag);
     }
@@ -39,6 +42,9 @@ impl CtapTransport for Box<dyn CtapTransport> {
     }
     fn set_timeout(&mut self, timeout: std::time::Duration) {
         (**self).set_timeout(timeout);
+    }
+    fn read_timeout(&self) -> std::time::Duration {
+        (**self).read_timeout()
     }
     fn set_cancel_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         (**self).set_cancel_flag(flag);
@@ -61,6 +67,14 @@ pub trait CtapTransport {
     /// manage their own timeouts (PC/SC drivers apply their own card timeouts)
     /// can leave the default no-op.
     fn set_timeout(&mut self, _timeout: std::time::Duration) {}
+
+    /// The read timeout currently in effect, so a long-window operation (reset,
+    /// fingerprint capture) can save the caller's configured value and restore
+    /// *it* afterwards instead of clobbering it back to the default. Transports
+    /// whose `set_timeout` is a no-op just report the HID default.
+    fn read_timeout(&self) -> std::time::Duration {
+        crate::hid::DEFAULT_READ_TIMEOUT
+    }
 
     /// Wire in a cooperative cancel flag so a capture blocked waiting for a touch
     /// can abort promptly when the user cancels.
