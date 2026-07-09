@@ -23,7 +23,7 @@ use keyroost_resolve::{
 
 mod overview;
 
-/// The global `--name` selector, captured once in `run()` so the FIDO device
+/// The global `--device` selector, captured once in `run()` so the FIDO device
 /// resolver can honor it without threading it through every subcommand handler.
 static SELECTED_KEY_NAME: OnceLock<Option<String>> = OnceLock::new();
 
@@ -359,8 +359,14 @@ struct Cli {
     debug: bool,
     /// Target a security key by its friendly name (see the `key-name` command).
     /// Resolves to the device's current path. Mutually exclusive with --path.
+    //
+    // Named `device` (flag `--device`), not `name`: a *global* arg whose clap id
+    // is `name` merges with every subcommand arg of the same id (e.g. the
+    // `oath add <NAME>` positional, `fido fingerprint --name`), so a credential
+    // or fingerprint name was being consumed as this device selector. A distinct
+    // id keeps the global selector separate from all of them.
     #[arg(long, global = true, value_name = "NAME")]
-    name: Option<String>,
+    device: Option<String>,
     /// Emit machine-readable JSON instead of human text (where supported: status
     /// and query commands). Side-effect commands ignore it.
     #[arg(long, global = true)]
@@ -2173,9 +2179,9 @@ fn read_password(stdin: bool, env_var: Option<&str>) -> Option<zeroize::Zeroizin
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    // Capture --name once so resolve_fido_path() can honor it without threading
+    // Capture --device once so resolve_fido_path() can honor it without threading
     // it through every FIDO subcommand handler.
-    let _ = SELECTED_KEY_NAME.set(cli.name.clone());
+    let _ = SELECTED_KEY_NAME.set(cli.device.clone());
     let _ = JSON_OUTPUT.set(cli.json);
 
     if cli.list_readers {
@@ -3306,16 +3312,16 @@ fn fido_target_hint(path: Option<&Path>) -> String {
         }
         [] => String::new(),
         many => format!(
-            " — {} FIDO keys connected; pass --name or --path to choose",
+            " — {} FIDO keys connected; pass --device or --path to choose",
             many.len()
         ),
     }
 }
 
-/// Resolve the global `--name` (if set) to a PC/SC reader name via the shared
-/// device model, so `--name` targets smart-card / Molto2 groups the same way
+/// Resolve the global `--device` (if set) to a PC/SC reader name via the shared
+/// device model, so `--device` targets smart-card / Molto2 groups the same way
 /// `--reader` does. Returns the reader substring to match, or None when no
-/// `--name` was given. Errors if a name is set but resolves to no PC/SC reader.
+/// `--device` was given. Errors if a name is set but resolves to no PC/SC reader.
 fn reader_from_name() -> Result<Option<String>, Box<dyn std::error::Error>> {
     let Some(name) = SELECTED_KEY_NAME.get().and_then(|o| o.clone()) else {
         return Ok(None);
@@ -3339,7 +3345,7 @@ fn reader_from_name() -> Result<Option<String>, Box<dyn std::error::Error>> {
 fn resolve_fido_path(explicit: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let name = SELECTED_KEY_NAME.get().and_then(|o| o.as_deref());
     if explicit.is_some() && name.is_some() {
-        return Err("pass either --path or --name, not both".into());
+        return Err("pass either --path or --device, not both".into());
     }
     // An explicit --path is trusted as-is (preserves prior behavior).
     if let Some(p) = explicit {
@@ -3380,7 +3386,7 @@ fn resolve_fido_path(explicit: Option<&Path>) -> Result<PathBuf, Box<dyn std::er
 /// can't speak CTAP until re-plugged into application mode).
 fn no_fido_device_error() -> Box<dyn std::error::Error> {
     let mut msg =
-        String::from("no FIDO HID device found. Plug a security key in, or pass --path/--name.");
+        String::from("no FIDO HID device found. Plug a security key in, or pass --path/--device.");
     if let Some(bl) = keyroost_hid::bootloader_device_present() {
         msg.push_str(&format!(
             " (Detected {bl} — re-plug it to return to application mode.)"
@@ -3406,7 +3412,7 @@ fn announce_target(keyring: &Keyring, path: &Path, label: &str, serial: Option<&
     }
 }
 
-/// Pick one device when no `--path`/`--name` was given: a lone key is used
+/// Pick one device when no `--path`/`--device` was given: a lone key is used
 /// directly; with several, an interactive picker runs on the terminal, and in a
 /// non-interactive context we refuse rather than guess. Returns the chosen index
 /// into `devices`. `serials` is parallel to `devices` (used for name display).
@@ -3426,7 +3432,7 @@ fn pick_from_devices(
                     .map(|d| d.path.display().to_string())
                     .collect();
                 Err(format!(
-                    "{} FIDO devices connected; pass --name or --path \
+                    "{} FIDO devices connected; pass --device or --path \
                      (or run in a terminal to choose): {}",
                     devices.len(),
                     paths.join(", ")
@@ -6658,6 +6664,37 @@ mod cli_tests {
     }
 
     #[test]
+    fn oath_add_positional_name_does_not_hijack_device_selector() {
+        // Regression: a subcommand's `name` arg must not be consumed as the
+        // global device selector. That happened when the global selector shared
+        // the clap id `name` (a global arg merges with same-id subcommand args),
+        // so `oath add <NAME>` routed the credential name into device resolution
+        // and could never run. The global selector's id/flag is now `--device`.
+        let cli = parse(&[
+            "keyroostctl",
+            "oath",
+            "add",
+            "issuer:acct",
+            "--secret-stdin",
+        ])
+        .unwrap();
+        assert!(
+            cli.device.is_none(),
+            "the global --device selector must stay unset when only a positional is given"
+        );
+        match cli.command {
+            Some(Cmd::Oath {
+                cmd: OathCmd::Add { name, .. },
+            }) => assert_eq!(name, "issuer:acct"),
+            _ => panic!("expected `oath add` with the credential name bound to the positional"),
+        }
+
+        // And --device still selects a device, independent of any positional.
+        let cli2 = parse(&["keyroostctl", "--device", "mykey", "oath", "list"]).unwrap();
+        assert_eq!(cli2.device.as_deref(), Some("mykey"));
+    }
+
+    #[test]
     fn sanitize_terminal_flattens_all_control_chars() {
         // ESC-based CSI, OSC with BEL, DEL, and a C1 byte all become spaces.
         let dirty = "a\x1b[31mb\x1b]0;t\x07c\x7fd\u{9b}e";
@@ -6809,12 +6846,12 @@ mod cli_tests {
     #[test]
     fn name_is_accepted_on_every_group() {
         for g in [
-            &["keyroostctl", "--name", "k", "piv", "status"][..],
-            &["keyroostctl", "--name", "k", "oath", "list"][..],
-            &["keyroostctl", "--name", "k", "openpgp", "status"][..],
-            &["keyroostctl", "--name", "k", "otp", "list"][..],
-            &["keyroostctl", "--name", "k", "molto", "info"][..],
-            &["keyroostctl", "--name", "k", "fido", "info"][..],
+            &["keyroostctl", "--device", "k", "piv", "status"][..],
+            &["keyroostctl", "--device", "k", "oath", "list"][..],
+            &["keyroostctl", "--device", "k", "openpgp", "status"][..],
+            &["keyroostctl", "--device", "k", "otp", "list"][..],
+            &["keyroostctl", "--device", "k", "molto", "info"][..],
+            &["keyroostctl", "--device", "k", "fido", "info"][..],
         ] {
             assert!(parse(g).is_ok(), "should parse: {:?}", g);
         }

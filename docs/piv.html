@@ -139,7 +139,7 @@ unset PIV_MGMT PIV_PIN   # clear the secrets when you're done</code></pre>
     <p>Swap <code>self-sign</code> for <code>request-cert --file slot-$slot.csr</code> if a
       certificate authority issues your certificates; import each one later with
       <code>import-cert --slot "$slot" --file …</code>. Use <code>--reader &lt;substr&gt;</code>
-      (or <code>--name</code> with a <a href="naming.html">friendly name</a>) to pin the loop
+      (or <code>--device</code> with a <a href="naming.html">friendly name</a>) to pin the loop
       to one device when several are plugged in.</p>
     <div class="kr-callout note">
       <div class="kr-callout-title note">One slot? The GUI is fine.</div>

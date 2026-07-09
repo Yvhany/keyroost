@@ -54,7 +54,7 @@
       serial number</strong>, so "signing-yubikey" always means the same physical key no
       matter which port it's in.</p>
     <p>This makes the device list easier to read at a glance, and it lets you target a
-      specific key on the command line with <code>--name</code> instead of hunting for the
+      specific key on the command line with <code>--device</code> instead of hunting for the
       right path.</p>
   </section>
 
@@ -104,7 +104,7 @@
 keyroostctl key-name list
 keyroostctl key-name remove signing-yubikey</code></pre>
     <p>Once a key is named, commands that target a single key accept
-      <code>--name signing-yubikey</code> to pick it out, instead of a device path that
+      <code>--device signing-yubikey</code> to pick it out, instead of a device path that
       changes between plugs.</p>
     <div class="kr-callout note">
       <div class="kr-callout-title note">Label rules</div>
