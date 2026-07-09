@@ -589,9 +589,18 @@ impl PcScOtpTransport {
                 }
                 0x6C => {
                     let le = sw_bytes[1];
-                    // Re-send the original command with the corrected Le appended.
+                    // Re-send with the card-suggested Le. The commands routed
+                    // here are case 2 (a single trailing Le byte), so replace
+                    // that byte rather than appending a second one — appending
+                    // produced `… Le_old Le_new`, a malformed APDU. (Mirrors the
+                    // CTAP PC/SC path; a bare 4-byte case-1 header, which never
+                    // reaches here, would fall back to appending.)
                     to_send = apdu.to_vec();
-                    to_send.push(le);
+                    if to_send.len() >= 5 {
+                        *to_send.last_mut().unwrap() = le;
+                    } else {
+                        to_send.push(le);
+                    }
                     acc.clear(); // the 6C response carried no data
                     chunks = 0;
                     continue;
