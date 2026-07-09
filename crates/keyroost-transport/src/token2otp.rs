@@ -39,14 +39,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
-/// Poll interval for the bounded hidapi read (macOS/Windows), in milliseconds.
-/// A report returns immediately; otherwise the read returns after this interval
-/// so the transmit loop can re-check its deadline instead of blocking forever on
-/// a silent device. Negligible overhead for a normal response (first poll
-/// returns in ~ms).
-#[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
-const HIDAPI_READ_POLL_MS: i32 = 500;
-
 /// Errors specific to the Token2 OTP applet. Kept separate from the crate-wide
 /// `TransportError` so the OTP feature can evolve without churning every other
 /// applet's error surface; the CLI maps these to exit messages.
@@ -293,14 +285,13 @@ impl HidOtpTransport {
             }
             #[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
             HidIo::Hidapi(d) => {
-                buf.fill(0);
-                // Bounded read: hidapi is blocking by default, so without a
-                // timeout a device that goes silent mid-response would block the
-                // caller forever. `0` means the poll interval elapsed with no
-                // report; the transmit loop treats that as "retry" and re-checks
-                // its deadline. (The Linux hidraw path below has no per-read
+                // Bounded read via the shared helper (see
+                // `keyroost_hid::read_report_bounded` for the poll contract):
+                // `0` means the poll interval elapsed with no report; the
+                // transmit loop treats that as "retry" and re-checks its
+                // deadline. (The Linux hidraw path above has no per-read
                 // timeout without poll(2)/unsafe and stays blocking.)
-                d.read_timeout(&mut buf[..hidframe::REPORT_PAYLOAD], HIDAPI_READ_POLL_MS)
+                keyroost_hid::read_report_bounded(d, &mut buf[..hidframe::REPORT_PAYLOAD])
                     .map_err(|e| OtpTransportError::TransportUnavailable(e.to_string()))?
             }
         };

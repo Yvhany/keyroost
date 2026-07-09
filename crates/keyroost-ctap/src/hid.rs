@@ -38,13 +38,6 @@ pub const CTAPHID_BROADCAST_CID: u32 = 0xFFFF_FFFF;
 /// restore it to this afterwards so later commands don't inherit the long
 /// window.
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(2);
-/// Poll interval for the bounded hidapi read (macOS/Windows), in milliseconds.
-/// A report that arrives returns immediately; otherwise the read returns after
-/// this interval so the recv loop can re-check its deadline and cancel flag.
-/// Short enough for a responsive cancel, long enough to add no meaningful
-/// overhead to a normal transaction (the first poll returns in ~ms).
-#[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
-const HIDAPI_READ_POLL_MS: i32 = 500;
 /// Output / input HID report size on USB authenticators. Both reports are
 /// exactly 64 bytes; the leading report-ID byte (0x00) is added by the
 /// transport layer, making the host-side write 65 bytes.
@@ -243,10 +236,10 @@ impl CtapHidDevice {
     /// Returns `Ok(true)` when a full report was read, `Ok(false)` when a
     /// bounded backend polled with no report available (the caller re-checks its
     /// overall deadline and cancel flag, then retries). The hidapi backend
-    /// (macOS/Windows) is polled with [`HIDAPI_READ_POLL_MS`] so a device that
-    /// goes silent mid-response can't block forever — hidapi is blocking by
-    /// default and no timeout is otherwise set. The Linux hidraw path has no
-    /// per-read timeout without `poll(2)` (which needs `unsafe`/a dep the crate
+    /// (macOS/Windows) reads through [`keyroost_hid::read_report_bounded`] so a
+    /// device that goes silent mid-response can't block forever — see that
+    /// helper for the poll contract. The Linux hidraw path has no per-read
+    /// timeout without `poll(2)` (which needs `unsafe`/a dep the crate
     /// forbids), so it stays blocking and always returns `Ok(true)`; a truly
     /// silent device there is bounded only cooperatively (the cancel flag, at
     /// keepalives) — see the module docs.
@@ -259,9 +252,7 @@ impl CtapHidDevice {
             }
             #[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
             HidIo::Hidapi(d) => {
-                buf.fill(0);
-                let n = d
-                    .read_timeout(buf, HIDAPI_READ_POLL_MS)
+                let n = keyroost_hid::read_report_bounded(d, buf)
                     .map_err(|e| HidTransportError::Backend(e.to_string()))?;
                 if n == 0 {
                     // Poll interval elapsed with no report; let the caller loop.

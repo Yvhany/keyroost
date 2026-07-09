@@ -182,6 +182,45 @@ fn enumerate_hidapi() -> Result<Vec<HidDevice>, HidError> {
     Ok(devices)
 }
 
+/// Poll interval, in milliseconds, for bounded reads on the hidapi backend —
+/// see [`read_report_bounded`], the one place that uses it.
+#[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
+pub const READ_POLL_MS: i32 = 500;
+
+/// One bounded input-report read against a hidapi device.
+///
+/// hidapi reads are blocking by default, so a device that goes silent
+/// mid-response would hang its caller forever. Every keyroost transport that
+/// reads HID reports through hidapi (the CTAP-HID transport in `keyroost-ctap`
+/// and the Token2 OTP transport in `keyroost-transport`) reads through this
+/// helper instead: it blocks at most [`READ_POLL_MS`], returning `Ok(0)` when
+/// the interval elapsed with no report — callers loop on that, re-checking
+/// their overall deadline and cancel flag — and `Ok(n)` when a report of `n`
+/// bytes arrived (`buf` is zeroed first so no stale tail survives a short
+/// read). A report that has already arrived returns immediately, so the poll
+/// adds no meaningful latency to a normal transaction; 500 ms keeps a
+/// cooperative cancel responsive.
+///
+/// This helper exists so the poll interval, the `0 = poll expired` contract,
+/// and this caveat live in exactly one place. Two policies deliberately stay
+/// with the callers:
+/// - **Short reads**: CTAP-HID input reports are a fixed 64 bytes, so
+///   `keyroost-ctap` rejects `n != buf.len()`; the Token2 OTP framing
+///   tolerates a short frame and hands `buf[..n]` to its reassembler.
+/// - **Linux hidraw**: the dependency-free production backend on Linux reads
+///   `/dev/hidrawN` directly, which has no per-read timeout without `poll(2)`
+///   (`unsafe`/a dep this workspace avoids). That path stays blocking and is
+///   bounded only cooperatively; this helper governs macOS/Windows (and Linux
+///   under the testing-oriented `hidapi-backend` feature).
+#[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
+pub fn read_report_bounded(
+    dev: &hidapi::HidDevice,
+    buf: &mut [u8],
+) -> Result<usize, hidapi::HidError> {
+    buf.fill(0);
+    dev.read_timeout(buf, READ_POLL_MS)
+}
+
 /// Dependency-free Linux backend: enumerate `/dev/hidraw*` via sysfs metadata.
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 fn enumerate_sysfs() -> Result<Vec<HidDevice>, HidError> {
