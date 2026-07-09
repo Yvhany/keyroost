@@ -3,11 +3,14 @@
 //! summary. All formatting is pure and unit-tested; the `print_*` fns are thin
 //! stdout wrappers.
 
+use crate::sanitize_terminal;
 use keyroost_resolve::{Device, DeviceKind};
 
-/// The display label: the friendly name when set, else the model.
-fn label(dev: &Device) -> &str {
-    dev.name.as_deref().unwrap_or(&dev.model)
+/// The display label: the friendly name when set, else the model. Sanitized —
+/// the model comes from the device's USB descriptor and the name from
+/// user-editable `keys.json`, so both are attacker-influenced.
+fn label(dev: &Device) -> String {
+    sanitize_terminal(dev.name.as_deref().unwrap_or(&dev.model))
 }
 
 /// Capability badges joined for display, e.g. "FIDO2 · OATH · PGP · PIV".
@@ -16,10 +19,12 @@ fn badge_line(dev: &Device) -> String {
 }
 
 /// Short serial for the at-a-glance overview: first 8 chars, "…" if longer.
-/// (The full serial lives in `keyroostctl list`.)
+/// (The full serial lives in `keyroostctl list`.) Sanitized: the serial is a
+/// device-supplied string.
 fn short_serial(serial: &str) -> String {
+    let serial = sanitize_terminal(serial);
     if serial.chars().count() <= 8 {
-        serial.to_string()
+        serial
     } else {
         let head: String = serial.chars().take(8).collect();
         format!("{head}…")
@@ -65,7 +70,7 @@ pub fn overview_lines(devices: &[Device]) -> Vec<String> {
         .map(|d| {
             format!(
                 "  {:wv$}  {:wm$}  {:wb$}  {:ws$}  {}",
-                d.vendor,
+                sanitize_terminal(&d.vendor),
                 label(d),
                 badge_line(d),
                 short_serial(&d.serial),
@@ -93,16 +98,23 @@ pub fn correlated_lines(devices: &[Device]) -> Vec<String> {
                 DeviceKind::ProgToken => "Programmable token",
                 DeviceKind::Key => "Key",
             };
+            // The reader name embeds the USB product string; sanitize it. The
+            // HID path is a device node (e.g. /dev/hidraw0), sanitized for
+            // uniformity.
             let pairing = match (&d.hid_path, &d.reader) {
-                (Some(p), Some(r)) => format!("{} + '{}'", p.display(), r),
-                (Some(p), None) => p.display().to_string(),
-                (None, Some(r)) => format!("'{}' (no HID)", r),
+                (Some(p), Some(r)) => format!(
+                    "{} + '{}'",
+                    sanitize_terminal(&p.display().to_string()),
+                    sanitize_terminal(r)
+                ),
+                (Some(p), None) => sanitize_terminal(&p.display().to_string()),
+                (None, Some(r)) => format!("'{}' (no HID)", sanitize_terminal(r)),
                 (None, None) => "(none)".to_string(),
             };
             format!(
                 "  {:5}  {} {}  {}  {}",
                 kind,
-                d.vendor,
+                sanitize_terminal(&d.vendor),
                 label(d),
                 badge_line(d),
                 pairing
@@ -215,6 +227,35 @@ mod tests {
         let m0 = lines[0].find("work-key").unwrap();
         let m1 = lines[1].find("Molto2").unwrap();
         assert_eq!(m0, m1);
+    }
+
+    #[test]
+    fn device_strings_flatten_terminal_escapes() {
+        // A hostile USB device puts ANSI/control bytes in its descriptor
+        // strings; neither overview nor the correlated summary may emit them raw.
+        let mut d = dev(
+            "Yub\x1b[31mico",
+            "K\x1b]0;pwn\x07ey",
+            None,
+            "AB\x1bCD\u{9b}6n",
+            "USB · PC/SC",
+            caps_of(&[Caps::FIDO2]),
+            DeviceKind::Key,
+        );
+        d.reader = Some("Rd\x1b[2Jr".into());
+
+        for line in overview_lines(std::slice::from_ref(&d)) {
+            assert!(
+                !line.chars().any(|c| c.is_control()),
+                "overview line leaked a control char: {line:?}"
+            );
+        }
+        for line in correlated_lines(std::slice::from_ref(&d)) {
+            assert!(
+                !line.chars().any(|c| c.is_control()),
+                "correlated line leaked a control char: {line:?}"
+            );
+        }
     }
 
     #[test]

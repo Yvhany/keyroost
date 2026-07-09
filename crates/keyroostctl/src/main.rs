@@ -333,6 +333,15 @@ mod json_out {
         /// the RP's AEAD ciphertext for an opaque entry).
         pub hex: String,
     }
+
+    /// `keyroostctl prog --json info`.
+    #[derive(Serialize)]
+    pub struct ProgInfoJson {
+        pub serial: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub model: Option<String>,
+        pub utc_time: u32,
+    }
 }
 
 #[derive(Parser)]
@@ -2396,7 +2405,7 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
                 if b.seed_present { "yes" } else { "-" },
                 b.title
                     .as_deref()
-                    .map(sanitize_cert_field)
+                    .map(sanitize_terminal)
                     .unwrap_or_default(),
                 molto_algo_label(b.algorithm),
                 b.time_step,
@@ -2416,7 +2425,7 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
         session.set_debug(debug);
         let block = session.read_public_data(*profile)?;
         match &block.title {
-            Some(t) => println!("slot #{} title: {}", profile, sanitize_cert_field(t)),
+            Some(t) => println!("slot #{} title: {}", profile, sanitize_terminal(t)),
             None => println!("slot #{} has no title", profile),
         }
         println!(
@@ -2441,14 +2450,14 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
             block
                 .title
                 .as_deref()
-                .map(sanitize_cert_field)
+                .map(sanitize_terminal)
                 .unwrap_or_else(|| "(none)".into()),
         );
         if !yes {
             return Err(format!(
                 "refusing to delete slot #{}'s seed on device serial {} without --yes",
                 profile,
-                sanitize_cert_field(&info.serial)
+                sanitize_terminal(&info.serial)
             )
             .into());
         }
@@ -2475,7 +2484,7 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
         if !yes {
             return Err(format!(
                 "refusing to factory-reset device serial {} without --yes",
-                sanitize_cert_field(&info.serial)
+                sanitize_terminal(&info.serial)
             )
             .into());
         }
@@ -2841,21 +2850,20 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             let info = session.read_info()?;
             let model = info.model();
             if json_output() {
-                println!(
-                    "{{\"serial\":\"{}\",\"model\":{},\"utc_time\":{}}}",
-                    info.serial,
-                    match model {
-                        Some(m) => format!("\"{m}\""),
-                        None => "null".to_string(),
-                    },
-                    info.utc_time
-                );
+                // serde escapes the device-supplied serial; the old hand-built
+                // JSON did not, so a serial with `"`/`\`/control bytes produced
+                // invalid or field-injected JSON for consuming scripts.
+                emit_json(&json_out::ProgInfoJson {
+                    serial: info.serial.clone(),
+                    model: model.map(str::to_owned),
+                    utc_time: info.utc_time,
+                })?;
             } else {
                 match model {
                     Some(m) => println!("model:    {m}"),
                     None => println!("model:    (unrecognized serial — not a known Token2 model)"),
                 }
-                println!("serial:   {}", info.serial);
+                println!("serial:   {}", sanitize_terminal(&info.serial));
                 println!("utc_time: {}", info.utc_time);
             }
         }
@@ -2936,13 +2944,13 @@ fn prog_guard_model(
     let info = session.read_info()?;
     match info.model() {
         Some(model) => {
-            eprintln!("[*] {model} (serial {})", info.serial);
+            eprintln!("[*] {model} (serial {})", sanitize_terminal(&info.serial));
             Ok(model)
         }
         None => Err(format!(
             "serial '{}' does not match any known Token2 programmable-token model; \
              refusing to program this device. Run `keyroostctl prog info` to inspect it.",
-            info.serial
+            sanitize_terminal(&info.serial)
         )
         .into()),
     }
@@ -3060,20 +3068,20 @@ fn run_doctor() {
                         {
                             Ok(_) => println!(
                                 "✓ {} ({}) is accessible",
-                                d.product_name,
+                                sanitize_terminal(&d.product_name),
                                 d.path.display()
                             ),
                             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                                 println!(
                                     "✗ {} ({}) permission denied — install the udev rules \
                                      (see README) and re-plug the key",
-                                    d.product_name,
+                                    sanitize_terminal(&d.product_name),
                                     d.path.display()
                                 );
                             }
                             Err(e) => println!(
                                 "✗ {} ({}) open failed: {}",
-                                d.product_name,
+                                sanitize_terminal(&d.product_name),
                                 d.path.display(),
                                 e
                             ),
@@ -3134,7 +3142,7 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
         Ok(readers) if readers.is_empty() => println!("  (none)"),
         Ok(readers) => {
             for r in readers {
-                println!("  {}", r);
+                println!("  {}", sanitize_terminal(&r));
             }
         }
         Err(e) => println!("  (unavailable: {})", e),
@@ -3154,7 +3162,7 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
     } else if probe_ok {
         for p in &probes {
             if p.is_molto2 {
-                println!("  {}  [Molto2 token]", p.reader_name);
+                println!("  {}  [Molto2 token]", sanitize_terminal(&p.reader_name));
                 continue;
             }
             let mut applets = Vec::new();
@@ -3172,7 +3180,7 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 applets.join(", ")
             };
-            println!("  {}  ->  {}", p.reader_name, list);
+            println!("  {}  ->  {}", sanitize_terminal(&p.reader_name), list);
         }
     }
 
@@ -3213,20 +3221,21 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
                     .clone()
                     .or_else(|| ccid_serial_for(d, &ccid));
                 let serial = match (&d.serial_number, &eff) {
-                    (Some(s), _) => format!(" serial={}", s),
-                    (None, Some(s)) => format!(" serial={}(ccid)", s),
+                    (Some(s), _) => format!(" serial={}", sanitize_terminal(s)),
+                    (None, Some(s)) => format!(" serial={}(ccid)", sanitize_terminal(s)),
                     (None, None) => String::new(),
                 };
                 let name = keyring
                     .name_for(eff.as_deref())
-                    .map(|n| format!(" name={}", n))
+                    .map(|n| format!(" name={}", sanitize_terminal(n)))
                     .unwrap_or_default();
+                let pname = sanitize_terminal(&d.product_name);
                 let model = if d.vendor_id == keyroost_proto::USB_VID {
                     keyroost_proto::token2_pid_label(d.product_id)
-                        .map(|l| format!("{} [{}]", d.product_name, l))
-                        .unwrap_or_else(|| d.product_name.clone())
+                        .map(|l| format!("{} [{}]", pname, l))
+                        .unwrap_or_else(|| pname.clone())
                 } else {
-                    d.product_name.clone()
+                    pname
                 };
                 println!(
                     "  {} {:04x}:{:04x} usage={:04x}:{:04x} {}{}{}{}",
@@ -3269,7 +3278,11 @@ fn fido_target_hint(path: Option<&Path>) -> String {
     if let Some(name) = SELECTED_KEY_NAME.get().and_then(|o| o.as_deref()) {
         let connected = connected_keys(&devices);
         if let Ok(dev) = keyring.resolve(name, &connected) {
-            return format!(" — target: {} at {}", dev.label, dev.path.display());
+            return format!(
+                " — target: {} at {}",
+                sanitize_terminal(&dev.label),
+                dev.path.display()
+            );
         }
         return String::new();
     }
@@ -3279,7 +3292,11 @@ fn fido_target_hint(path: Option<&Path>) -> String {
             let label = keyring
                 .name_for(serials[0].as_deref())
                 .unwrap_or(&d.product_name);
-            format!(" — target: {} at {}", label, d.path.display())
+            format!(
+                " — target: {} at {}",
+                sanitize_terminal(label),
+                d.path.display()
+            )
         }
         [] => String::new(),
         many => format!(
@@ -3369,8 +3386,16 @@ fn no_fido_device_error() -> Box<dyn std::error::Error> {
 /// Print the resolved target to stderr so the user always sees which physical
 /// key a command is about to act on (annotated with its friendly name if set).
 fn announce_target(keyring: &Keyring, path: &Path, label: &str, serial: Option<&str>) {
+    // `label` is a device USB product string and the keyring name is
+    // user-editable; both reach the terminal, so flatten control chars.
+    let label = sanitize_terminal(label);
     match keyring.name_for(serial) {
-        Some(name) => eprintln!("\u{2192} {} ({}, {})", name, label, path.display()),
+        Some(name) => eprintln!(
+            "\u{2192} {} ({}, {})",
+            sanitize_terminal(name),
+            label,
+            path.display()
+        ),
         None => eprintln!("\u{2192} {} ({})", label, path.display()),
     }
 }
@@ -3431,8 +3456,8 @@ fn pick_device_interactively(
     for (i, d) in devices.iter().enumerate() {
         let serial = serials.get(i).and_then(|s| s.as_deref());
         let label = match keyring.name_for(serial) {
-            Some(name) => format!("{}  ({})", name, d.product_name),
-            None => d.product_name.clone(),
+            Some(name) => format!("{}  ({})", sanitize_terminal(name), sanitize_terminal(&d.product_name)),
+            None => sanitize_terminal(&d.product_name),
         };
         writeln!(out, "  {}) {:<30} {}", i + 1, label, d.path.display())?;
     }
@@ -3523,7 +3548,7 @@ fn open_oath(
 ) -> Result<keyroost_transport::OathSession, Box<dyn std::error::Error>> {
     let by_name = reader_from_name()?;
     let name = resolve_oath_reader(access.reader.as_deref().or(by_name.as_deref()))?;
-    eprintln!("\u{2192} OATH on {}", name);
+    eprintln!("\u{2192} OATH on {}", sanitize_terminal(&name));
     let mut session = keyroost_transport::OathSession::open(&name)?;
     session.set_debug(debug);
     match access.password()? {
@@ -3561,7 +3586,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 for c in creds {
                     println!(
                         "{}  [{}/{}]",
-                        c.name,
+                        sanitize_terminal(&c.name),
                         oath_type_str(c.oath_type),
                         oath_algo_str(c.algorithm)
                     );
@@ -3735,6 +3760,8 @@ fn run_otp(
                     } else {
                         format!("{}:{}", e.app_name, e.account_name)
                     };
+                    // app/account names come from the device; strip escapes.
+                    let label = sanitize_terminal(&label);
                     let code = e.code.as_deref().unwrap_or("\u{2014}"); // em dash when withheld
                     println!(
                         "{label}  [{}/{}]  {}{}",
@@ -4774,7 +4801,7 @@ fn open_openpgp(
     let readers = keyroost_transport::OpenPgpSession::list_openpgp_readers()?;
     let by_name = reader_from_name()?;
     let name = resolve_reader(readers, reader.or(by_name.as_deref()), "OpenPGP")?;
-    eprintln!("\u{2192} OpenPGP on {}", name);
+    eprintln!("\u{2192} OpenPGP on {}", sanitize_terminal(&name));
     let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
     session.set_debug(debug);
     Ok(session)
@@ -4788,7 +4815,7 @@ fn open_piv(
     let readers = keyroost_transport::PivSession::list_piv_readers()?;
     let by_name = reader_from_name()?;
     let name = resolve_reader(readers, reader.or(by_name.as_deref()), "PIV")?;
-    eprintln!("\u{2192} PIV on {}", name);
+    eprintln!("\u{2192} PIV on {}", sanitize_terminal(&name));
     let mut session = keyroost_transport::PivSession::open(&name)?;
     session.set_debug(debug);
     Ok(session)
@@ -4933,7 +4960,9 @@ fn key_name_add(name: &str, path: Option<&Path>) -> Result<(), Box<dyn std::erro
     // Opt-in disclosure: state plainly what is stored, and how to undo it.
     eprintln!(
         "Recording \"{}\" \u{2192} serial {} ({}).",
-        name, serial, dev.product_name
+        sanitize_terminal(name),
+        sanitize_terminal(&serial),
+        sanitize_terminal(&dev.product_name)
     );
     eprintln!(
         "This saves the key's serial number to keys.json on this computer so the \
@@ -4963,7 +4992,12 @@ fn key_name_list() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .any(|c| c.serial.as_deref() == Some(k.serial.as_str()));
         let status = if here { "connected" } else { "not connected" };
-        println!("  {:<20} serial={} [{}]", k.name, k.serial, status);
+        println!(
+            "  {:<20} serial={} [{}]",
+            sanitize_terminal(&k.name),
+            sanitize_terminal(&k.serial),
+            status
+        );
     }
     Ok(())
 }
@@ -5371,8 +5405,8 @@ fn run_fido_large_blob_list(
                 "[{}] {} bytes  ssh-cert  {} ({})",
                 i,
                 e.orig_size,
-                sanitize_cert_field(&info.key_id),
-                sanitize_cert_field(&info.principals.join(","))
+                sanitize_terminal(&info.key_id),
+                sanitize_terminal(&info.principals.join(","))
             ),
             EntryKind::Opaque => println!(
                 "[{}] {} bytes  opaque    {}",
@@ -5417,7 +5451,9 @@ fn run_fido_large_blob_get(
     match classified {
         EntryKind::Note(text) => {
             println!("Entry {}: keyroost note, {} bytes", index, entry.orig_size);
-            println!("{}", text);
+            // A note is arbitrary text written by any app with the PIN; keep its
+            // line structure but strip escapes so it can't hijack the terminal.
+            println!("{}", sanitize_multiline(&text));
         }
         EntryKind::SshCert { info, .. } => {
             println!(
@@ -5426,21 +5462,21 @@ fn run_fido_large_blob_get(
             );
             println!(
                 "  Type:        {} ({})",
-                sanitize_cert_field(&info.key_type),
+                sanitize_terminal(&info.key_type),
                 if info.cert_type == keyroost_ctap::ssh_cert::CERT_TYPE_USER {
                     "user"
                 } else {
                     "host"
                 }
             );
-            println!("  Key ID:      {}", sanitize_cert_field(&info.key_id));
+            println!("  Key ID:      {}", sanitize_terminal(&info.key_id));
             println!("  Serial:      {}", info.serial);
             println!(
                 "  Principals:  {}",
                 if info.principals.is_empty() {
                     "(any)".to_string()
                 } else {
-                    sanitize_cert_field(&info.principals.join(", "))
+                    sanitize_terminal(&info.principals.join(", "))
                 }
             );
             println!(
@@ -5448,16 +5484,16 @@ fn run_fido_large_blob_get(
                 keyroost_ctap::ssh_cert::format_validity(info.valid_after, info.valid_before)
             );
             for (n, v) in &info.critical_options {
-                let n = sanitize_cert_field(n);
+                let n = sanitize_terminal(n);
                 if v.is_empty() {
                     println!("  Critical:    {n}");
                 } else {
-                    let v = sanitize_cert_field(v);
+                    let v = sanitize_terminal(v);
                     println!("  Critical:    {n}={v}");
                 }
             }
             for ext in &info.extensions {
-                println!("  Extension:   {}", sanitize_cert_field(ext));
+                println!("  Extension:   {}", sanitize_terminal(ext));
             }
             println!("\nExport with: keyroostctl fido large-blob export {index} <FILE> --as-cert");
         }
@@ -5648,12 +5684,34 @@ fn large_blob_bad_index(index: usize, len: usize) -> Box<dyn std::error::Error> 
     }
 }
 
-/// Flatten control characters out of an attacker-suppliable certificate
-/// string (key IDs, principals, options come from unverified cert bytes)
-/// so a hostile entry cannot inject terminal escape sequences.
-fn sanitize_cert_field(s: &str) -> String {
+/// Flatten control characters out of any attacker-supplied string before it
+/// reaches the terminal, so a hostile value cannot inject ANSI/terminal escape
+/// sequences. Applies to every device- or file-derived string printed by the
+/// CLI: certificate fields, USB descriptor strings (vendor/model/serial),
+/// PC/SC reader names, OATH/FIDO credential names, slot titles, and friendly
+/// names. Control chars (which include ESC `0x1b`) become spaces; character
+/// count is preserved so column alignment is unaffected.
+pub(crate) fn sanitize_terminal(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// Like [`sanitize_terminal`] but preserves newlines and tabs — for multi-line
+/// text (e.g. a large-blob note) where line structure is meaningful. Every
+/// other control character (notably ESC `0x1b`) still becomes a space, so ANSI
+/// escapes can't survive.
+pub(crate) fn sanitize_multiline(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c == '\n' || c == '\t' {
+                c
+            } else if c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -5811,16 +5869,21 @@ fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::erro
     }
 
     println!();
-    println!("Versions:  {}", info.versions.join(", "));
+    // versions/extensions/option-keys come from the device's getInfo CBOR;
+    // flatten any control bytes before they reach the terminal.
+    println!("Versions:  {}", sanitize_terminal(&info.versions.join(", ")));
     if !info.extensions.is_empty() {
-        println!("Extensions: {}", info.extensions.join(", "));
+        println!(
+            "Extensions: {}",
+            sanitize_terminal(&info.extensions.join(", "))
+        );
     }
     println!("AAGUID:    {}", format_aaguid(&info.aaguid));
     if !info.options.is_empty() {
         let opts: Vec<String> = info
             .options
             .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
+            .map(|(k, v)| format!("{}={}", sanitize_terminal(k), v))
             .collect();
         println!("Options:   {}", opts.join(", "));
     }
@@ -5836,7 +5899,10 @@ fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::erro
         println!("PIN/UV protocols: {}", v.join(", "));
     }
     if !info.transports.is_empty() {
-        println!("Transports: {}", info.transports.join(", "));
+        println!(
+            "Transports: {}",
+            sanitize_terminal(&info.transports.join(", "))
+        );
     }
     if let Some(n) = info.min_pin_length {
         println!("Min PIN length: {}", n);
@@ -5951,8 +6017,12 @@ fn run_fido_creds_list(
         }
         for rp in &rps {
             let creds = mgr.list_credentials(&rp.rp_id_hash)?;
+            // rp.id and rp.name are attacker-controlled (any app with the PIN
+            // can register a credential); flatten control chars. The user.name /
+            // display_name / user.id below print via {:?}, which already
+            // escape-debugs control bytes.
             let name_suffix = match &rp.name {
-                Some(n) if !n.is_empty() => format!("  ({})", n),
+                Some(n) if !n.is_empty() => format!("  ({})", sanitize_terminal(n)),
                 _ => String::new(),
             };
             let count_suffix = if creds.is_empty() {
@@ -5960,7 +6030,7 @@ fn run_fido_creds_list(
             } else {
                 format!("  [{} credential(s)]", creds.len())
             };
-            println!("{}{}{}", rp.id, name_suffix, count_suffix);
+            println!("{}{}{}", sanitize_terminal(&rp.id), name_suffix, count_suffix);
             for c in &creds {
                 let name_field = match &c.user.name {
                     Some(n) => format!("  name={:?}", n),
@@ -6014,7 +6084,12 @@ fn run_fido_fingerprint_list(
         }
         println!("Enrolled fingerprints:");
         for e in &list {
-            let name = e.friendly_name.as_deref().unwrap_or("(unnamed)");
+            // The friendly name is stored on the device; strip escapes.
+            let name = e
+                .friendly_name
+                .as_deref()
+                .map(sanitize_terminal)
+                .unwrap_or_else(|| "(unnamed)".to_string());
             // The hex template id is what --template-id takes for rename/delete.
             println!("  id {}   {}", hex_encode(&e.template_id), name);
         }
@@ -6454,7 +6529,7 @@ fn print_info(info: &keyroost_transport::DeviceInfo) {
     // The serial is `from_utf8_lossy` over device bytes; flatten any control
     // characters before they reach the terminal (a hostile token could embed
     // escape sequences). Shared by every command that prints device info.
-    println!("device serial: {}", sanitize_cert_field(&info.serial));
+    println!("device serial: {}", sanitize_terminal(&info.serial));
     println!("device UTC:    {} (epoch)", info.utc_time);
     // TOTP tolerates small drift (one 30s step either way at most verifiers);
     // beyond that, codes get rejected in ways users misdiagnose as a bad
@@ -6562,6 +6637,26 @@ mod cli_tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(args)
+    }
+
+    #[test]
+    fn sanitize_terminal_flattens_all_control_chars() {
+        // ESC-based CSI, OSC with BEL, DEL, and a C1 byte all become spaces.
+        let dirty = "a\x1b[31mb\x1b]0;t\x07c\x7fd\u{9b}e";
+        let clean = sanitize_terminal(dirty);
+        assert!(!clean.chars().any(|c| c.is_control()));
+        assert_eq!(clean.chars().count(), dirty.chars().count()); // 1:1, alignment safe
+        assert!(clean.starts_with("a "));
+    }
+
+    #[test]
+    fn sanitize_multiline_keeps_newline_tab_but_strips_escapes() {
+        let dirty = "line1\n\tcol\x1b[2Jx\r";
+        let clean = sanitize_multiline(dirty);
+        assert!(clean.contains('\n'), "newline preserved");
+        assert!(clean.contains('\t'), "tab preserved");
+        assert!(!clean.contains('\x1b'), "ESC flattened");
+        assert!(!clean.contains('\r'), "other control (CR) flattened");
     }
 
     #[test]
