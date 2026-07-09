@@ -202,6 +202,15 @@ struct AdvancedDialog {
     force_change: bool,
 }
 
+impl Drop for AdvancedDialog {
+    /// Scrub the typed PIN when the dialog is torn down (e.g. on success, the
+    /// dialog is replaced with `None`), matching the wipe-on-drop discipline of
+    /// the other secret-bearing dialogs (ChangePinDialog, PivState).
+    fn drop(&mut self) {
+        wipe(&mut self.pin_input);
+    }
+}
+
 #[derive(Default, Clone, Copy, PartialEq)]
 enum AdvancedAction {
     #[default]
@@ -610,6 +619,37 @@ fn openpgp_cred_mismatch(pgp: &OpenPgpState, kind: OpenPgpCredKind) -> Option<&'
 fn wipe(s: &mut String) {
     use zeroize::Zeroize;
     s.zeroize();
+}
+
+/// Purge egui's retained plaintext for a masked text widget.
+///
+/// egui keeps an undo history (`TextEditState.undoer`) holding real, unmasked
+/// snapshots of everything typed into a field, for the whole process lifetime;
+/// `.password(true)` only masks *display*. So wiping the caller's `String`
+/// buffer is not enough — the secret is still recoverable from egui's own
+/// memory until the undo history is cleared. This clears it. Safe to call every
+/// frame and on a widget that was never typed into (it only touches that
+/// widget's stored state, if any).
+fn clear_edit_undo(ctx: &egui::Context, id: egui::Id) {
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+        state.clear_undoer();
+        egui::TextEdit::store_state(ctx, id, state);
+    }
+}
+
+/// Draw-time guard for a secret field: once it loses keyboard focus, purge its
+/// undo history (see [`clear_edit_undo`]). Call immediately after adding any
+/// `.password(true)` field, passing its [`egui::Response`].
+///
+/// Clearing only while unfocused keeps in-field undo working *during* editing,
+/// then scrubs the retained plaintext the moment the user moves on — which
+/// includes the frame a dialog's submit/cancel takes focus away, so the secret
+/// is gone before the dialog (and its buffer) is torn down. This needs no
+/// bookkeeping in the dialog structs or their `Drop` impls.
+fn guard_secret_field(ctx: &egui::Context, resp: &egui::Response) {
+    if !resp.has_focus() {
+        clear_edit_undo(ctx, resp.id);
+    }
 }
 
 /// The shared "Scan QR" button: a Default button with the QR glyph painted into
@@ -2901,7 +2941,8 @@ impl App {
             return;
         };
         let action = dlg.action;
-        let pin = dlg.pin_input.clone();
+        // Zeroizing so the worker closure's PIN copy is scrubbed when the job ends.
+        let pin = zeroize::Zeroizing::new(dlg.pin_input.clone());
         let force_change = dlg.force_change;
         let min_pin = dlg.min_pin_input.trim().parse::<u32>().ok();
 
@@ -4183,7 +4224,11 @@ pub(crate) fn secret_edit(
         }
         let _ = ir.on_hover_text(if *revealed { "Hide" } else { "Show" });
     });
-    resp.unwrap()
+    let resp = resp.unwrap();
+    // Scrub egui's retained plaintext once the field is no longer focused, so a
+    // wiped buffer leaves nothing recoverable from egui memory.
+    guard_secret_field(ui.ctx(), &resp);
+    resp
 }
 
 fn hex_full(bytes: &[u8]) -> String {
@@ -5342,11 +5387,12 @@ fn pin_field(ui: &mut egui::Ui, p: &Palette, label: &str, buf: &mut String) {
                     .color(p.txt2),
             ),
         );
-        ui.add(
+        let resp = ui.add(
             egui::TextEdit::singleline(buf)
                 .password(true)
                 .desired_width(200.0),
         );
+        guard_secret_field(ui.ctx(), &resp);
     });
     ui.add_space(4.0);
 }
@@ -5364,12 +5410,13 @@ fn secret_field(ui: &mut egui::Ui, p: &Palette, label: &str, buf: &mut String, h
                     .color(p.txt2),
             ),
         );
-        ui.add(
+        let resp = ui.add(
             egui::TextEdit::singleline(buf)
                 .password(true)
                 .hint_text(hint)
                 .desired_width(w),
         );
+        guard_secret_field(ui.ctx(), &resp);
     });
     ui.add_space(4.0);
 }
@@ -7562,6 +7609,7 @@ impl App {
                             .password(true)
                             .hint_text("Enter PIN to unlock this key"),
                     );
+                    guard_secret_field(ui.ctx(), &resp);
                     let submit = theme::button(ui, p, BtnKind::Primary, "Unlock").clicked();
                     if submit
                         || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
@@ -9098,9 +9146,14 @@ impl App {
             }
 
             if let Some(action) = arm {
+                // Fields listed explicitly: AdvancedDialog now has a Drop impl
+                // (to wipe the PIN), so struct-update from `Default::default()`
+                // is disallowed (can't move fields out of a Drop type).
                 self.security_keys.advanced = Some(AdvancedDialog {
                     action,
-                    ..Default::default()
+                    pin_input: String::new(),
+                    min_pin_input: String::new(),
+                    force_change: false,
                 });
                 self.security_keys.error = None;
             }
@@ -9402,11 +9455,12 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label("Device PIN");
                     if let Some(d) = self.security_keys.advanced.as_mut() {
-                        ui.add(
+                        let resp = ui.add(
                             egui::TextEdit::singleline(&mut d.pin_input)
                                 .password(true)
                                 .desired_width(160.0),
                         );
+                        guard_secret_field(ui.ctx(), &resp);
                     }
                 });
                 ui.add_space(16.0);
@@ -9986,6 +10040,7 @@ impl App {
                             .vertical_align(egui::Align::Center)
                             .password(true),
                     );
+                    guard_secret_field(ui.ctx(), &resp);
                     let submit = theme::button(ui, p, BtnKind::Primary, "Unlock").clicked();
                     // Enter in the field submits too, matching the FIDO2 unlock card
                     // and the other inline credential fields in this redesign.
@@ -11753,11 +11808,12 @@ impl App {
                     );
                     if self.bulk_dialog.needs_password {
                         ui.label("Aegis vault password:");
-                        ui.add(
+                        let resp = ui.add(
                             egui::TextEdit::singleline(&mut self.bulk_dialog.password)
                                 .password(true)
                                 .desired_width(360.0),
                         );
+                        guard_secret_field(ui.ctx(), &resp);
                     }
                     ui.horizontal(|ui| {
                         let importing = self.import_busy();
@@ -11858,7 +11914,14 @@ impl App {
                         });
                     }
                 });
+            let was_open = self.bulk_dialog.open;
             self.bulk_dialog.open = open;
+            // Scrub the typed vault password when the dialog closes (X button or
+            // programmatic close), so a password that survived a decrypt error
+            // — kept live to allow a retry — never lingers past the dialog.
+            if was_open && !open {
+                wipe(&mut self.bulk_dialog.password);
+            }
             if do_load {
                 self.bulk_load();
             }
@@ -12022,6 +12085,44 @@ fn slot_summary(algo: Option<u8>, fpr: &[u8; 20]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// egui retains a plaintext snapshot of every typed secret in the text
+    /// widget's undo history for the process lifetime; `.password(true)` only
+    /// masks display. `clear_edit_undo` must purge that history so a wiped
+    /// buffer leaves nothing recoverable from egui memory.
+    #[test]
+    fn clear_edit_undo_purges_retained_plaintext() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("pin-field-test");
+        let empty = (egui::text::CCursorRange::default(), String::new());
+
+        // Simulate egui recording undo history as the user types a PIN. An undo
+        // point is committed only once a state has been stable for `stable_time`
+        // (1s default), so feed the same secret across a ≥1s gap.
+        let secret = (egui::text::CCursorRange::default(), "1234-secret-pin".to_string());
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap_or_default();
+        let mut undoer = state.undoer();
+        undoer.feed_state(0.0, &empty);
+        undoer.feed_state(1.0, &secret);
+        undoer.feed_state(2.0, &secret);
+        state.set_undoer(undoer);
+        egui::TextEdit::store_state(&ctx, id, state);
+
+        // Precondition: history retains a snapshot differing from an empty field.
+        let before = egui::TextEdit::load_state(&ctx, id).unwrap();
+        assert!(
+            before.undoer().has_undo(&empty),
+            "test setup should have recorded undo history"
+        );
+
+        clear_edit_undo(&ctx, id);
+
+        let after = egui::TextEdit::load_state(&ctx, id).unwrap();
+        assert!(
+            !after.undoer().has_undo(&empty),
+            "undo history (and its plaintext) must be gone after clear_edit_undo"
+        );
+    }
 
     /// A job dispatched to a real worker thread runs off-thread, and its result
     /// applies back to the App with the busy bookkeeping cleared.
