@@ -237,10 +237,41 @@ pub mod aegis {
 
     /// Detect an encrypted Aegis vault without parsing the whole structure.
     /// `Ok(true)` means an `encrypted` decrypt is needed; `Ok(false)` means
-    /// the file is already plaintext. Cheap and side-effect-free.
+    /// the file is already plaintext. Cheap and side-effect-free: the `db`
+    /// object is drained with `IgnoredAny`, so — unlike `parse()` — no entry
+    /// (and no seed string) is ever materialized just to answer a bool.
     pub fn is_encrypted(json: &str) -> Result<bool, BulkError> {
-        let root: Root = serde_json::from_str(json)?;
-        Ok(matches!(root.db, DbField::Encrypted))
+        #[derive(Deserialize)]
+        struct ProbeRoot {
+            db: DbProbe,
+        }
+        enum DbProbe {
+            Plain,
+            Encrypted,
+        }
+        impl<'de> serde::Deserialize<'de> for DbProbe {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                use serde::de::{self, IgnoredAny, MapAccess, Visitor};
+                struct V;
+                impl<'de> Visitor<'de> for V {
+                    type Value = DbProbe;
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str("an Aegis db object or an encrypted base64 string")
+                    }
+                    fn visit_str<E: de::Error>(self, _v: &str) -> Result<DbProbe, E> {
+                        Ok(DbProbe::Encrypted)
+                    }
+                    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<DbProbe, A::Error> {
+                        // Drain token-by-token without allocating anything.
+                        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                        Ok(DbProbe::Plain)
+                    }
+                }
+                d.deserialize_any(V)
+            }
+        }
+        let root: ProbeRoot = serde_json::from_str(json)?;
+        Ok(matches!(root.db, DbProbe::Encrypted))
     }
 
     /// Decrypt an Aegis encrypted vault and return the inner plaintext JSON,
