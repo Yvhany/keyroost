@@ -773,12 +773,22 @@ pub fn clear_certificate(slot: Slot) -> Vec<u8> {
     put_data(&slot.cert_object_tag(), &[])
 }
 
-/// Pad a PIN to the fixed 8-byte PIV field with trailing `0xFF`. A PIN already
-/// 8 bytes or longer is returned truncated to 8 (PIV PINs are 6–8 bytes).
+/// Pad a PIN/PUK to the fixed 8-byte PIV field with trailing `0xFF`.
+///
+/// PIV PINs and PUKs are 6–8 bytes (SP 800-73). An over-length value must never
+/// be silently truncated: that would build a VERIFY/CHANGE for a *different*,
+/// valid-length secret than the caller supplied and burn a retry against the
+/// card. Callers validate length first (the transport layer's `check_pin_len`);
+/// this asserts the same 6–8 contract so a direct byte-layer consumer that skips
+/// validation fails loudly here instead of transmitting the wrong secret.
 fn pad_pin(pin: &[u8]) -> Vec<u8> {
+    assert!(
+        (6..=8).contains(&pin.len()),
+        "PIV PIN/PUK must be 6-8 bytes (got {})",
+        pin.len()
+    );
     let mut out = [0xFFu8; 8].to_vec();
-    let n = pin.len().min(8);
-    out[..n].copy_from_slice(&pin[..n]);
+    out[..pin.len()].copy_from_slice(pin);
     out
 }
 
@@ -1324,16 +1334,22 @@ mod tests {
     }
 
     #[test]
-    fn pad_pin_truncates_and_pads() {
-        // Documented behavior: longer-than-8 input is truncated (callers must
-        // validate 6–8 first); shorter input is 0xFF-padded.
-        let apdu = verify_pin(b"1234567890");
-        assert_eq!(&apdu[5..], b"12345678");
+    fn pad_pin_pads_short_within_range() {
+        // A 6-byte PIN is 0xFF-padded to the fixed 8-byte field.
         let apdu = verify_pin(b"123456");
         assert_eq!(
             &apdu[5..],
             &[0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0xFF, 0xFF]
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "6-8 bytes")]
+    fn pad_pin_rejects_over_length_instead_of_truncating() {
+        // A >8-byte value must never be silently truncated into a different,
+        // valid-length PIN — that would build a VERIFY for the wrong secret and
+        // burn a retry against the card. Fail loudly instead.
+        let _ = verify_pin(b"1234567890");
     }
 
     #[test]
