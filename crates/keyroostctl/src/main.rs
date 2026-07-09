@@ -3038,7 +3038,7 @@ fn run_doctor() {
                     } else {
                         ""
                     };
-                    println!("    {}{}", r, tag);
+                    println!("    {}{}", sanitize_terminal(r), tag);
                 }
             }
         }
@@ -5708,29 +5708,53 @@ fn large_blob_bad_index(index: usize, len: usize) -> Box<dyn std::error::Error> 
     }
 }
 
+/// True for characters that can visually reorder or hide terminal output even
+/// though they are not Unicode *control* characters (category Cf, which
+/// `char::is_control()` — Cc only — does not cover): the bidirectional
+/// embedding/override/isolate controls (the Trojan-Source class,
+/// CVE-2021-42574) and zero-width characters that can disguise a spoofed
+/// serial or credential name.
+fn is_render_hostile(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'                  // arabic letter mark (bidi)
+        | '\u{200B}'..='\u{200F}'   // zero-widths, ZWJ/ZWNJ, LRM/RLM
+        | '\u{202A}'..='\u{202E}'   // LRE/RLE/PDF/LRO/RLO
+        | '\u{2066}'..='\u{2069}'   // LRI/RLI/FSI/PDI
+        | '\u{FEFF}'                // zero-width no-break space / BOM
+    )
+}
+
 /// Flatten control characters out of any attacker-supplied string before it
 /// reaches the terminal, so a hostile value cannot inject ANSI/terminal escape
 /// sequences. Applies to every device- or file-derived string printed by the
 /// CLI: certificate fields, USB descriptor strings (vendor/model/serial),
 /// PC/SC reader names, OATH/FIDO credential names, slot titles, and friendly
-/// names. Control chars (which include ESC `0x1b`) become spaces; character
-/// count is preserved so column alignment is unaffected.
+/// names. Control chars (which include ESC `0x1b`) and bidi/zero-width
+/// format chars (see [`is_render_hostile`]) become spaces; character count is
+/// preserved so column alignment is unaffected.
 pub(crate) fn sanitize_terminal(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || is_render_hostile(c) {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
 /// Like [`sanitize_terminal`] but preserves newlines and tabs — for multi-line
 /// text (e.g. a large-blob note) where line structure is meaningful. Every
-/// other control character (notably ESC `0x1b`) still becomes a space, so ANSI
-/// escapes can't survive.
+/// other control character (notably ESC `0x1b`) and bidi/zero-width format
+/// char still becomes a space, so ANSI escapes and reordering can't survive.
 pub(crate) fn sanitize_multiline(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c == '\n' || c == '\t' {
                 c
-            } else if c.is_control() {
+            } else if c.is_control() || is_render_hostile(c) {
                 ' '
             } else {
                 c
@@ -5754,7 +5778,13 @@ fn preview_note(text: &str) -> String {
     const MAX: usize = 48;
     let one_line: String = text
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || is_render_hostile(c) {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let trimmed = one_line.trim();
     let mut out: String = trimmed.chars().take(MAX).collect();
@@ -6762,6 +6792,21 @@ mod cli_tests {
         assert!(clean.contains('\t'), "tab preserved");
         assert!(!clean.contains('\x1b'), "ESC flattened");
         assert!(!clean.contains('\r'), "other control (CR) flattened");
+    }
+
+    #[test]
+    fn sanitize_flattens_bidi_and_zero_width_format_chars() {
+        // Cf-category chars pass char::is_control(); a hostile device string
+        // using RLO/isolates could visually reverse or spoof `list` output
+        // (Trojan-Source class), and zero-widths can hide a lookalike name.
+        let dirty = "ser\u{202E}321\u{2066}x\u{200B}y\u{061C}z\u{FEFF}";
+        for clean in [sanitize_terminal(dirty), sanitize_multiline(dirty)] {
+            assert!(!clean.chars().any(is_render_hostile), "bidi/ZW flattened");
+            assert!(!clean.chars().any(|c| c.is_control()));
+            assert_eq!(clean.chars().count(), dirty.chars().count());
+        }
+        // Plain text — including non-ASCII letters — is untouched.
+        assert_eq!(sanitize_terminal("Ĺéttèrs 123"), "Ĺéttèrs 123");
     }
 
     #[test]
