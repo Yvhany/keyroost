@@ -227,7 +227,9 @@ fn percent_decode(s: &str) -> Result<String, ()> {
 }
 
 /// Percent-decode a URI path segment (the label): `+` is a literal plus.
-fn percent_decode_keep_plus(s: &str) -> Result<String, ()> {
+/// Shared with the Google Authenticator migration parser so malformed
+/// `%XX` input decodes identically on both import paths.
+pub(crate) fn percent_decode_keep_plus(s: &str) -> Result<String, ()> {
     percent_decode_impl(s, false)
 }
 

@@ -260,31 +260,10 @@ impl<'a> Reader<'a> {
 
 /// Percent-decode without the '+'→space rule (that rule is for
 /// form-encoding; in a migration URI '+' is a base64 character).
+/// Delegates to the shared decoder in [`crate::otpauth`] so a malformed
+/// `%XX` sequence is rejected identically on both import paths.
 fn percent_decode_keep_plus(s: &str) -> Option<String> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let hi = hex_nibble(*bytes.get(i + 1)?)?;
-            let lo = hex_nibble(*bytes.get(i + 2)?)?;
-            out.push((hi << 4) | lo);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-fn hex_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
+    crate::otpauth::percent_decode_keep_plus(s).ok()
 }
 
 #[cfg(test)]
