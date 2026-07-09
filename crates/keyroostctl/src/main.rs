@@ -1293,10 +1293,13 @@ enum ProgCmd {
     Seed {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
-        /// Seed in hex. Argv is visible in `ps`; prefer --hex-stdin.
+        /// Seed in hex. Argv is visible in `ps` and shell history; prefer
+        /// --hex-stdin or --hex-env.
         #[arg(long, conflicts_with = "base32", value_name = "HEX")]
         hex: Option<String>,
-        /// Seed in base32 (RFC 4648; whitespace and dashes tolerated).
+        /// Seed in base32 (RFC 4648; whitespace and dashes tolerated). Argv is
+        /// visible in `ps` and shell history; prefer --base32-stdin or
+        /// --base32-env.
         #[arg(long, value_name = "B32")]
         base32: Option<String>,
         /// Read the hex seed from the named environment variable.
