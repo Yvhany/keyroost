@@ -107,6 +107,11 @@ pub enum FrameError {
     OutOfSequence { expected: u8, got: u8 },
     /// The frame was shorter than the 3-byte payload header it must contain.
     ShortFrame,
+    /// The reassembled response exceeded [`MAX_RESPONSE`] — a device streaming
+    /// `more` frames without end (the sequence counter wraps every 16, so the
+    /// ordering check alone can't stop it) would otherwise grow the buffer
+    /// without bound.
+    ResponseTooLong,
 }
 
 impl std::fmt::Display for FrameError {
@@ -120,9 +125,17 @@ impl std::fmt::Display for FrameError {
                 expected, got
             ),
             FrameError::ShortFrame => write!(f, "HID frame shorter than its 3-byte header"),
+            FrameError::ResponseTooLong => {
+                write!(f, "HID response exceeded the {}-byte reassembly limit", MAX_RESPONSE)
+            }
         }
     }
 }
+
+/// Upper bound on a reassembled device response. Real OTP responses (enumerate
+/// pages, read-one records, config, serial) are far smaller; anything larger is
+/// a malfunctioning or hostile device streaming `more` frames endlessly.
+pub const MAX_RESPONSE: usize = 64 * 1024;
 
 impl std::error::Error for FrameError {}
 
@@ -193,6 +206,9 @@ impl ResponseAssembler {
         let chunk = payload
             .get(PAYLOAD_HEADER..end)
             .ok_or(FrameError::ShortFrame)?;
+        if self.buf.len() + chunk.len() > MAX_RESPONSE {
+            return Err(FrameError::ResponseTooLong);
+        }
         self.buf.extend_from_slice(chunk);
 
         let more = (flags & FLAG_MORE) != 0;
@@ -355,5 +371,26 @@ mod tests {
         let mut p = vec![MAGIC, FLAG_LAST, 62];
         p.resize(REPORT_PAYLOAD, 0);
         assert_eq!(asm.push(&p), Err(FrameError::ChunkTooLong(62)));
+    }
+
+    #[test]
+    fn endless_more_frames_are_capped() {
+        // A device that never sets FLAG_LAST (seq wraps every 16, so the order
+        // check keeps passing) must not grow the buffer without bound.
+        let mut asm = ResponseAssembler::new();
+        let chunk = [0xAAu8; MAX_CHUNK];
+        let mut pushed = 0usize;
+        loop {
+            let seq = (pushed % 16) as u8;
+            match asm.push(&payload(FLAG_MORE | seq, &chunk)) {
+                Ok(Step::NeedMore) => pushed += 1,
+                Err(FrameError::ResponseTooLong) => break,
+                other => panic!("unexpected step at frame {pushed}: {other:?}"),
+            }
+            assert!(
+                pushed < MAX_RESPONSE / MAX_CHUNK + 8,
+                "assembler should have capped the response by now"
+            );
+        }
     }
 }
