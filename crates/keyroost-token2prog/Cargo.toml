@@ -16,5 +16,6 @@ workspace = true
 # single-profile token shares the same crypto primitives; only the command set,
 # the (hardcoded) device key, and a couple of framing details differ.
 keyroost-proto = { path = "../keyroost-proto", version = "0.7.4" }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]

@@ -2044,6 +2044,7 @@ name = "keyroost-token2prog"
 version = "0.7.4"
 dependencies = [
  "keyroost-proto",
+ "zeroize",
 ]
 
 [[package]]

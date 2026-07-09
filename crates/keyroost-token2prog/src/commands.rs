@@ -130,10 +130,18 @@ pub fn answer_challenge(challenge: &[u8; 8]) -> Command {
 /// already 20 bytes or longer are returned unchanged (the device also accepts
 /// 32-byte seeds via the longer-seed framing in [`set_seed`]).
 pub fn pad_totp_seed(mut seed: Vec<u8>) -> Vec<u8> {
-    if seed.len() < 20 {
-        seed.resize(20, 0);
+    use zeroize::Zeroize;
+    if seed.len() >= 20 {
+        return seed;
     }
-    seed
+    // Build the padded seed in a fresh 20-byte buffer instead of `seed.resize`,
+    // which reallocates a short Vec and strands the plaintext in the freed
+    // buffer. Scrub the shorter input we're discarding. (Callers wrap the
+    // returned buffer in Zeroizing.)
+    let mut out = vec![0u8; 20];
+    out[..seed.len()].copy_from_slice(&seed);
+    seed.zeroize();
+    out
 }
 
 /// `84 C5 01 00 Lc <SM4(seed_padded) ‖ mac>` — program the OTP seed.
