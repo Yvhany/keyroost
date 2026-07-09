@@ -264,6 +264,13 @@ impl CtapHidDevice {
 
     /// Send a CTAPHID command and read the response.
     pub fn transact(&mut self, cmd: u8, payload: &[u8]) -> Result<Vec<u8>, HidTransportError> {
+        // authenticatorCredentialManagement (CTAP2 cmd 0x0A) and its preview
+        // (0x41) responses enumerate RP IDs and user names in plaintext CBOR.
+        // Redact them from the opt-in trace so a pasted debug log doesn't leak
+        // the user's account list. (PIN material in other commands is ciphertext
+        // under the ECDH session key, not recoverable from the trace.)
+        let sensitive_resp =
+            cmd == CTAPHID_CBOR && matches!(payload.first(), Some(0x0A) | Some(0x41));
         if ctap_trace_enabled() {
             eprintln!(
                 "CTAP > cmd=0x{cmd:02x} len={} {}",
@@ -274,7 +281,11 @@ impl CtapHidDevice {
         self.send(self.channel_id, cmd, payload)?;
         let resp = self.recv(self.channel_id, cmd)?;
         if ctap_trace_enabled() {
-            eprintln!("CTAP < len={} {}", resp.len(), hexline(&resp));
+            if sensitive_resp {
+                eprintln!("CTAP < len={} <redacted: credential listing>", resp.len());
+            } else {
+                eprintln!("CTAP < len={} {}", resp.len(), hexline(&resp));
+            }
         }
         Ok(resp)
     }
