@@ -293,15 +293,14 @@ impl CtapHidDevice {
         self.timeout = t;
     }
 
+    /// The read timeout currently in effect (see [`Self::set_timeout`]).
+    pub fn read_timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// Send a CTAPHID command and read the response.
     pub fn transact(&mut self, cmd: u8, payload: &[u8]) -> Result<Vec<u8>, HidTransportError> {
-        // authenticatorCredentialManagement (CTAP2 cmd 0x0A) and its preview
-        // (0x41) responses enumerate RP IDs and user names in plaintext CBOR.
-        // Redact them from the opt-in trace so a pasted debug log doesn't leak
-        // the user's account list. (PIN material in other commands is ciphertext
-        // under the ECDH session key, not recoverable from the trace.)
-        let sensitive_resp =
-            cmd == CTAPHID_CBOR && matches!(payload.first(), Some(0x0A) | Some(0x41));
+        let sensitive_resp = response_is_sensitive(cmd, payload);
         if ctap_trace_enabled() {
             eprintln!(
                 "CTAP > cmd=0x{cmd:02x} len={} {}",
@@ -313,7 +312,10 @@ impl CtapHidDevice {
         let resp = self.recv(self.channel_id, cmd)?;
         if ctap_trace_enabled() {
             if sensitive_resp {
-                eprintln!("CTAP < len={} <redacted: credential listing>", resp.len());
+                eprintln!(
+                    "CTAP < len={} <redacted: credential/enrollment listing>",
+                    resp.len()
+                );
             } else {
                 eprintln!("CTAP < len={} {}", resp.len(), hexline(&resp));
             }
@@ -479,6 +481,24 @@ fn ctap_trace_enabled() -> bool {
     std::env::var_os("KEYROOST_CTAP_DEBUG").is_some()
 }
 
+/// True when a CTAPHID CBOR request's *response* carries personal data that
+/// must be redacted from the opt-in trace:
+/// - authenticatorCredentialManagement (`0x0A`, preview `0x41`) enumerates RP
+///   IDs and user names;
+/// - authenticatorBioEnrollment (`0x09`, preview `0x40`) enumerates
+///   fingerprint template friendly names — often a person's name.
+///
+/// (PIN material in other commands is ciphertext under the ECDH session key,
+/// not recoverable from the trace.) Add every future personal-data-bearing
+/// CTAP2 command here, not at the trace call site.
+fn response_is_sensitive(cmd: u8, payload: &[u8]) -> bool {
+    cmd == CTAPHID_CBOR
+        && matches!(
+            payload.first(),
+            Some(0x0A) | Some(0x41) | Some(0x09) | Some(0x40)
+        )
+}
+
 /// Lowercase hex of a byte slice, for the debug trace.
 fn hexline(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -573,5 +593,24 @@ mod tests {
         let n2 = generate_nonce();
         assert_ne!(n1, [0u8; 8]);
         assert_ne!(n1, n2);
+    }
+
+    #[test]
+    fn trace_redaction_covers_personal_data_commands() {
+        // credentialManagement enumerates RP IDs / user names; bioEnrollment
+        // enumerates fingerprint template friendly names. Both (and their
+        // vendor-preview forms) must be redacted from the debug trace.
+        for cbor_cmd in [0x0A, 0x41, 0x09, 0x40] {
+            assert!(
+                response_is_sensitive(CTAPHID_CBOR, &[cbor_cmd]),
+                "CBOR cmd 0x{cbor_cmd:02x} must be redacted"
+            );
+        }
+        // getInfo / clientPIN traces stay visible (PIN material is ciphertext).
+        assert!(!response_is_sensitive(CTAPHID_CBOR, &[0x04]));
+        assert!(!response_is_sensitive(CTAPHID_CBOR, &[0x06]));
+        // Non-CBOR frames (INIT, PING) are never redacted.
+        assert!(!response_is_sensitive(CTAPHID_INIT, &[0x0A]));
+        assert!(!response_is_sensitive(CTAPHID_CBOR, &[]));
     }
 }
