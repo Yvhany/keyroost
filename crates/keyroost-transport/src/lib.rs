@@ -374,7 +374,7 @@ impl Session {
         let (sw1, sw2) = (sw[0], sw[1]);
         if sw_auth_failed(sw1) {
             return Err(TransportError::AuthFailed {
-                tries_remaining: sw2,
+                tries_remaining: auth_tries_remaining(sw2),
             });
         }
         if !sw_ok(sw1, sw2) {
@@ -1091,6 +1091,21 @@ fn molto2_cmd_sensitive(apdu: &[u8]) -> bool {
     matches!(apdu.get(1), Some(0xC5) | Some(0xD7) | Some(0xCE))
 }
 
+/// Decode the remaining-attempts counter from SW2 of a `63xx` auth-failure.
+///
+/// The Molto2 reports it in the ISO-7816 `63 Cx` form, where the low nibble
+/// `x` is the number of attempts left — verified on hardware, which returned
+/// `63 C7` with 7 tries remaining. Reading the raw SW2 byte reported `0xC7`
+/// (199). For a device that instead reports a plain count (no `Cx` marker) the
+/// byte is passed through unchanged.
+fn auth_tries_remaining(sw2: u8) -> u8 {
+    if sw2 & 0xF0 == 0xC0 {
+        sw2 & 0x0F
+    } else {
+        sw2
+    }
+}
+
 /// Hex-dump a response APDU for `--debug` traces, hiding the payload of
 /// responses that carry secrets (e.g. PSO:DECIPHER plaintext). The SW1/SW2
 /// trailer stays visible.
@@ -1169,6 +1184,18 @@ pub(crate) fn transmit_applet(
 #[cfg(test)]
 mod redaction_tests {
     use super::*;
+
+    #[test]
+    fn auth_tries_decodes_iso_63cx_form() {
+        // The Molto2 reports the auth retry counter in ISO-7816 `63 Cx` form
+        // (low nibble = tries remaining) — verified on hardware, which returned
+        // `63 C7` with 7 attempts left. Reading the raw SW2 byte reported 199.
+        assert_eq!(auth_tries_remaining(0xC7), 7);
+        assert_eq!(auth_tries_remaining(0xC0), 0);
+        assert_eq!(auth_tries_remaining(0xCA), 10);
+        // A device that reports a plain count (< 0xCx form) is passed through.
+        assert_eq!(auth_tries_remaining(0x03), 3);
+    }
 
     #[test]
     fn sensitive_cmd_hides_body_keeps_header() {

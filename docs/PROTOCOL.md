@@ -48,8 +48,11 @@ Required before any "secure" command (CLA `0x84`).
 2. Device responds with 8 random bytes + `SW=9000`.
 3. Host zero-pads the challenge to 16 bytes, SM4-encrypts it in-place with the
    derived key, and sends `80 CE 00 00 10 <16-byte ciphertext>`.
-4. On success the device returns `SW=9000`. On failure it returns `SW=63 NN`
-   where `NN` is the number of attempts remaining before the device locks.
+4. On success the device returns `SW=9000`. On failure it returns `SW=63 Cx`
+   (ISO-7816 retry-counter form) where the low nibble `x` is the number of
+   attempts remaining before the device locks — hardware-verified: a wrong key
+   returns e.g. `63 C7` with 7 tries left, not a raw count in the whole byte.
+   A successful auth resets the counter.
 
 ## Per-command MAC (secure commands)
 
@@ -190,7 +193,7 @@ with the same `D4 01 <profile>` header.
 |---|---|
 | `9000` | Success — command completed |
 | `9060` | Success — command queued, awaiting on-device button confirmation (factory reset, set customer key) |
-| `63 NN` | Auth failed; `NN` is attempts remaining before lock |
+| `63 Cx` | Auth failed; low nibble `x` is attempts remaining before lock (ISO-7816 retry counter) |
 | `6A83` | Referenced data not found (e.g. `0xE6` on a slot with no seed) |
 | other `6xxx` / `9xxx` | Command-specific failure |
 
