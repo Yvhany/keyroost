@@ -1090,7 +1090,7 @@ fn molto2_cmd_sensitive(apdu: &[u8]) -> bool {
 /// *unknown* count, not zero. This is the single decoder for every applet
 /// (Molto2 auth, OpenPGP and PIV PINs); keep interpretation changes here.
 pub(crate) fn sw_tries_remaining(sw: u16) -> Option<u8> {
-    ((sw & 0xFFF0) == 0x63C0).then(|| (sw & 0x000F) as u8)
+    ((sw & 0xFFF0) == 0x63C0).then_some((sw & 0x000F) as u8)
 }
 
 /// Decode the remaining-attempts counter from SW2 of a Molto2 `63xx`
