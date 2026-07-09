@@ -952,6 +952,11 @@ impl ReaderWatcher {
             // If the OS can't spawn the watch thread (resource exhaustion),
             // degrade to no live hot-plug detection rather than aborting the
             // process — the UI still works and falls back to manual rescans.
+            // Say so on stderr: a session-long loss of hot-plug detection with
+            // no diagnostic reads as "the app stopped noticing my key".
+            .inspect_err(|e| {
+                eprintln!("warning: could not start the reader hot-plug watcher ({e}); plug/unplug events will not be detected this session");
+            })
             .ok();
         ReaderWatcher { stop, handle }
     }
