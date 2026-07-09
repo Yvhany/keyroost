@@ -295,10 +295,14 @@ pub fn parse_rp(v: &Value) -> Result<RelyingParty, CtapError> {
             _ => {}
         }
     }
-    let mut hash = [0u8; 32];
-    if rp_id_hash.len() == 32 {
-        hash.copy_from_slice(rp_id_hash);
+    // A wrong-length rpIdHash must be an error, not silently replaced with all
+    // zeros: the hash keys every follow-up list_credentials() call, so a zeroed
+    // one would query the wrong RP and quietly return no/incorrect credentials.
+    if rp_id_hash.len() != 32 {
+        return Err(CtapError::InvalidResponseShape("rpIdHash is not 32 bytes"));
     }
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(rp_id_hash);
     Ok(RelyingParty {
         id: rp_id,
         name: rp_name,
@@ -421,6 +425,33 @@ mod tests {
         let mut out = vec![mgr_cmd];
         out.extend_from_slice(&encode(&Value::Map(entries)));
         out
+    }
+
+    #[test]
+    fn parse_rp_rejects_wrong_length_hash() {
+        let rp_entity = Value::Map(vec![(
+            Value::Text("id".into()),
+            Value::Text("example.com".into()),
+        )]);
+        // A 31-byte rpIdHash must be an error, not silently zero-filled (which
+        // would key later list_credentials() calls to the wrong RP).
+        let bad = Value::Map(vec![
+            (Value::UInt(RESP_RP), rp_entity.clone()),
+            (Value::UInt(RESP_RP_ID_HASH), Value::Bytes(vec![0xAA; 31])),
+        ]);
+        assert!(matches!(
+            parse_rp(&bad),
+            Err(CtapError::InvalidResponseShape(_))
+        ));
+
+        // The correct 32-byte hash parses through unchanged.
+        let good = Value::Map(vec![
+            (Value::UInt(RESP_RP), rp_entity),
+            (Value::UInt(RESP_RP_ID_HASH), Value::Bytes(vec![0xAA; 32])),
+        ]);
+        let rp = parse_rp(&good).unwrap();
+        assert_eq!(rp.rp_id_hash, [0xAA; 32]);
+        assert_eq!(rp.id, "example.com");
     }
 
     #[test]

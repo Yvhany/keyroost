@@ -26,6 +26,12 @@ use std::time::{Duration, Instant};
 
 /// Broadcast channel ID used for the initial `CTAPHID_INIT` request.
 pub const CTAPHID_BROADCAST_CID: u32 = 0xFFFF_FFFF;
+
+/// Default per-report read deadline for ordinary commands. Long user-present
+/// operations (reset, fingerprint capture) widen it temporarily and must
+/// restore it to this afterwards so later commands don't inherit the long
+/// window.
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// Output / input HID report size on USB authenticators. Both reports are
 /// exactly 64 bytes; the leading report-ID byte (0x00) is added by the
 /// transport layer, making the host-side write 65 bytes.
@@ -170,7 +176,7 @@ impl CtapHidDevice {
         let mut dev = Self {
             io,
             channel_id: CTAPHID_BROADCAST_CID,
-            timeout: Duration::from_secs(2),
+            timeout: DEFAULT_READ_TIMEOUT,
             cancel: None,
         };
         let init = dev.do_init()?;

@@ -192,7 +192,11 @@ impl<'a, T: CtapTransport> BioEnrollment<'a, T> {
         self.dev.set_timeout(std::time::Duration::from_secs(30));
         let params =
             timeout_ms.map(|t| Value::Map(vec![(Value::UInt(PARAM_TIMEOUT_MS), Value::UInt(t))]));
-        let resp = self.dispatch(SUB_ENROLL_BEGIN, params)?;
+        let resp = self.dispatch(SUB_ENROLL_BEGIN, params);
+        // Restore the normal deadline so later commands don't inherit the 30s
+        // capture window.
+        self.dev.set_timeout(crate::hid::DEFAULT_READ_TIMEOUT);
+        let resp = resp?;
         let template_id = resp
             .get_uint_key(RESP_TEMPLATE_ID)
             .and_then(|v| v.as_bytes())
@@ -220,7 +224,10 @@ impl<'a, T: CtapTransport> BioEnrollment<'a, T> {
         if let Some(t) = timeout_ms {
             p.push((Value::UInt(PARAM_TIMEOUT_MS), Value::UInt(t)));
         }
-        let resp = self.dispatch(SUB_ENROLL_CAPTURE_NEXT, Some(Value::Map(p)))?;
+        let resp = self.dispatch(SUB_ENROLL_CAPTURE_NEXT, Some(Value::Map(p)));
+        // Restore the normal deadline (see enroll_begin).
+        self.dev.set_timeout(crate::hid::DEFAULT_READ_TIMEOUT);
+        let resp = resp?;
         Ok(CaptureStatus {
             last_sample_status: field_uint(&resp, RESP_LAST_ENROLL_SAMPLE_STATUS).unwrap_or(0),
             remaining_samples: field_uint(&resp, RESP_REMAINING_SAMPLES).unwrap_or(0),

@@ -215,7 +215,12 @@ pub fn get_info(dev: &mut impl CtapTransport) -> Result<AuthenticatorInfo, CtapE
 /// usually mean the touch window has closed.
 pub fn reset(dev: &mut impl CtapTransport) -> Result<(), CtapError> {
     dev.set_timeout(RESET_TIMEOUT);
-    let resp = dev.transact(CTAPHID_CBOR, &[CTAP2_RESET])?;
+    let result = dev.transact(CTAPHID_CBOR, &[CTAP2_RESET]);
+    // Restore the normal deadline unconditionally, so a later command on this
+    // device doesn't inherit the 30s reset window (which would make error paths
+    // — e.g. spammed foreign-CID frames — take 30s to surface instead of ~2s).
+    dev.set_timeout(crate::hid::DEFAULT_READ_TIMEOUT);
+    let resp = result?;
     let (status, _) = split_status(&resp)?;
     if status != 0 {
         return Err(CtapError::StatusCode(status));
