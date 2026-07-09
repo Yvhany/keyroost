@@ -1071,7 +1071,26 @@ impl Worker {
             .name("keyroost-worker".into())
             .spawn(move || {
                 while let Ok(job) = job_rx.recv() {
-                    let apply = job();
+                    // A panicking job must not kill the worker: that would
+                    // disconnect the result channel and wedge the busy guard
+                    // (spawn_job would reject every future job forever). Catch
+                    // it and deliver an error apply instead, so the frame loop
+                    // still clears the busy bookkeeping and the thread lives on.
+                    // A panicking job must not kill the worker: that would
+                    // disconnect the result channel and wedge the busy guard
+                    // (spawn_job would reject every future job forever). Catch
+                    // it and deliver an error apply instead, so the frame loop
+                    // still clears the busy bookkeeping and the thread lives on.
+                    let apply = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
+                        Ok(apply) => apply,
+                        Err(_) => Box::new(|app: &mut App| {
+                            app.log(
+                                Severity::Err,
+                                "a background device operation panicked and was aborted; \
+                                 re-plug the key if it stops responding",
+                            );
+                        }) as ApplyFn,
+                    };
                     if result_tx.send(apply).is_err() {
                         break; // UI gone
                     }
@@ -1654,10 +1673,21 @@ impl App {
 
     /// Apply any finished background jobs. Called once per frame from `update()`.
     fn drain_worker(&mut self) {
-        let applies: Vec<ApplyFn> = match &self.worker {
-            Some(w) => w.result_rx.try_iter().collect(),
-            None => Vec::new(),
-        };
+        use std::sync::mpsc::TryRecvError;
+        let mut applies: Vec<ApplyFn> = Vec::new();
+        let mut disconnected = false;
+        if let Some(w) = &self.worker {
+            loop {
+                match w.result_rx.try_recv() {
+                    Ok(apply) => applies.push(apply),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
         for apply in applies {
             // Decrement *before* applying so an apply closure that chains another
             // job (e.g. refresh-readers → probe-lock) isn't blocked by the busy
@@ -1667,6 +1697,20 @@ impl App {
                 self.busy_label = None;
             }
             apply(self);
+        }
+        if disconnected {
+            // Last-resort safety net: jobs catch their own panics, so a dead
+            // worker means the thread ended some other way. Clear the busy guard
+            // so the UI can't wedge with an eternal spinner, then respawn a
+            // worker so device actions keep working (falls back to inline
+            // execution if there's no egui context, e.g. in tests).
+            self.busy_jobs = 0;
+            self.busy_label = None;
+            self.worker = self.egui_ctx.clone().map(Worker::spawn);
+            self.log(
+                Severity::Err,
+                "the background worker stopped unexpectedly and was restarted",
+            );
         }
     }
 
@@ -12122,6 +12166,53 @@ mod tests {
             !after.undoer().has_undo(&empty),
             "undo history (and its plaintext) must be gone after clear_edit_undo"
         );
+    }
+
+    /// A job that panics inside the worker must not wedge the UI: the worker
+    /// catches it, delivers an error apply (so busy clears), and stays alive to
+    /// run later jobs. Before the fix the thread unwound, the result channel
+    /// disconnected, and busy_jobs stuck at 1 forever.
+    #[test]
+    fn panicking_job_clears_busy_and_worker_survives() {
+        let mut app = App {
+            worker: Some(Worker::spawn(egui::Context::default())),
+            ..Default::default()
+        };
+        // Silence the panic backtrace this test intentionally triggers.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        app.spawn_job("boom", || -> ApplyFn { panic!("simulated device-op panic") });
+        assert!(app.busy(), "busy set right after dispatch");
+
+        // The worker still delivers an apply despite the panic.
+        let apply = app
+            .worker
+            .as_ref()
+            .unwrap()
+            .result_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker delivered an apply despite the panicking job");
+        std::panic::set_hook(prev);
+        app.busy_jobs -= 1;
+        apply(&mut app);
+        assert!(!app.busy(), "busy must clear after a panicking job");
+
+        // The worker survived: a subsequent job still runs to completion.
+        assert!(
+            app.spawn_job("after", || Box::new(|app: &mut App| app.slot = 7)),
+            "worker should accept jobs after a panic"
+        );
+        let apply = app
+            .worker
+            .as_ref()
+            .unwrap()
+            .result_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("second job ran on the surviving worker");
+        app.busy_jobs -= 1;
+        apply(&mut app);
+        assert_eq!(app.slot, 7);
     }
 
     /// A job dispatched to a real worker thread runs off-thread, and its result
