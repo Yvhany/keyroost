@@ -350,16 +350,28 @@ impl OtpTransport for HidOtpTransport {
         let mut asm = ResponseAssembler::new();
         let deadline = Instant::now() + self.timeout;
         let mut prompted = false;
+        // Distinguishes "device is telling us to wait for a button press"
+        // (BUSY frames seen) from total silence (unplugged / dead device) at
+        // the deadline — a device that never sent a single frame is not
+        // waiting for a button.
+        let mut got_frame = false;
         let mut buf = [0u8; hidframe::REPORT_PAYLOAD + 1];
         loop {
             if Instant::now() >= deadline {
-                return Err(OtpTransportError::Applet(OtpError::ButtonPressRequired));
+                return Err(if got_frame {
+                    OtpTransportError::Applet(OtpError::ButtonPressRequired)
+                } else {
+                    OtpTransportError::TransportUnavailable(
+                        "device sent no response before the timeout".into(),
+                    )
+                });
             }
             let n = self.read_report(&mut buf)?;
             if n == 0 {
                 // Bounded hidapi read polled with no frame; re-check the deadline.
                 continue;
             }
+            got_frame = true;
             match asm.push(&buf[..n])? {
                 Step::Busy { retries } => {
                     // Fire the prompt once at the 3rd busy frame (spec §4.4).
@@ -521,6 +533,7 @@ impl PcScOtpTransport {
         let mut acc = Vec::new();
         let mut to_send = apdu.to_vec();
         let mut chunks = 0usize;
+        let mut le_retries = 0u8;
         // Contact (T=0) readers occasionally drop a transmit with a transient
         // SCARD_W_RESET_CARD / SCARD_F_COMM_ERROR ("communications error, retry").
         // Reconnect to the card and retry the *current* APDU a few times before
@@ -606,13 +619,25 @@ impl PcScOtpTransport {
                     continue;
                 }
                 0x6C => {
+                    // A conformant card answers 6C at most once per command
+                    // (with the Le it wants); a card that keeps rejecting the
+                    // corrected APDU must not spin this loop forever — the
+                    // `chunks` reset below defeats the reassembly bound.
+                    le_retries += 1;
+                    if le_retries > 4 {
+                        return Err(OtpTransportError::Parse(ParseError::Malformed(
+                            "card kept answering 6C to the corrected Le",
+                        )));
+                    }
                     let le = sw_bytes[1];
-                    // Re-send with the card-suggested Le. The commands routed
-                    // here are case 2 (a single trailing Le byte), so replace
-                    // that byte rather than appending a second one — appending
-                    // produced `… Le_old Le_new`, a malformed APDU. (Mirrors the
-                    // CTAP PC/SC path; a bare 4-byte case-1 header, which never
-                    // reaches here, would fall back to appending.)
+                    // Re-send with the card-suggested Le. Per ISO 7816, 6C is
+                    // only returned to a command that carried Le (case 2, e.g.
+                    // GET_PUBKEY / READ_CONFIG), so replace that trailing byte
+                    // rather than appending a second one — appending produced
+                    // `… Le_old Le_new`, a malformed APDU. (Mirrors the CTAP
+                    // PC/SC path. A bare 4-byte case-1 header — e.g.
+                    // ERASE_ALL — falls back to appending, forming valid
+                    // case 2.)
                     to_send = apdu.to_vec();
                     if to_send.len() >= 5 {
                         *to_send.last_mut().unwrap() = le;
