@@ -117,14 +117,36 @@ fn expect_tag(input: &[u8], expected: u8) -> Result<(Tlv<'_>, &[u8]), X509ParseE
 /// Decode a DER OBJECT IDENTIFIER content (without the tag/length) to its
 /// dotted-decimal string. Returns `None` if the encoding is malformed.
 fn decode_oid(content: &[u8]) -> Option<String> {
-    let first = *content.first()?;
-    // First byte encodes the first two arcs: arc1 * 40 + arc2.
-    let arc1 = (first / 40) as u32;
-    let arc2 = (first % 40) as u32;
+    let mut iter = content.iter();
+
+    // The first sub-identifier is itself base-128 (it may span several bytes),
+    // and it encodes both leading arcs (X.690 §8.19): X<40 -> 0.X, X<80 ->
+    // 1.(X-40), else 2.(X-80). Decoding only the first *byte* mis-renders any
+    // OID whose first sub-identifier doesn't fit in one byte (e.g. 2.999).
+    let mut first_sid: u64 = 0;
+    let mut got_first = false;
+    for &b in iter.by_ref() {
+        first_sid = (first_sid << 7) | (b & 0x7f) as u64;
+        if b & 0x80 == 0 {
+            got_first = true;
+            break;
+        }
+    }
+    if !got_first {
+        return None; // empty content, or an unterminated first sub-identifier
+    }
+    let (arc1, arc2) = if first_sid < 40 {
+        (0, first_sid)
+    } else if first_sid < 80 {
+        (1, first_sid - 40)
+    } else {
+        (2, first_sid - 80)
+    };
     let mut out = format!("{arc1}.{arc2}");
+
     let mut value: u64 = 0;
     let mut started = false;
-    for &b in &content[1..] {
+    for &b in iter {
         started = true;
         value = (value << 7) | (b & 0x7f) as u64;
         if b & 0x80 == 0 {
@@ -322,6 +344,15 @@ mod tests {
     fn oid_decoder_rejects_unterminated() {
         // Trailing byte with the high bit set and no terminator.
         assert_eq!(decode_oid(&[0x55, 0x81]), None);
+    }
+
+    #[test]
+    fn oid_decoder_multibyte_first_subidentifier() {
+        // 2.999: first sub-id = 2*40 + 999 = 1079, encoded multi-byte as 88 37.
+        // A naive first/40, first%40 split would give "3.16.55".
+        assert_eq!(decode_oid(&[0x88, 0x37]).as_deref(), Some("2.999"));
+        // 2.100.3: first sub-id 180 = 81 34, then arc 3.
+        assert_eq!(decode_oid(&[0x81, 0x34, 0x03]).as_deref(), Some("2.100.3"));
     }
 
     #[test]
