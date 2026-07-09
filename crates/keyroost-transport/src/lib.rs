@@ -962,11 +962,11 @@ impl ReaderWatcher {
                     }
                 }
             })
-            .expect("spawn reader-watch thread");
-        ReaderWatcher {
-            stop,
-            handle: Some(handle),
-        }
+            // If the OS can't spawn the watch thread (resource exhaustion),
+            // degrade to no live hot-plug detection rather than aborting the
+            // process — the UI still works and falls back to manual rescans.
+            .ok();
+        ReaderWatcher { stop, handle }
     }
 }
 
