@@ -54,6 +54,25 @@ const RESP_CREDENTIAL_ID: u64 = 0x07;
 const RESP_PUBLIC_KEY: u64 = 0x08;
 const RESP_TOTAL_CREDS: u64 = 0x09;
 
+/// Upper bound on the RP / credential count we'll enumerate. Real
+/// authenticators hold at most a few dozen resident credentials; the spec's
+/// `totalRPs` / `totalCredentials` are device-claimed `u32`s, so a hostile or
+/// buggy key could answer with a gigantic value and drive the `…Next` loop to
+/// stream entries indefinitely (unbounded memory / a multi-hour hang). A count
+/// past this ceiling is treated as a malformed response.
+const MAX_ENUMERATED: usize = 4096;
+
+/// Validate a device-claimed enumeration total against [`MAX_ENUMERATED`].
+fn checked_total(total: usize) -> Result<usize, CtapError> {
+    if total > MAX_ENUMERATED {
+        Err(CtapError::InvalidResponseShape(
+            "authenticator claimed an implausible enumeration count",
+        ))
+    } else {
+        Ok(total)
+    }
+}
+
 /// Aggregate resident-credential storage stats from `getCredsMetadata`.
 #[derive(Debug, Clone, Default)]
 pub struct CredsMetadata {
@@ -146,13 +165,12 @@ impl<'a, T: CtapTransport> CredentialManager<'a, T> {
             Err(CtapError::StatusCode(CTAP2_ERR_NO_CREDENTIALS)) => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
-        let total = field_uint(&first, RESP_TOTAL_RPS).unwrap_or(0) as usize;
+        let total = checked_total(field_uint(&first, RESP_TOTAL_RPS).unwrap_or(0) as usize)?;
         if total == 0 {
             return Ok(Vec::new());
         }
-        // The count is device-claimed — cap the preallocation so a buggy or
-        // hostile authenticator can't drive a huge allocation. The loop below
-        // still honours `total`; growth past the cap just reallocates.
+        // The count is device-claimed and now bounded by `checked_total`; cap
+        // the preallocation too so even an in-range count can't overcommit.
         let mut out = Vec::with_capacity(total.min(1024));
         out.push(parse_rp(&first)?);
         while out.len() < total {
@@ -178,11 +196,11 @@ impl<'a, T: CtapTransport> CredentialManager<'a, T> {
             Err(CtapError::StatusCode(CTAP2_ERR_NO_CREDENTIALS)) => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
-        let total = field_uint(&first, RESP_TOTAL_CREDS).unwrap_or(0) as usize;
+        let total = checked_total(field_uint(&first, RESP_TOTAL_CREDS).unwrap_or(0) as usize)?;
         if total == 0 {
             return Ok(Vec::new());
         }
-        // Device-claimed count — cap the preallocation (see list_rps).
+        // Device-claimed count, now bounded by `checked_total` (see list_rps).
         let mut out = Vec::with_capacity(total.min(1024));
         out.push(parse_credential(&first)?);
         while out.len() < total {
@@ -403,6 +421,24 @@ mod tests {
         let mut out = vec![mgr_cmd];
         out.extend_from_slice(&encode(&Value::Map(entries)));
         out
+    }
+
+    #[test]
+    fn checked_total_rejects_absurd_device_counts() {
+        // A real key holds well under the cap; those pass through unchanged.
+        assert_eq!(checked_total(0).unwrap(), 0);
+        assert_eq!(checked_total(100).unwrap(), 100);
+        assert_eq!(checked_total(MAX_ENUMERATED).unwrap(), MAX_ENUMERATED);
+        // A hostile authenticator claiming a huge total (up to u32) must be
+        // rejected, not enumerated — otherwise the Next loop streams forever.
+        assert!(matches!(
+            checked_total(MAX_ENUMERATED + 1),
+            Err(CtapError::InvalidResponseShape(_))
+        ));
+        assert!(matches!(
+            checked_total(u32::MAX as usize),
+            Err(CtapError::InvalidResponseShape(_))
+        ));
     }
 
     #[test]
