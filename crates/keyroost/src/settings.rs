@@ -85,25 +85,53 @@ impl From<ModeSetting> for Mode {
     }
 }
 
-/// Default config path: `$XDG_CONFIG_HOME/keyroost/settings.json`, else
-/// `$HOME/.config/keyroost/settings.json`. Mirrors `keyroost_keyring::config_path`
-/// (plain `std::env`, no path crate) so both files land in the same directory.
+/// Default config path. On Windows: `%APPDATA%\keyroost\settings.json` (else
+/// `%USERPROFILE%\.config\keyroost\settings.json`). Otherwise:
+/// `$XDG_CONFIG_HOME/keyroost/settings.json`, else
+/// `$HOME/.config/keyroost/settings.json`.
+///
+/// Mirrors [`keyroost_keyring::config_path`] (plain `std::env`, no path crate)
+/// including its Windows branch — without it, a stock Windows install (no HOME)
+/// returned `None` and the GUI silently never persisted its settings, and
+/// settings.json landed in a different place than keys.json.
 pub fn config_path() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return Some(PathBuf::from(xdg).join("keyroost").join("settings.json"));
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            if !appdata.is_empty() {
+                return Some(PathBuf::from(appdata).join("keyroost").join("settings.json"));
+            }
         }
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            if !profile.is_empty() {
+                return Some(
+                    PathBuf::from(profile)
+                        .join(".config")
+                        .join("keyroost")
+                        .join("settings.json"),
+                );
+            }
+        }
+        None
     }
-    let home = std::env::var_os("HOME")?;
-    if home.is_empty() {
-        return None;
+    #[cfg(not(windows))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+            if !xdg.is_empty() {
+                return Some(PathBuf::from(xdg).join("keyroost").join("settings.json"));
+            }
+        }
+        let home = std::env::var_os("HOME")?;
+        if home.is_empty() {
+            return None;
+        }
+        Some(
+            PathBuf::from(home)
+                .join(".config")
+                .join("keyroost")
+                .join("settings.json"),
+        )
     }
-    Some(
-        PathBuf::from(home)
-            .join(".config")
-            .join("keyroost")
-            .join("settings.json"),
-    )
 }
 
 impl Settings {
