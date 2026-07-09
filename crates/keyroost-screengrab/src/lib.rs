@@ -68,6 +68,11 @@ pub fn capture_virtual_screen() -> Result<Frame, String> {
 
         let blit_ok = BitBlt(mem, 0, 0, w, h, screen, x, y, SRCCOPY) != 0;
 
+        // Deselect the bitmap from the DC *before* GetDIBits: MSDN requires the
+        // bitmap not be selected into any DC when GetDIBits reads it. The blit
+        // is already done, so nothing else needs the selection.
+        SelectObject(mem, prev);
+
         // Top-down (negative height) 32-bpp BGRA readback.
         let mut info: BITMAPINFO = core::mem::zeroed();
         info.bmiHeader = BITMAPINFOHEADER {
@@ -90,8 +95,7 @@ pub fn capture_virtual_screen() -> Result<Frame, String> {
             DIB_RGB_COLORS,
         );
 
-        // Release GDI objects regardless of outcome.
-        SelectObject(mem, prev);
+        // Release the remaining GDI objects regardless of outcome.
         DeleteObject(bmp as _);
         DeleteDC(mem);
         ReleaseDC(std::ptr::null_mut(), screen);
@@ -99,8 +103,10 @@ pub fn capture_virtual_screen() -> Result<Frame, String> {
         if !blit_ok {
             return Err("BitBlt failed".into());
         }
-        if lines == 0 {
-            return Err("GetDIBits returned no scanlines".into());
+        // A partial readback (fewer scanlines than requested) leaves black rows,
+        // so require the full height, not merely a nonzero count.
+        if lines != h {
+            return Err("GetDIBits returned an incomplete image".into());
         }
 
         // BGRA -> RGBA (and force opaque alpha).

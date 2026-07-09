@@ -224,8 +224,12 @@ mod macos {
                     .into(),
             );
         }
-        let bytes = std::fs::read(&path).map_err(|e| format!("cannot read the capture: {e}"))?;
+        // Remove the on-disk capture (it may contain a 2FA QR / secrets) before
+        // returning on either the success or the read-error path, so a failed
+        // read doesn't leave the screenshot behind.
+        let read_result = std::fs::read(&path);
         let _ = std::fs::remove_file(&path);
+        let bytes = read_result.map_err(|e| format!("cannot read the capture: {e}"))?;
         Ok(vec![Capture::Png(bytes)])
     }
 }
