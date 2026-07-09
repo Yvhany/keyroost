@@ -635,14 +635,28 @@ pub struct CredentialInfo {
     pub algorithm: Algorithm,
 }
 
+/// A decoded `LIST` response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    /// The entries that decoded cleanly.
+    pub credentials: Vec<CredentialInfo>,
+    /// `NAME_LIST` entries that were present on the card but skipped because
+    /// they could not be decoded (empty value, unknown type/algorithm prefix,
+    /// or a non-UTF-8 name). Non-zero means the listing is **partial**: the
+    /// card holds credentials this crate cannot show, and callers should say
+    /// so before any destructive operation (e.g. a reset).
+    pub skipped: usize,
+}
+
 /// Parse a `LIST` response into credential entries.
 ///
 /// The response is a sequence of `NAME_LIST` (`0x72`) TLVs; each value is
 /// `[ (type<<4)|algo, name_utf8... ]`. Non-`NAME_LIST` tags are ignored so the
 /// parser tolerates a card that interleaves other tags.
-pub fn parse_list(buf: &[u8]) -> Result<Vec<CredentialInfo>, ParseError> {
+pub fn parse_list(buf: &[u8]) -> Result<Listing, ParseError> {
     let tlvs = parse_tlvs(buf)?;
     let mut out = Vec::new();
+    let mut skipped = 0usize;
     for tlv in &tlvs {
         if tlv.tag != Tag::NameList.code() {
             continue;
@@ -650,17 +664,22 @@ pub fn parse_list(buf: &[u8]) -> Result<Vec<CredentialInfo>, ParseError> {
         let value = tlv.value;
         // Skip an individual undecodable entry (empty, unknown prefix, or a
         // non-UTF-8 name) rather than failing the whole listing — one corrupt
-        // credential must not hide every other credential on the key.
+        // credential must not hide every other credential on the key. The
+        // skip is counted so callers can tell a partial listing from a
+        // complete one.
         let Some(&prefix) = value.first() else {
+            skipped += 1;
             continue;
         };
         let (Some(oath_type), Some(algorithm)) = (
             OathType::from_prefix(prefix),
             Algorithm::from_prefix(prefix),
         ) else {
+            skipped += 1;
             continue;
         };
         let Ok(name) = core::str::from_utf8(&value[1..]) else {
+            skipped += 1;
             continue;
         };
         out.push(CredentialInfo {
@@ -669,7 +688,10 @@ pub fn parse_list(buf: &[u8]) -> Result<Vec<CredentialInfo>, ParseError> {
             algorithm,
         });
     }
-    Ok(out)
+    Ok(Listing {
+        credentials: out,
+        skipped,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -927,7 +949,9 @@ mod tests {
         buf.extend_from_slice(&[0x72, 0x03, 0x21, b'a', b'b']);
         buf.extend_from_slice(&[0x72, 0x04, 0x13, b'f', b'o', b'o']);
 
-        let creds = parse_list(&buf).unwrap();
+        let listing = parse_list(&buf).unwrap();
+        assert_eq!(listing.skipped, 0);
+        let creds = listing.credentials;
         assert_eq!(creds.len(), 2);
         assert_eq!(
             creds[0],
@@ -959,13 +983,16 @@ mod tests {
     #[test]
     fn parse_list_skips_bad_entries_keeps_good() {
         // A corrupt entry (bad prefix 0x99, then a non-UTF-8 name) must not hide
-        // the valid entries that follow — skip it and return the good ones.
+        // the valid entries that follow — skip it, return the good ones, and
+        // report how many were dropped so callers can flag the partial listing.
         let buf = [
             0x72, 0x02, 0x99, b'a', // bad type nibble 0x90 -> skipped
             0x72, 0x02, 0x21, 0xFF, // TOTP|SHA1 but invalid UTF-8 name -> skipped
             0x72, 0x03, 0x21, b'o', b'k', // TOTP|SHA1 "ok" -> kept
         ];
-        let creds = parse_list(&buf).unwrap();
+        let listing = parse_list(&buf).unwrap();
+        assert_eq!(listing.skipped, 2);
+        let creds = listing.credentials;
         assert_eq!(creds.len(), 1);
         assert_eq!(creds[0].name, "ok");
         assert_eq!(creds[0].oath_type, OathType::Totp);

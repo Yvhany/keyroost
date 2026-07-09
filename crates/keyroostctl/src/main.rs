@@ -3583,7 +3583,21 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
     match cmd {
         OathCmd::List { access } => {
             let mut session = open_oath(access, debug)?;
-            let creds = session.list()?;
+            let listing = session.list()?;
+            if listing.skipped > 0 {
+                // The listing is PARTIAL — say so loudly, on stderr so it also
+                // reaches --json users without breaking the output schema. An
+                // invisible entry would otherwise be silently destroyed by a
+                // reset the user believed they had fully audited.
+                eprintln!(
+                    "warning: {} credential entr{} on the key could not be decoded and {} not shown; \
+                     the listing is incomplete",
+                    listing.skipped,
+                    if listing.skipped == 1 { "y" } else { "ies" },
+                    if listing.skipped == 1 { "is" } else { "are" },
+                );
+            }
+            let creds = listing.credentials;
             if json_output() {
                 let out: Vec<json_out::OathCredentialJson> = creds
                     .iter()
@@ -3619,6 +3633,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             // counter (empty challenge), TOTP a time counter.
             let is_hotp = session
                 .list()?
+                .credentials
                 .iter()
                 .find(|c| c.name == *name)
                 .map(|c| matches!(c.oath_type, keyroost_oath::OathType::Hotp))

@@ -156,7 +156,11 @@ impl OathSession {
     }
 
     /// List provisioned credential names (with their type/algorithm).
-    pub fn list(&mut self) -> Result<Vec<oath::CredentialInfo>, TransportError> {
+    ///
+    /// `Listing::skipped` is non-zero when the card holds entries this crate
+    /// could not decode; callers should surface that — the listing is partial
+    /// and destructive operations would also destroy the invisible entries.
+    pub fn list(&mut self) -> Result<oath::Listing, TransportError> {
         let (data, sw) = self.transmit_full(&oath::list())?;
         ok_or_apdu("oath list", sw)?;
         oath::parse_list(&data).map_err(TransportError::OathParse)

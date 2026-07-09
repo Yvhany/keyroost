@@ -337,6 +337,10 @@ impl Drop for ChangePinDialog {
 struct OathState {
     /// Credentials listed from the selected key, with their freshly-computed code.
     creds: Vec<OathRow>,
+    /// Entries the card reported that could not be decoded (the listing is
+    /// partial when non-zero) — surfaced so a reset isn't run against an
+    /// inventory the user believes is complete.
+    skipped: usize,
     /// True when the selected applet is password-protected and not yet unlocked.
     locked: bool,
     /// Password entry field (cleared after an unlock attempt).
@@ -3251,16 +3255,18 @@ impl App {
         Ok(session)
     }
 
-    /// Off-thread helper: list credentials and compute each current TOTP.
+    /// Off-thread helper: list credentials and compute each current TOTP. Also
+    /// returns how many undecodable entries the card holds (partial listing).
     fn oath_list_rows(
         session: &mut keyroost_transport::OathSession,
-    ) -> Result<Vec<OathRow>, TransportError> {
+    ) -> Result<(Vec<OathRow>, usize), TransportError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let listing = session.list()?;
         let mut rows = Vec::new();
-        for c in session.list()? {
+        for c in listing.credentials {
             // A touch-required credential blocks until touched; fine off-thread.
             let code = session
                 .calculate_totp(&c.name, now, 30)
@@ -3268,11 +3274,11 @@ impl App {
                 .map(|otp| otp.code);
             rows.push(OathRow { name: c.name, code });
         }
-        Ok(rows)
+        Ok((rows, listing.skipped))
     }
 
     /// Store the outcome of an op that ends by (re)listing credentials.
-    fn apply_oath_rows(app: &mut App, result: Result<Vec<OathRow>, TransportError>) {
+    fn apply_oath_rows(app: &mut App, result: Result<(Vec<OathRow>, usize), TransportError>) {
         // The typed password is consumed whatever the outcome — success,
         // wrong-password, or a transport error must not leave it buffered for
         // an automatic retry against (potentially) a different key.
@@ -3293,8 +3299,9 @@ impl App {
             app.oath.add.busy = false;
         }
         match result {
-            Ok(rows) => {
+            Ok((rows, skipped)) => {
                 app.oath.creds = rows;
+                app.oath.skipped = skipped;
                 app.oath.loaded = true;
                 app.oath.locked = false;
             }
@@ -3363,7 +3370,7 @@ impl App {
         // The form stays open showing the spinner; it is wiped/closed on the
         // modal's Done (success) or Cancel/✕/Esc. Do not reset it here.
         self.spawn_job("Adding credential\u{2026}", move || {
-            let result = (|| -> Result<Vec<OathRow>, TransportError> {
+            let result = (|| -> Result<(Vec<OathRow>, usize), TransportError> {
                 let mut session = Self::oath_open_unlock(&name, &password)?;
                 session.put(&keyroost_oath::PutParams {
                     name: &cred_name,
@@ -3390,7 +3397,7 @@ impl App {
         let cred_name = name.to_owned();
         let password = zeroize::Zeroizing::new(self.oath.password_input.clone());
         self.spawn_job("Deleting credential\u{2026}", move || {
-            let result = (|| -> Result<Vec<OathRow>, TransportError> {
+            let result = (|| -> Result<(Vec<OathRow>, usize), TransportError> {
                 let mut session = Self::oath_open_unlock(&reader, &password)?;
                 session.delete(&cred_name)?;
                 Self::oath_list_rows(&mut session)
@@ -4465,6 +4472,7 @@ impl App {
         self.security_keys.lb_confirm_delete = None;
         self.security_keys.lb_confirm_clear = false;
         self.oath.creds.clear();
+        self.oath.skipped = 0;
         self.oath.loaded = false;
         self.oath.locked = false;
         self.oath.error = None;
@@ -10105,12 +10113,30 @@ impl App {
             );
             return;
         }
-        if self.oath.creds.is_empty() {
+        if self.oath.skipped > 0 {
+            // Partial listing: the card holds entries we couldn't decode. Shown
+            // before (and instead of) "No authenticator codes" — a key whose
+            // only credentials are undecodable is NOT empty.
             ui.label(
-                egui::RichText::new("No authenticator codes on this key.")
-                    .font(theme::f_reg(13.0))
-                    .color(p.txt3),
+                egui::RichText::new(format!(
+                    "\u{26A0} {} entr{} on this key could not be decoded and {} not shown.",
+                    self.oath.skipped,
+                    if self.oath.skipped == 1 { "y" } else { "ies" },
+                    if self.oath.skipped == 1 { "is" } else { "are" },
+                ))
+                .font(theme::f_reg(13.0))
+                .color(p.warn),
             );
+            ui.add_space(4.0);
+        }
+        if self.oath.creds.is_empty() {
+            if self.oath.skipped == 0 {
+                ui.label(
+                    egui::RichText::new("No authenticator codes on this key.")
+                        .font(theme::f_reg(13.0))
+                        .color(p.txt3),
+                );
+            }
             return;
         }
 
@@ -12451,10 +12477,13 @@ mod tests {
         app.oath.add.busy = true;
         App::apply_oath_rows(
             &mut app,
-            Ok(vec![OathRow {
-                name: "x".into(),
-                code: None,
-            }]),
+            Ok((
+                vec![OathRow {
+                    name: "x".into(),
+                    code: None,
+                }],
+                0,
+            )),
         );
         assert!(!app.oath.add.busy);
         assert_eq!(app.oath.add.result, Some(Ok(())));
