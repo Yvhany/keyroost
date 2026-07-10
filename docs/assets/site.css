@@ -161,3 +161,15 @@ a.kr-card .kr-more { color: var(--kr-accent); font-size: 0.85rem; font-weight: 6
 .kr-table th { background: var(--kr-raised); color: var(--kr-txt-2); font-weight: 600; }
 .kr-table code { white-space: nowrap; }
 .kr-table-wrap { overflow-x: auto; }
+
+/* --- product screenshots ---------------------------------------------- */
+.kr-shot { margin: 20px 0 8px; }
+.kr-shot img {
+  display: block; width: 100%; height: auto;
+  border: 1px solid var(--kr-line);
+  border-radius: 12px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+}
+.kr-shot figcaption {
+  margin-top: 8px; font-size: 0.85rem; color: var(--kr-txt-3); text-align: center;
+}
