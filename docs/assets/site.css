@@ -151,3 +151,13 @@ a.kr-card .kr-more { color: var(--kr-accent); font-size: 0.85rem; font-weight: 6
   .kr-hero { padding-top: 38px; }
   h1 { font-size: 1.7rem; }
 }
+
+/* --- migration tables ------------------------------------------------- */
+.kr-table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 0.92rem; }
+.kr-table th, .kr-table td {
+  text-align: left; padding: 8px 12px;
+  border: 1px solid var(--kr-line);
+}
+.kr-table th { background: var(--kr-raised); color: var(--kr-txt-2); font-weight: 600; }
+.kr-table code { white-space: nowrap; }
+.kr-table-wrap { overflow-x: auto; }

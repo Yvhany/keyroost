@@ -510,36 +510,14 @@ keyroostctl key-name list
 keyroost
 ```
 
-## Migrating to the 0.6.0 command names
+## Breaking changes & migration
 
-The Molto2 and FIDO commands are now nested under `molto` and `fido` groups.
-The old flat names have been replaced — update any scripts as follows:
-
-| Old (≤ 0.5.x)                       | New (0.6.0)                          |
-|-------------------------------------|--------------------------------------|
-| `keyroostctl info`                  | `keyroostctl molto info`             |
-| `keyroostctl set-seed …`            | `keyroostctl molto seed …`           |
-| `keyroostctl set-title …`           | `keyroostctl molto title …`          |
-| `keyroostctl configure …`           | `keyroostctl molto config …`         |
-| `keyroostctl sync-time …`           | `keyroostctl molto sync-time …`      |
-| `keyroostctl set-customer-key …`    | `keyroostctl molto customer-key …`   |
-| `keyroostctl import …`              | `keyroostctl molto import …`         |
-| `keyroostctl import-file …`         | `keyroostctl molto import-file …`    |
-| `keyroostctl factory-reset …`       | `keyroostctl molto reset …`          |
-| `keyroostctl fido-info`             | `keyroostctl fido info`              |
-| `keyroostctl fido-reset …`          | `keyroostctl fido reset …`           |
-| `keyroostctl fido-pin-set …`        | `keyroostctl fido pin-set …`         |
-| `keyroostctl fido-pin-change …`     | `keyroostctl fido pin-change …`      |
-| `keyroostctl fido-pin-retries`      | `keyroostctl fido pin-retries`       |
-| `keyroostctl fido-creds-list …`     | `keyroostctl fido creds-list …`      |
-| `keyroostctl fido-creds-metadata …` | `keyroostctl fido creds-metadata …`  |
-| `keyroostctl fido-creds-delete …`   | `keyroostctl fido creds-delete …`    |
-| `keyroostctl manpage > x.1`         | `keyroostctl manpage ./man`          |
-
-The customer-key flags (`--key`, `--key-ascii`, `--key-env`, `--key-ascii-env`)
-now live under `molto` — e.g. `keyroostctl molto customer-key --key-env K`. The
-`piv`, `oath`, `openpgp`, `otp`, `key-name`, `list`, `doctor`, and `completions`
-commands are unchanged.
+Breaking changes are tracked per release on the site's
+[migration notes](https://framefilter.github.io/keyroost/migration.html)
+page, with the exact before → after for scripts and library consumers. The
+two to know about: **v0.7.5** renames the global device selector from
+`--name` to `--device`, and **v0.6.0** moved the Molto2 / FIDO commands under
+the `molto` and `fido` groups.
 
 ## Workspace layout
 
