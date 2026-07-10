@@ -11309,7 +11309,10 @@ impl App {
                     ui.add_space(10.0);
                     ui.horizontal_top(|ui| {
                         ui.vertical(|ui| {
-                            ui.set_width(140.0);
+                            // Wide enough for "Slot NN · " plus a full 12-char
+                            // title (the device's title limit) in the mono font,
+                            // with the seed dot clear of the text.
+                            ui.set_width(212.0);
                             // Fill the remaining height so the rail isn't a fixed
                             // block jammed at the window bottom; leave a margin.
                             let rail_h = (ui.available_height() - 48.0).max(160.0);
@@ -11340,7 +11343,14 @@ impl App {
                                         Some(t) => format!("Slot {s:02} \u{00B7} {}", sanitize_title(t)),
                                         None => format!("Slot {s:02}"),
                                     };
-                                    ui.painter().text(
+                                    // Clip to the row (short of the seed dot) so a
+                                    // maximal title can never paint over the form
+                                    // column beside the rail.
+                                    let text_clip = egui::Rect::from_min_max(
+                                        rect.min,
+                                        egui::pos2(rect.right() - 20.0, rect.max.y),
+                                    );
+                                    ui.painter().with_clip_rect(text_clip).text(
                                         rect.left_center() + egui::vec2(12.0, 0.0),
                                         egui::Align2::LEFT_CENTER,
                                         label,
