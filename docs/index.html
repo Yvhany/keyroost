@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>So you bought a hardware security key… now what? — keyroost</title>
 <meta name="description" content="A short, vendor-neutral guide to what a hardware security key actually does — FIDO2 passkeys, TOTP, smart-card (PIV), and OpenPGP — how to set one up, and where to read the real standards.">
+<link rel="icon" type="image/png" href="assets/keyroost-logo.png">
 <link rel="stylesheet" href="assets/keyroost-theme.css">
 <link rel="stylesheet" href="assets/site.css">
 <script>(function(){try{var t=localStorage.getItem('kr-theme');if(t==='light'||(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches))document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
@@ -58,8 +59,8 @@
     <h2><span class="num">01</span>What is it, really?</h2>
     <p>A hardware security key is a tiny tamper-resistant computer. Its one job is to
       hold <strong>secrets that never leave the chip</strong> and to perform crypto
-      operations with them on demand — so even malware on your laptop can borrow the
-      key's <em>powers</em> while it's plugged in, but can never copy the <em>keys</em>
+      operations with them on demand — so malware on your laptop can, at worst, borrow
+      the key's <em>powers</em> while it's plugged in; it can never copy the <em>keys</em>
       themselves.</p>
     <p>Most modern keys (YubiKey, SoloKey, Nitrokey, Token2, and others) are really
       several independent "applets" sharing one piece of plastic. Each speaks a
@@ -213,11 +214,49 @@
     </details>
 
     <details>
+      <summary>Which keys does it work with?</summary>
+      <div class="kr-answer">
+        <p>Any standards-compliant FIDO2 key for the FIDO features — keyroost implements
+          the published CTAP2 spec, not vendor quirks. Hardware-verified so far: YubiKey 5
+          series, SoloKeys Solo 2, Nitrokey 3, Token2 PIN+ (including fingerprints and
+          on-device OTP), and the Token2 Molto2 and single-profile programmable tokens.
+          OATH, OpenPGP, and PIV work on any key that exposes those applets over PC/SC.
+          <a href="https://github.com/framefilter/keyroost#supported-devices">Full device
+          table →</a></p>
+      </div>
+    </details>
+
+    <details>
       <summary>Text input in the desktop app misbehaves on my Linux session</summary>
       <div class="kr-answer">
         <p>On some Wayland compositors — notably KDE Plasma — GUI text fields can drop or
           mishandle keystrokes. Launch the app with <code>KEYROOST_X11=1</code> set to force
           it onto XWayland, which resolves the input handling.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary>The desktop app exits on its own after being left open for hours (Linux)</summary>
+      <div class="kr-answer">
+        <p>On Wayland, an app left idle for hours can be killed by the compositor with
+          <code>Protocol error … wl_registry</code> — typically when a monitor sleeps or
+          reconfigures at just the wrong moment. This is a known race in the Wayland
+          protocol itself, not something keyroost can prevent; a protocol-level fix
+          (<code>wl_fixes</code>) is rolling out across compositors and GUI toolkits.
+          It's harmless: everything lives on your keys, so nothing is lost — just reopen
+          the app. If you want it to survive long idle periods today, launch it with
+          <code>KEYROOST_X11=1</code>; the XWayland path is unaffected.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary>Why does Windows ask for administrator rights?</summary>
+      <div class="kr-answer">
+        <p>Windows reserves raw FIDO access for elevated processes, so the FIDO2 features
+          need an administrator session — keyroost detects this and offers to relaunch
+          elevated or open Windows' own security-key settings. Everything that runs over
+          the smart-card interface (OATH, OpenPGP, PIV, Molto2) works without elevation.
+          Elevate for the FIDO operation you need, then drop back.</p>
       </div>
     </details>
   </section>
@@ -230,12 +269,23 @@
 
     <h3>Linux — desktop app</h3>
     <p><strong>Flatpak</strong> is the easiest route for a non-technical user: it
-      auto-updates and bundles everything the GUI needs.</p>
-<pre><code>flatpak remote-add --if-not-exists keyroost https://framefilter.github.io/keyroost-flatpak/keyroost.flatpakrepo
-flatpak install keyroost io.github.framefilter.keyroost</code></pre>
+      auto-updates and bundles everything the GUI needs. Add both remotes in the same
+      (<code>--user</code>) scope:</p>
+<pre><code>flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak remote-add --if-not-exists --user keyroost https://framefilter.github.io/keyroost-flatpak/keyroost.flatpakrepo
+flatpak install --user keyroost io.github.framefilter.keyroost</code></pre>
     <p><strong>AppImage</strong> needs no installation — download
       <code>keyroost-x86_64.AppImage</code> from the latest release, make it executable, and
-      run it.</p>
+      run it. (It uses the host's pcsc-lite, so install that first — see the note below.)</p>
+    <div class="kr-callout note">
+      <div class="kr-callout-title note">Linux prerequisites</div>
+      <p>The smart-card features (OATH, OpenPGP, PIV, Molto2) need the host's
+        <code>pcscd</code> daemon — <code>sudo apt install pcscd</code> or your distro's
+        equivalent. Talking to a key's FIDO interface needs the bundled udev rules so the
+        device node isn't root-only. Both are two-minute setups —
+        <a href="https://github.com/framefilter/keyroost#smart-card-prerequisite">full
+        notes in the README</a>.</p>
+    </div>
 
     <h3>macOS &amp; Linux — Homebrew</h3>
 <pre><code>brew tap framefilter/keyroost
