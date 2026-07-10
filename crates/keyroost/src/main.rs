@@ -285,6 +285,18 @@ struct ResetArm {
     saw_removal: bool,
 }
 
+/// The device an open rename field is bound to, pinned when the field opens so
+/// a background rescan can't retarget the save. See [`App::rename_target`].
+#[derive(Clone)]
+struct RenameTarget {
+    /// Serial the new name will be written against (device serial, not the
+    /// reader-name serial). A device with no serial can't be named.
+    serial: String,
+    /// The device's friendly name at open time, so the save removes the right
+    /// old entry even if the live device's name has since changed.
+    name_at_open: Option<String>,
+}
+
 struct UnlockedSession {
     token: PinUvAuthToken,
     metadata: CredsMetadata,
@@ -1306,6 +1318,13 @@ struct App {
     rename_open: bool,
     /// Friendly-name draft for the selected device.
     rename_input: String,
+    /// The device the open rename field targets, pinned when the field opens:
+    /// its serial and its name-at-open. The save writes against *this* serial,
+    /// not whatever `selected_device` happens to be at save time — a background
+    /// rescan (e.g. the Molto2's flapping CCID reader) can silently move the
+    /// selection between open and save, and without this pin the new name would
+    /// land on the wrong key.
+    rename_target: Option<RenameTarget>,
     /// Background worker for blocking device I/O. `None` only in tests.
     worker: Option<Worker>,
     /// Number of in-flight background jobs. While >0 the UI shows a spinner and
@@ -4556,8 +4575,7 @@ impl App {
         self.otp = OtpState::default();
         self.molto_reset_confirm = false;
         self.molto_delete_confirm = false;
-        self.rename_open = false;
-        self.rename_input.clear();
+        self.close_rename();
         self.authenticated = false;
         self.session = None;
         self.info = None;
@@ -5278,64 +5296,92 @@ impl App {
     /// borrowed) and applied here afterwards.
     fn apply_rename_actions(&mut self, dev: &Device, open: bool, cancel: bool, save: bool) {
         if open {
-            self.rename_open = true;
-            self.rename_input = dev.name.clone().unwrap_or_default();
+            if dev.serial.is_empty() {
+                self.log(
+                    Severity::Warn,
+                    "this device exposes no serial, so it can't be named yet",
+                );
+            } else {
+                self.rename_open = true;
+                self.rename_input = dev.name.clone().unwrap_or_default();
+                // Pin the target now, so the eventual save writes against this
+                // device even if a background rescan moves the selection first.
+                self.rename_target = Some(RenameTarget {
+                    serial: dev.serial.clone(),
+                    name_at_open: dev.name.clone(),
+                });
+            }
         }
         if cancel {
-            self.rename_open = false;
-            self.rename_input.clear();
+            self.close_rename();
         }
         if save {
             self.save_device_name();
         }
     }
 
-    /// Persist (or clear) the selected device's friendly name in `keys.json`,
-    /// keyed by its serial. Empty input removes the existing name.
+    /// Reset the inline-rename state (field closed, draft and pin cleared).
+    fn close_rename(&mut self) {
+        self.rename_open = false;
+        self.rename_input.clear();
+        self.rename_target = None;
+    }
+
+    /// Persist (or clear) the friendly name for the device the rename field was
+    /// opened against, keyed by the serial pinned at open time. Empty input
+    /// removes the existing name. Writing against the *pinned* serial (not the
+    /// live selection) is what keeps a mid-edit rescan from landing the name on
+    /// the wrong key. The vendor is looked up from the live device list if that
+    /// device is still present, else omitted — it's a display hint only.
     fn save_device_name(&mut self) {
-        let Some(dev) = self.selected_device().cloned() else {
+        let Some(target) = self.rename_target.clone() else {
+            // No pinned target (e.g. the device had no serial at open); nothing
+            // to write.
+            self.close_rename();
             return;
         };
-        if dev.serial.is_empty() {
-            self.log(
-                Severity::Warn,
-                "this device exposes no serial, so it can't be named yet",
-            );
-            self.rename_open = false;
-            return;
-        }
         let name = self.rename_input.trim().to_owned();
         if !name.is_empty() {
             if let Err(e) = keyroost_keyring::validate_name(&name) {
                 self.log(Severity::Err, format!("invalid name: {e}"));
-                return;
+                return; // keep the field open so the user can correct it
             }
         }
+        let vendor = self
+            .devices
+            .iter()
+            .find(|d| d.serial == target.serial)
+            .map(|d| d.vendor.to_ascii_lowercase());
         let mut keyring = keyroost_keyring::Keyring::load_default().unwrap_or_default();
-        // Drop any existing name for this device first (covers rename + clear).
-        if let Some(current) = dev.name.clone() {
+        // Drop the target's prior name — by the name pinned at open, then by
+        // serial as a belt-and-braces (covers a name changed under us). This
+        // covers both rename and clear.
+        if let Some(current) = target.name_at_open.clone() {
             keyring.remove(&current);
+        }
+        if let Some(existing) = keyring.name_for(Some(&target.serial)) {
+            let existing = existing.to_owned();
+            keyring.remove(&existing);
         }
         if !name.is_empty() {
             let entry = keyroost_keyring::KeyEntry {
                 name,
-                serial: dev.serial.clone(),
+                serial: target.serial.clone(),
                 source: keyroost_keyring::IdSource::default(),
-                vendor: Some(dev.vendor.to_ascii_lowercase()),
+                vendor,
                 aaguid: None,
                 note: None,
             };
             if let Err(e) = keyring.add(entry) {
                 self.log(Severity::Err, format!("name: {e}"));
-                return;
+                return; // keep the field open; nothing was saved
             }
         }
         match keyring.save_default() {
             Ok(_) => self.log(Severity::Ok, "name saved"),
             Err(e) => self.log(Severity::Err, format!("save names: {e}")),
         }
-        self.rename_open = false;
-        self.rename_input.clear();
+        self.close_rename();
         self.refresh_devices();
     }
 
@@ -6145,10 +6191,16 @@ impl eframe::App for App {
         // Drive the rescan burst: run a scan when one is due and the worker is
         // free, then schedule the next. Spacing gives a slow reader (Molto2)
         // time to register with pcscd between attempts.
+        //
+        // Held off while an inline rename field is open: a scan replaces the
+        // device list and can move the selection out from under the open field
+        // (acute with the Molto2's flapping CCID reader). The pending count is
+        // kept, so the burst resumes the moment the field closes — the repaint
+        // request below keeps the loop alive to notice.
         if self.reset_arm.is_none() && self.pending_scans > 0 {
             let now = std::time::Instant::now();
             let due = self.next_scan_at.is_none_or(|t| now >= t);
-            if due && !self.busy() {
+            if due && !self.busy() && !self.rename_open {
                 self.refresh_devices();
                 self.pending_scans -= 1;
                 self.next_scan_at = Some(now + std::time::Duration::from_millis(1500));
@@ -12762,6 +12814,58 @@ mod tests {
         let m = app.openpgp.cred_modal.as_ref().unwrap();
         assert!(!m.busy);
         assert_eq!(m.result, Some(Err("wrong admin PIN".into())));
+    }
+
+    fn test_key(id: &str, serial: &str, name: Option<&str>) -> Device {
+        Device {
+            id: id.into(),
+            name: name.map(str::to_owned),
+            vendor: "Yubico".into(),
+            model: "YubiKey".into(),
+            serial: serial.into(),
+            transport: "USB".into(),
+            firmware: String::new(),
+            caps: Caps::default(),
+            kind: DeviceKind::Key,
+            hid_path: None,
+            reader: None,
+        }
+    }
+
+    #[test]
+    fn rename_pins_target_serial_independent_of_selection() {
+        // Opening the rename field pins the device's serial and name-at-open,
+        // so a later selection change (e.g. a background rescan of a flapping
+        // reader) can't retarget the save.
+        let mut app = App::default();
+        let a = test_key("serial:A", "AAA", Some("old-a"));
+        app.apply_rename_actions(&a, /*open*/ true, false, false);
+        assert!(app.rename_open);
+        let t = app.rename_target.clone().expect("target pinned on open");
+        assert_eq!(t.serial, "AAA");
+        assert_eq!(t.name_at_open.as_deref(), Some("old-a"));
+
+        // Selection moves to another key mid-edit — the pin is unchanged.
+        app.devices = vec![test_key("serial:B", "BBB", Some("old-b"))];
+        app.selected_device = Some("serial:B".into());
+        let still = app.rename_target.clone().unwrap();
+        assert_eq!(still.serial, "AAA", "pin must not follow the selection");
+
+        // Cancel clears the pin and the field.
+        app.apply_rename_actions(&a, false, /*cancel*/ true, false);
+        assert!(!app.rename_open);
+        assert!(app.rename_target.is_none());
+    }
+
+    #[test]
+    fn rename_refuses_a_serial_less_device() {
+        // A device with no serial can't be named — the field never opens and no
+        // target is pinned.
+        let mut app = App::default();
+        let no_serial = test_key("winfido:x", "", None);
+        app.apply_rename_actions(&no_serial, true, false, false);
+        assert!(!app.rename_open);
+        assert!(app.rename_target.is_none());
     }
 
     /// The OpenPGP mismatch guard is inert (the PIN forms have no confirm field),
