@@ -227,7 +227,11 @@ pub fn select() -> Vec<u8> {
 pub struct PutParams<'a> {
     /// Credential name as stored on the card (UTF-8, e.g. `"issuer:account"`).
     pub name: &'a str,
-    /// Raw (already base32-decoded) HMAC secret.
+    /// Raw (already base32-decoded) HMAC secret. Secrets shorter than
+    /// [`MIN_HMAC_KEY_LEN`] are zero-padded on encode — the YKOATH protocol
+    /// requires the *client* to pad, and the card rejects shorter keys with
+    /// `6A80`. Padding never changes the codes: HMAC zero-pads its key to the
+    /// block size anyway, so `HMAC(k)` == `HMAC(k ∥ 0…)`.
     pub secret: &'a [u8],
     /// Credential kind.
     pub oath_type: OathType,
@@ -254,10 +258,16 @@ const MAX_SHORT_LEN: usize = 255;
 /// input (an imported `otpauth://` URI or QR code, whose name/secret lengths
 /// are attacker-controlled) must check this first and reject rather than build.
 #[must_use]
+/// Minimum HMAC-key length the YKOATH `PUT` accepts; shorter secrets are
+/// zero-padded to this length by [`put`] (the protocol makes padding the
+/// client's job, and padding is a semantic no-op for HMAC).
+pub const MIN_HMAC_KEY_LEN: usize = 14;
+
 pub fn put_fits(params: &PutParams<'_>) -> bool {
     let name = params.name.len();
-    // KEY value = prefix byte + digits byte + secret.
-    let key_val = 2 + params.secret.len();
+    // KEY value = prefix byte + digits byte + secret (zero-padded to the
+    // minimum the card accepts — mirror of put()'s encoding).
+    let key_val = 2 + params.secret.len().max(MIN_HMAC_KEY_LEN);
     if name > MAX_SHORT_LEN || key_val > MAX_SHORT_LEN {
         return false;
     }
@@ -294,10 +304,18 @@ pub fn put(params: &PutParams<'_>) -> Vec<u8> {
     let mut data = Zeroizing::new(Vec::new());
     push_tlv(&mut data, Tag::Name, params.name.as_bytes());
 
-    let mut key = Zeroizing::new(Vec::with_capacity(2 + params.secret.len()));
+    let mut key = Zeroizing::new(Vec::with_capacity(
+        2 + params.secret.len().max(MIN_HMAC_KEY_LEN),
+    ));
     key.push(prefix_byte(params.oath_type, params.algorithm));
     key.push(params.digits);
     key.extend_from_slice(params.secret);
+    // The card rejects HMAC keys shorter than MIN_HMAC_KEY_LEN with 6A80;
+    // the protocol expects the client to zero-pad. Safe: HMAC zero-pads its
+    // key to the block size anyway, so the computed codes are identical.
+    while key.len() < 2 + MIN_HMAC_KEY_LEN {
+        key.push(0);
+    }
     push_tlv(&mut data, Tag::Key, &key);
 
     if params.require_touch {
@@ -874,6 +892,10 @@ mod tests {
     #[test]
     fn put_bytes_fixed_vector() {
         // name = "ab", secret = 01 02 03, TOTP/SHA1, 6 digits, no touch.
+        // Expected bytes changed with client-side key padding (YKOATH requires
+        // the client to zero-pad HMAC keys shorter than MIN_HMAC_KEY_LEN; the
+        // card rejects a 3-byte key with 6A80, and HMAC(k) == HMAC(k ∥ 0…) so
+        // the codes are unchanged).
         let params = PutParams {
             name: "ab",
             secret: &[0x01, 0x02, 0x03],
@@ -886,15 +908,31 @@ mod tests {
         let apdu = put(&params);
         // header: 00 01 00 00
         // NAME(71) len2 "ab" = 71 02 61 62
-        // KEY(73) len5: prefix (0x20|0x01=0x21) digits(06) secret(01 02 03)
-        //   = 73 05 21 06 01 02 03
-        // Lc = 4 + 7 = 11 = 0x0B
+        // KEY(73) len16: prefix (0x20|0x01=0x21) digits(06) secret(01 02 03)
+        //   zero-padded to 14 key bytes = 73 10 21 06 01 02 03 00*11
+        // Lc = 4 + 18 = 22 = 0x16
         let expected = vec![
-            0x00, 0x01, 0x00, 0x00, 0x0B, // header + Lc
+            0x00, 0x01, 0x00, 0x00, 0x16, // header + Lc
             0x71, 0x02, 0x61, 0x62, // NAME "ab"
-            0x73, 0x05, 0x21, 0x06, 0x01, 0x02, 0x03, // KEY
+            0x73, 0x10, 0x21, 0x06, 0x01, 0x02, 0x03, // KEY prefix+digits+secret
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, // zero pad to MIN_HMAC_KEY_LEN
         ];
         assert_eq!(apdu, expected);
+    }
+
+    #[test]
+    fn put_pads_short_secret_and_leaves_long_alone() {
+        // The 10-byte "JBSWY3DPEHPK3PXP" doc secret must pad to 14 key bytes…
+        let short = params_with("x", 10);
+        let apdu = put(&short);
+        let key_len = apdu[apdu.iter().position(|&b| b == 0x73).unwrap() + 1];
+        assert_eq!(key_len, 2 + MIN_HMAC_KEY_LEN as u8);
+        // …while a 20-byte RFC 6238 key is sent as-is.
+        let long = params_with("y", 20);
+        let apdu = put(&long);
+        let key_len = apdu[apdu.iter().position(|&b| b == 0x73).unwrap() + 1];
+        assert_eq!(key_len, 2 + 20);
     }
 
     #[test]
@@ -909,11 +947,15 @@ mod tests {
             imf: 1,
         };
         let apdu = put(&params);
+        // Expected bytes changed with client-side key padding (see
+        // put_bytes_fixed_vector): the 1-byte secret pads to 14 key bytes.
         let expected = vec![
             0x00, 0x01, 0x00, 0x00,
-            // Lc: NAME(71 01 78)=3 + KEY(73 03 12 08 AA)=5 + PROP(78 01 02)=3 + IMF(7A 04 00000001)=6 = 17 = 0x11
-            0x11, 0x71, 0x01, 0x78, // NAME "x"
-            0x73, 0x03, 0x12, 0x08, 0xAA, // KEY: prefix 0x10|0x02=0x12, digits 8
+            // Lc: NAME(71 01 78)=3 + KEY(73 10 …)=18 + PROP(78 01 02)=3 + IMF(7A 04 00000001)=6 = 30 = 0x1E
+            0x1E, 0x71, 0x01, 0x78, // NAME "x"
+            0x73, 0x10, 0x12, 0x08, 0xAA, // KEY: prefix 0x10|0x02=0x12, digits 8
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, // zero pad to MIN_HMAC_KEY_LEN
             0x78, 0x01, 0x02, // PROPERTY require-touch
             0x7A, 0x04, 0x00, 0x00, 0x00, 0x01, // IMF = 1
         ];
