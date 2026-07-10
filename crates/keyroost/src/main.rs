@@ -360,6 +360,10 @@ struct OathState {
 struct OathRow {
     name: String,
     code: Option<String>,
+    /// Counter-based credential: codes are computed only on explicit request
+    /// (each computation advances the card's counter — a passive listing must
+    /// not burn counter steps), and they don't expire, so no countdown ring.
+    hotp: bool,
 }
 
 /// "Add credential" modal state for the OATH pane. Open iff `open` is true; the
@@ -3264,14 +3268,67 @@ impl App {
         let listing = session.list()?;
         let mut rows = Vec::new();
         for c in listing.credentials {
-            // A touch-required credential blocks until touched; fine off-thread.
-            let code = session
-                .calculate_totp(&c.name, now, 30)
-                .ok()
-                .map(|otp| otp.code);
-            rows.push(OathRow { name: c.name, code });
+            let hotp = matches!(c.oath_type, keyroost_oath::OathType::Hotp);
+            // HOTP codes are never computed during a listing: the card
+            // advances the credential's counter on every CALCULATE (the time
+            // challenge is ignored), so a passive refresh would silently walk
+            // the card out of the server's look-ahead window. The row shows a
+            // "Read code" button instead.
+            let code = if hotp {
+                None
+            } else {
+                // A touch-required credential blocks until touched; fine off-thread.
+                session
+                    .calculate_totp(&c.name, now, 30)
+                    .ok()
+                    .map(|otp| otp.code)
+            };
+            rows.push(OathRow {
+                name: c.name,
+                code,
+                hotp,
+            });
         }
+        // Group without headers: live TOTP codes first, on-demand HOTP rows
+        // after (stable — card order preserved within each group).
+        rows.sort_by_key(|r| r.hotp);
         Ok((rows, listing.skipped))
+    }
+
+    /// Compute one HOTP code on explicit request and patch it into the row.
+    /// Deliberately not part of the listing: each computation advances the
+    /// card's counter.
+    fn read_hotp_code(&mut self, name: &str) {
+        self.oath.error = None;
+        let Some(reader) = self.selected_oath_reader() else {
+            self.oath.error = Some("no OATH key selected".into());
+            return;
+        };
+        let cred = name.to_owned();
+        let password = zeroize::Zeroizing::new(self.oath.password_input.clone());
+        self.spawn_job("Reading code\u{2026}", move || {
+            let result = (|| -> Result<String, TransportError> {
+                let mut session = Self::oath_open_unlock(&reader, &password)?;
+                Ok(session.calculate_hotp(&cred)?.code)
+            })();
+            Box::new(move |app: &mut App| {
+                // The typed password is consumed whatever the outcome (mirrors
+                // apply_oath_rows).
+                wipe(&mut app.oath.password_input);
+                match result {
+                    Ok(code) => {
+                        if let Some(row) = app.oath.creds.iter_mut().find(|r| r.name == cred) {
+                            row.code = Some(code);
+                        }
+                    }
+                    Err(TransportError::OathPasswordRejected) => {
+                        app.oath.locked = true;
+                        app.oath.error = Some("wrong OATH password".into());
+                    }
+                    Err(e) => app.oath.error = Some(e.to_string()),
+                }
+            })
+        });
     }
 
     /// Store the outcome of an op that ends by (re)listing credentials.
@@ -7221,9 +7278,15 @@ impl App {
                         for row in self.oath.creds.iter().take(2) {
                             let is_copied =
                                 self.copied.as_ref().is_some_and(|(n, _)| n == &row.name);
-                            if let (Some(code), _) =
-                                oath_row(ui, p, &row.name, row.code.as_deref(), is_copied, false)
-                            {
+                            if let (Some(code), _, _) = oath_row(
+                                ui,
+                                p,
+                                &row.name,
+                                row.code.as_deref(),
+                                row.hotp,
+                                is_copied,
+                                false,
+                            ) {
                                 copy = Some((row.name.clone(), code));
                             }
                             ui.add_space(6.0);
@@ -10139,16 +10202,28 @@ impl App {
 
         let mut copy: Option<(String, String)> = None;
         let mut delete: Option<String> = None;
+        let mut read: Option<String> = None;
         theme::card_frame(p).show(ui, |ui| {
             let n = self.oath.creds.len();
             for (i, row) in self.oath.creds.iter().enumerate() {
                 let is_copied = self.copied.as_ref().is_some_and(|(nm, _)| nm == &row.name);
-                let (c, d) = oath_row(ui, p, &row.name, row.code.as_deref(), is_copied, true);
+                let (c, d, r) = oath_row(
+                    ui,
+                    p,
+                    &row.name,
+                    row.code.as_deref(),
+                    row.hotp,
+                    is_copied,
+                    true,
+                );
                 if let Some(code) = c {
                     copy = Some((row.name.clone(), code));
                 }
                 if d {
                     delete = Some(row.name.clone());
+                }
+                if r {
+                    read = Some(row.name.clone());
                 }
                 if i + 1 < n {
                     ui.add_space(5.0);
@@ -10169,6 +10244,9 @@ impl App {
         }
         if let Some(name) = delete {
             self.oath.confirm_delete = Some(name);
+        }
+        if let Some(name) = read {
+            self.read_hotp_code(&name);
         }
     }
 
@@ -12049,24 +12127,38 @@ fn oath_row(
     p: &Palette,
     name: &str,
     code: Option<&str>,
+    hotp: bool,
     is_copied: bool,
     with_delete: bool,
-) -> (Option<String>, bool) {
+) -> (Option<String>, bool, bool) {
     let (issuer, account) = match name.split_once(':') {
         Some((a, b)) => (a.to_string(), b.to_string()),
         None => (name.to_string(), String::new()),
     };
     let (secs, pct) = theme::totp_window(30);
-    let code_color = if secs <= 5 { p.warn } else { p.accent };
+    let code_color = if hotp {
+        // HOTP codes don't expire — no about-to-roll warning color.
+        p.accent
+    } else if secs <= 5 {
+        p.warn
+    } else {
+        p.accent
+    };
     let mut copy = None;
     let mut delete = false;
+    let mut read = false;
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            ui.label(
-                egui::RichText::new(issuer)
-                    .font(theme::f_sb(13.5))
-                    .color(p.txt),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(issuer)
+                        .font(theme::f_sb(13.5))
+                        .color(p.txt),
+                );
+                if hotp {
+                    theme::pill(ui, "HOTP", p.txt2, p.line_soft);
+                }
+            });
             if !account.is_empty() {
                 ui.label(
                     egui::RichText::new(account)
@@ -12085,6 +12177,24 @@ fn oath_row(
                 }
                 ui.add_space(8.0);
             }
+            if hotp && code.is_none() {
+                // No code yet: reading one advances the card's counter, so it
+                // happens only on request. (No copy icon either — there's
+                // nothing to copy.) The compact overview card doesn't handle
+                // the click, so it gets a passive label instead of a button.
+                if with_delete {
+                    if theme::button(ui, p, BtnKind::Ghost, "Read code").clicked() {
+                        read = true;
+                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new("on demand")
+                            .font(theme::f_reg(13.0))
+                            .color(p.txt3),
+                    );
+                }
+                return;
+            }
             let (cr, cresp) = ui.allocate_exact_size(egui::vec2(20.0, 18.0), egui::Sense::click());
             if is_copied {
                 paint_check_icon(ui, cr.center(), p.ok);
@@ -12097,13 +12207,17 @@ fn oath_row(
                 }
             }
             ui.add_space(10.0);
-            ui.label(
-                egui::RichText::new(format!("{secs}s"))
-                    .font(theme::f_reg(11.0))
-                    .color(p.txt3),
-            );
-            ui.add_space(5.0);
-            theme::ring(ui, pct, 20.0, code_color, p.line);
+            if !hotp {
+                // The countdown is a TOTP concept; an HOTP code stays valid
+                // until used.
+                ui.label(
+                    egui::RichText::new(format!("{secs}s"))
+                        .font(theme::f_reg(11.0))
+                        .color(p.txt3),
+                );
+                ui.add_space(5.0);
+                theme::ring(ui, pct, 20.0, code_color, p.line);
+            }
             ui.add_space(14.0);
             match code {
                 Some(c) => {
@@ -12123,7 +12237,7 @@ fn oath_row(
             }
         });
     });
-    (copy, delete)
+    (copy, delete, read)
 }
 
 /// Flatten control characters out of a device-provided title before display
@@ -12488,6 +12602,7 @@ mod tests {
                 vec![OathRow {
                     name: "x".into(),
                     code: None,
+                    hotp: false,
                 }],
                 0,
             )),
