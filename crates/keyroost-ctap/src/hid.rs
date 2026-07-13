@@ -305,25 +305,22 @@ impl CtapHidDevice {
 
     /// Send a CTAPHID command and read the response.
     pub fn transact(&mut self, cmd: u8, payload: &[u8]) -> Result<Vec<u8>, HidTransportError> {
-        let sensitive_resp = response_is_sensitive(cmd, payload);
+        let sensitive = exchange_is_sensitive(cmd, payload);
         if ctap_trace_enabled() {
             eprintln!(
                 "CTAP > cmd=0x{cmd:02x} len={} {}",
                 payload.len(),
-                hexline(payload)
+                trace_payload(payload, sensitive)
             );
         }
         self.send(self.channel_id, cmd, payload)?;
         let resp = self.recv(self.channel_id, cmd)?;
         if ctap_trace_enabled() {
-            if sensitive_resp {
-                eprintln!(
-                    "CTAP < len={} <redacted: credential/enrollment listing>",
-                    resp.len()
-                );
-            } else {
-                eprintln!("CTAP < len={} {}", resp.len(), hexline(&resp));
-            }
+            eprintln!(
+                "CTAP < len={} {}",
+                resp.len(),
+                trace_payload(&resp, sensitive)
+            );
         }
         Ok(resp)
     }
@@ -495,22 +492,40 @@ fn ctap_trace_enabled() -> bool {
     std::env::var_os("KEYROOST_CTAP_DEBUG").is_some()
 }
 
-/// True when a CTAPHID CBOR request's *response* carries personal data that
-/// must be redacted from the opt-in trace:
-/// - authenticatorCredentialManagement (`0x0A`, preview `0x41`) enumerates RP
-///   IDs and user names;
-/// - authenticatorBioEnrollment (`0x09`, preview `0x40`) enumerates
-///   fingerprint template friendly names — often a person's name.
+/// True when a CTAPHID CBOR exchange carries personal data that must be
+/// redacted from the opt-in trace — in **both** directions, because requests
+/// carry the same material the responses enumerate:
+/// - authenticatorCredentialManagement (`0x0A`, preview `0x41`): responses
+///   enumerate RP IDs and user names; `updateUserInformation` requests carry
+///   the replacement user entity;
+/// - authenticatorBioEnrollment (`0x09`, preview `0x40`): responses enumerate
+///   fingerprint template friendly names; `setFriendlyName` requests carry
+///   the new name — often a person's name;
+/// - authenticatorLargeBlobs (`0x0C`): reads return the serialized array,
+///   which includes keyroost's own plaintext notes (see
+///   `large_blobs::LargeBlobEntry::from_text` — explicitly NOT encryption),
+///   and writes carry the same bytes out.
 ///
 /// (PIN material in other commands is ciphertext under the ECDH session key,
 /// not recoverable from the trace.) Add every future personal-data-bearing
-/// CTAP2 command here, not at the trace call site.
-fn response_is_sensitive(cmd: u8, payload: &[u8]) -> bool {
+/// CTAP2 command here, not at the trace call sites.
+fn exchange_is_sensitive(cmd: u8, payload: &[u8]) -> bool {
     cmd == CTAPHID_CBOR
         && matches!(
             payload.first(),
-            Some(0x0A) | Some(0x41) | Some(0x09) | Some(0x40)
+            Some(0x0A) | Some(0x41) | Some(0x09) | Some(0x40) | Some(0x0C)
         )
+}
+
+/// The payload portion of one trace line: full hex normally, a redaction
+/// marker for sensitive exchanges. Framing metadata (direction, command byte,
+/// length) stays visible on the caller's side of the line.
+fn trace_payload(payload: &[u8], sensitive: bool) -> String {
+    if sensitive {
+        "<redacted: personal-data payload>".to_owned()
+    } else {
+        hexline(payload)
+    }
 }
 
 /// Lowercase hex of a byte slice, for the debug trace.
@@ -642,19 +657,59 @@ mod tests {
     #[test]
     fn trace_redaction_covers_personal_data_commands() {
         // credentialManagement enumerates RP IDs / user names; bioEnrollment
-        // enumerates fingerprint template friendly names. Both (and their
-        // vendor-preview forms) must be redacted from the debug trace.
-        for cbor_cmd in [0x0A, 0x41, 0x09, 0x40] {
+        // enumerates fingerprint template friendly names; largeBlobs carries
+        // keyroost's plaintext notes. All (and the vendor-preview forms) must
+        // be redacted from the debug trace, in both directions.
+        for cbor_cmd in [0x0A, 0x41, 0x09, 0x40, 0x0C] {
             assert!(
-                response_is_sensitive(CTAPHID_CBOR, &[cbor_cmd]),
+                exchange_is_sensitive(CTAPHID_CBOR, &[cbor_cmd]),
                 "CBOR cmd 0x{cbor_cmd:02x} must be redacted"
             );
         }
         // getInfo / clientPIN traces stay visible (PIN material is ciphertext).
-        assert!(!response_is_sensitive(CTAPHID_CBOR, &[0x04]));
-        assert!(!response_is_sensitive(CTAPHID_CBOR, &[0x06]));
+        assert!(!exchange_is_sensitive(CTAPHID_CBOR, &[0x04]));
+        assert!(!exchange_is_sensitive(CTAPHID_CBOR, &[0x06]));
         // Non-CBOR frames (INIT, PING) are never redacted.
-        assert!(!response_is_sensitive(CTAPHID_INIT, &[0x0A]));
-        assert!(!response_is_sensitive(CTAPHID_CBOR, &[]));
+        assert!(!exchange_is_sensitive(CTAPHID_INIT, &[0x0A]));
+        assert!(!exchange_is_sensitive(CTAPHID_CBOR, &[]));
+    }
+
+    #[test]
+    fn trace_redacts_sensitive_request_payloads() {
+        // KEY-002 residual: the request side of the trace used to hex-dump
+        // every payload. A bioEnrollment setFriendlyName request carries a
+        // person's name in plaintext CBOR; the trace must show framing only.
+        let mut payload = vec![0x09]; // authenticatorBioEnrollment
+        payload.extend_from_slice(b"\xa1\x02mAlice Example"); // CBOR text: the name
+        let sensitive = exchange_is_sensitive(CTAPHID_CBOR, &payload);
+        assert!(sensitive, "bioEnroll requests must be classed sensitive");
+        let body = trace_payload(&payload, sensitive);
+        assert!(body.contains("redacted"));
+        // No hex of the payload (in particular the name bytes) may appear.
+        assert!(!body.contains(&hexline(b"Alice")));
+    }
+
+    #[test]
+    fn trace_redacts_large_blob_exchanges() {
+        // authenticatorLargeBlobs (0x0C) reads return the serialized array,
+        // which can include keyroost's own PLAINTEXT notes (large_blobs.rs
+        // documents from_text as "NOT encryption"); writes carry the same
+        // bytes out. Both directions key off the request's command byte.
+        let read_req = [0x0C, 0xA1, 0x03, 0x01];
+        assert!(exchange_is_sensitive(CTAPHID_CBOR, &read_req));
+        // Response bytes are formatted with the request's sensitivity flag.
+        let resp = b"\x00KR1\0my recovery note";
+        let body = trace_payload(resp, true);
+        assert!(body.contains("redacted"));
+        assert!(!body.contains(&hexline(b"note")));
+    }
+
+    #[test]
+    fn trace_shows_hex_for_non_sensitive_commands() {
+        // getInfo stays fully visible — the trace must remain useful.
+        let payload = [0x04];
+        let sensitive = exchange_is_sensitive(CTAPHID_CBOR, &payload);
+        assert!(!sensitive);
+        assert_eq!(trace_payload(&payload, sensitive), "04");
     }
 }
