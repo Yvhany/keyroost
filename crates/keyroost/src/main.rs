@@ -373,8 +373,10 @@ struct OathState {
     loaded: bool,
     /// "Add credential" dialog state.
     add: OathAddDialog,
-    /// Credential name awaiting a delete confirmation, if any.
-    confirm_delete: Option<String>,
+    /// Pending delete confirmation: the device the row was shown for and the
+    /// credential name. Bound to a device so a confirmation opened for one
+    /// key can neither render over nor delete from another (KEY-008).
+    confirm_delete: Option<(DeviceId, String)>,
     /// Password accepted by the last successful unlock+list of the current
     /// selection. `password_input` is consumed (wiped) by every op's apply,
     /// so on-demand reads that happen much later — HOTP "Read code" — send
@@ -622,14 +624,20 @@ struct OpenPgpCredModal {
     kind: OpenPgpCredKind,
     busy: bool,
     result: Option<Result<(), String>>,
+    /// The device the modal was opened for. Submit is rejected — and the
+    /// modal closed — when the selection has moved since (KEY-013): the
+    /// Reset flow needs no PIN, so this binding is the only thing standing
+    /// between a stale modal and a factory reset of the wrong card.
+    device: Option<DeviceId>,
 }
 
 impl OpenPgpCredModal {
-    fn new(kind: OpenPgpCredKind) -> Self {
+    fn new(kind: OpenPgpCredKind, device: Option<DeviceId>) -> Self {
         OpenPgpCredModal {
             kind,
             busy: false,
             result: None,
+            device,
         }
     }
 }
@@ -3835,11 +3843,19 @@ impl App {
         }
     }
 
-    /// Modal confirmation before deleting a credential (irreversible).
+    /// Modal confirmation before deleting a credential (irreversible). Bound
+    /// to the device it was opened for: if the selection has moved the
+    /// confirmation is dropped instead of rendered, and the dispatch is
+    /// re-checked, so `delete_oath` can never open a different reader than
+    /// the one the user confirmed against (KEY-008).
     fn render_oath_delete_confirm(&mut self, ctx: &egui::Context) {
-        let Some(name) = self.oath.confirm_delete.clone() else {
+        let Some((for_device, name)) = self.oath.confirm_delete.clone() else {
             return;
         };
+        if !completion_still_valid(Some(&for_device), self.selected_device.as_ref()) {
+            self.oath.confirm_delete = None;
+            return;
+        }
         let mut decision: Option<bool> = None;
         egui::Window::new("Delete credential?")
             .collapsible(false)
@@ -4311,6 +4327,7 @@ impl App {
             return true; // nothing to do; let the modal close
         };
         self.openpgp.notice = None;
+        let for_device = self.selected_device.clone();
         self.spawn_job("Resetting OpenPGP applet…", move || {
             let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
                 let mut s = keyroost_transport::OpenPgpSession::open(&name)?;
@@ -4318,6 +4335,9 @@ impl App {
                 s.status()
             })();
             Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // selection changed mid-reset; don't paint A's outcome under B
+                }
                 Self::apply_openpgp_write(
                     app,
                     result,
@@ -4793,6 +4813,11 @@ impl App {
         wipe(&mut self.oath.add.secret);
         wipe(&mut self.otp.add.secret);
         self.openpgp.wipe_secrets();
+        // Destructive confirmations are per-device: a delete/reset dialog
+        // opened for one key must not survive onto another (KEY-008/KEY-013).
+        self.oath.confirm_delete = None;
+        self.openpgp.cred_modal = None;
+        self.security_keys.reset = ResetDialog::default();
         self.oath_tried = false;
         self.piv_tried = false;
         self.otp_tried = false;
@@ -10370,6 +10395,18 @@ impl App {
             return;
         }
         if want_submit && !busy {
+            // The modal is bound to the device it opened for (KEY-013); a
+            // stale one must close, not dispatch against the new selection.
+            if !completion_still_valid(
+                self.openpgp
+                    .cred_modal
+                    .as_ref()
+                    .and_then(|m| m.device.as_ref()),
+                self.selected_device.as_ref(),
+            ) {
+                self.openpgp_cred_modal_close();
+                return;
+            }
             // Mark busy first so the modal shows the spinner this frame; the op
             // writes the result back via `apply_openpgp_cred_result`.
             if let Some(m) = self.openpgp.cred_modal.as_mut() {
@@ -10559,7 +10596,9 @@ impl App {
             self.clipboard_clear_at = Some((code, now_secs_f64() + 45.0));
         }
         if let Some(name) = delete {
-            self.oath.confirm_delete = Some(name);
+            if let Some(dev) = self.selected_device.clone() {
+                self.oath.confirm_delete = Some((dev, name));
+            }
         }
         if let Some(name) = read {
             self.read_hotp_code(&name);
@@ -10910,7 +10949,8 @@ impl App {
         if let Some(kind) = open_modal {
             self.openpgp.wipe_secrets();
             self.openpgp.error = None;
-            self.openpgp.cred_modal = Some(OpenPgpCredModal::new(kind));
+            self.openpgp.cred_modal =
+                Some(OpenPgpCredModal::new(kind, self.selected_device.clone()));
         }
     }
 
@@ -13072,6 +13112,7 @@ mod tests {
             kind: OpenPgpCredKind::SetName,
             busy: true,
             result: None,
+            device: None,
         });
         app.openpgp.error = None;
         App::apply_openpgp_cred_result(&mut app);
@@ -13080,7 +13121,7 @@ mod tests {
         assert_eq!(m.result, Some(Ok(())));
 
         // Error path.
-        app.openpgp.cred_modal = Some(OpenPgpCredModal::new(OpenPgpCredKind::ChangeAdminPin));
+        app.openpgp.cred_modal = Some(OpenPgpCredModal::new(OpenPgpCredKind::ChangeAdminPin, None));
         app.openpgp.cred_modal.as_mut().unwrap().busy = true;
         app.openpgp.error = Some("wrong admin PIN".into());
         App::apply_openpgp_cred_result(&mut app);
@@ -13324,5 +13365,36 @@ mod tests {
         );
         assert!(app.oath.unlocked_password.is_none());
         assert!(app.oath.locked);
+    }
+
+    /// KEY-008 / KEY-013: destructive confirmations (OATH delete, OpenPGP
+    /// reset modal, FIDO reset dialog) are dropped the moment the selection
+    /// changes — a confirmation opened for one key must never render over,
+    /// or dispatch against, another.
+    #[test]
+    fn selection_change_clears_destructive_confirmations() {
+        let mut app = App::default();
+        app.oath.confirm_delete = Some(("serial:AAA".into(), "acct".into()));
+        app.openpgp.cred_modal = Some(OpenPgpCredModal::new(
+            OpenPgpCredKind::Reset,
+            Some("serial:AAA".into()),
+        ));
+        app.security_keys.reset.open = true;
+
+        app.on_device_selected();
+
+        assert!(app.oath.confirm_delete.is_none());
+        assert!(app.openpgp.cred_modal.is_none());
+        assert!(!app.security_keys.reset.open);
+    }
+
+    /// The OATH delete confirmation is only armed with a concrete device
+    /// captured; the guard then rejects a mismatch at confirm time.
+    #[test]
+    fn oath_delete_confirmation_is_device_bound() {
+        let captured: DeviceId = "serial:AAA".into();
+        let other: DeviceId = "serial:BBB".into();
+        assert!(completion_still_valid(Some(&captured), Some(&captured)));
+        assert!(!completion_still_valid(Some(&captured), Some(&other)));
     }
 }
