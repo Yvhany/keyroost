@@ -10,7 +10,7 @@
 //! consumed transparently.
 //!
 //! Read bounding differs by backend. The hidapi backend (macOS/Windows) polls
-//! with a timeout ([`HIDAPI_READ_POLL_MS`]), so the overall deadline and the
+//! with a timeout (`keyroost_hid::READ_POLL_MS`), so the overall deadline and the
 //! cooperative-cancel flag are honored even if a device goes completely silent
 //! mid-response — it cannot block a caller forever. The Linux hidraw `File`
 //! backend has no per-read timeout: the kernel driver doesn't surface one, and
