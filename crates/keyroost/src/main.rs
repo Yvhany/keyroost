@@ -200,6 +200,10 @@ struct AdvancedDialog {
     min_pin_input: String,
     /// Whether to also force a PIN change (SetMinPin option).
     force_change: bool,
+    /// The device the dialog was opened for. Apply is rejected — and the
+    /// dialog dropped, wiping the PIN — when the selection has moved since
+    /// (KEY-007): a PIN typed for one key must never be sent to another.
+    device: Option<DeviceId>,
 }
 
 impl Drop for AdvancedDialog {
@@ -3055,14 +3059,29 @@ impl App {
         let Some(dlg) = self.security_keys.advanced.as_ref() else {
             return;
         };
-        let Some(target) = self.selected_fido_target() else {
-            return;
-        };
         let action = dlg.action;
         // Zeroizing so the worker closure's PIN copy is scrubbed when the job ends.
         let pin = zeroize::Zeroizing::new(dlg.pin_input.clone());
         let force_change = dlg.force_change;
         let min_pin = dlg.min_pin_input.trim().parse::<u32>().ok();
+        let dlg_device = dlg.device.clone();
+
+        // The dialog is bound to the device it opened for (KEY-007): if the
+        // selection moved, the typed PIN must not be sent to the new key.
+        // Dropping the dialog wipes the PIN (Drop impl).
+        if !completion_still_valid(dlg_device.as_ref(), self.selected_device.as_ref()) {
+            self.security_keys.advanced = None;
+            self.security_keys.error = Some(
+                "the selected key changed \u{2014} the settings change was cancelled; \
+                 reopen it to retry"
+                    .into(),
+            );
+            return;
+        }
+
+        let Some(target) = self.selected_fido_target() else {
+            return;
+        };
 
         // Validate inputs before spawning.
         if action == AdvancedAction::SetMinPin && min_pin.is_none() {
@@ -3081,6 +3100,7 @@ impl App {
             AdvancedAction::EnterpriseAttestation => "Enabling enterprise attestation\u{2026}",
             AdvancedAction::None => return,
         };
+        let for_device = self.selected_device.clone();
         self.spawn_job(label, move || {
             let result = Self::with_config(&target, &pin, |cfg| match action {
                 AdvancedAction::ToggleAlwaysUv => {
@@ -3097,14 +3117,25 @@ impl App {
                     .map_err(SessionOpError::from_ctap),
                 AdvancedAction::None => Ok(()),
             });
-            Box::new(move |app: &mut App| match result {
-                Ok(()) => {
-                    app.security_keys.advanced = None;
-                    app.security_keys.error = None;
-                    // Re-read info so alwaysUv / minPinLength reflect the change.
-                    app.fetch_selected_info();
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // selection changed mid-flight; discard
                 }
-                Err(e) => app.fail_session_op(&e, "config change failed"),
+                match result {
+                    Ok(()) => {
+                        app.security_keys.advanced = None;
+                        app.security_keys.error = None;
+                        // Re-read info so alwaysUv / minPinLength reflect the change.
+                        app.fetch_selected_info();
+                    }
+                    Err(e) => {
+                        // Drop the dialog on error too (KEY-007): a failed
+                        // attempt must not keep the typed PIN alive for a
+                        // retry against whatever is selected later.
+                        app.security_keys.advanced = None;
+                        app.fail_session_op(&e, "config change failed");
+                    }
+                }
             })
         });
     }
@@ -4615,6 +4646,9 @@ impl App {
         wipe(&mut self.security_keys.change_pin.new);
         wipe(&mut self.security_keys.change_pin.confirm);
         self.security_keys.change_pin.open = false;
+        // A pending advanced-config dialog (and its typed PIN — wiped by the
+        // Drop impl) must not survive onto another key (KEY-007).
+        self.security_keys.advanced = None;
         wipe(&mut self.oath.password_input);
         wipe(&mut self.oath.add.secret);
         wipe(&mut self.otp.add.secret);
@@ -9378,6 +9412,7 @@ impl App {
                     pin_input: String::new(),
                     min_pin_input: String::new(),
                     force_change: false,
+                    device: self.selected_device.clone(),
                 });
                 self.security_keys.error = None;
             }
@@ -9591,6 +9626,10 @@ impl App {
         };
         let action = dlg.action;
         if action == AdvancedAction::None {
+            return;
+        }
+        if !completion_still_valid(dlg.device.as_ref(), self.selected_device.as_ref()) {
+            self.security_keys.advanced = None;
             return;
         }
 
@@ -13004,5 +13043,45 @@ mod tests {
         };
         app.on_device_selected();
         assert!(app.molto_session_device.is_none());
+    }
+
+    /// KEY-007: Apply on the advanced dialog is rejected (and the dialog
+    /// dropped, wiping its PIN via the Drop impl) once the selection has
+    /// moved from the device the dialog opened for.
+    #[test]
+    fn advanced_dialog_apply_rejected_after_selection_change() {
+        let mut app = App {
+            selected_device: Some("serial:AAA".into()),
+            ..Default::default()
+        };
+        app.security_keys.advanced = Some(AdvancedDialog {
+            action: AdvancedAction::ForcePinChange,
+            pin_input: "123456".into(),
+            min_pin_input: String::new(),
+            force_change: false,
+            device: Some("serial:AAA".into()),
+        });
+        app.selected_device = Some("serial:BBB".into());
+        app.run_advanced_action();
+        assert!(
+            app.security_keys.advanced.is_none(),
+            "a stale dialog must be dropped, not dispatched"
+        );
+        assert!(app.security_keys.error.is_some(), "the refusal is surfaced");
+    }
+
+    /// Selecting another device closes (and thereby zeroizes) the dialog.
+    #[test]
+    fn selection_change_clears_the_advanced_dialog() {
+        let mut app = App::default();
+        app.security_keys.advanced = Some(AdvancedDialog {
+            action: AdvancedAction::SetMinPin,
+            pin_input: "123456".into(),
+            min_pin_input: "6".into(),
+            force_change: false,
+            device: Some("serial:AAA".into()),
+        });
+        app.on_device_selected();
+        assert!(app.security_keys.advanced.is_none());
     }
 }
