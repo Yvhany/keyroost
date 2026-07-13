@@ -284,6 +284,12 @@ struct ResetArm {
     /// no serial (`target_serial` is `None`): its disappearance is the "unplug"
     /// half of the dance, and a fresh path is treated as the re-insert.
     target_path: Option<std::path::PathBuf>,
+    /// The armed key's *effective* serial from the resolver (USB serial, else
+    /// the CCID-read YubiKey serial shown in the sidebar). In path mode this
+    /// is the identity a re-inserted candidate must prove before the reset
+    /// fires; without it (and without a HID serial) arming is refused —
+    /// fail closed rather than reset the first same-model key (KEY-005).
+    target_effective_serial: Option<String>,
     /// The armed key's USB vendor/product ids, captured at arm time. In path
     /// mode a fresh path must match these — so plugging in a *different*
     /// model while a reset is armed doesn't get it reset by mistake.
@@ -681,6 +687,35 @@ fn wipe(s: &mut String) {
 /// `if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) { return; }`.
 fn completion_still_valid(captured: Option<&DeviceId>, current: Option<&DeviceId>) -> bool {
     matches!((captured, current), (Some(c), Some(now)) if c == now)
+}
+
+/// Decide whether a freshly appeared FIDO HID device may receive an armed
+/// reset. `target_*` describe the key the user armed; `cand_*` the device
+/// that just appeared. Vendor/product ids must match when known, and then a
+/// *stable* identity must match: the USB HID serial when both sides expose
+/// one, else the resolver's effective (CCID-derived) serial. When neither
+/// side offers a stable identity the answer is `false` — fail closed; being
+/// the first same-model path to show up is not an identity (KEY-005).
+fn reset_reinsert_matches(
+    target_hid_serial: Option<&str>,
+    target_effective_serial: Option<&str>,
+    target_ids: Option<(u16, u16)>,
+    cand_hid_serial: Option<&str>,
+    cand_effective_serial: Option<&str>,
+    cand_ids: (u16, u16),
+) -> bool {
+    if let Some(ids) = target_ids {
+        if ids != cand_ids {
+            return false;
+        }
+    }
+    if let (Some(t), Some(c)) = (target_hid_serial, cand_hid_serial) {
+        return t == c;
+    }
+    if let (Some(t), Some(c)) = (target_effective_serial, cand_effective_serial) {
+        return t == c;
+    }
+    false
 }
 
 /// The password an OATH op should send: the freshly typed entry when there
@@ -3984,7 +4019,9 @@ impl App {
         if arm {
             // Snapshot the current FIDO keys so the poll can tell when ours
             // leaves and a fresh one arrives. Prefer the armed key's HID serial
-            // (port-independent) and fall back to its path + USB ids.
+            // (port-independent), then the resolver's effective (CCID) serial;
+            // refuse to arm with neither — a replugged key we can't re-identify
+            // must not be matched by "first same-model path" (KEY-005).
             let target_path = self.selected_fido_hid_path();
             let devices = Self::fido_devices();
             let target = target_path
@@ -3992,13 +4029,28 @@ impl App {
                 .and_then(|p| devices.iter().find(|d| &d.path == p));
             let target_serial = target.and_then(|d| d.serial.clone());
             let target_ids = target.map(|d| d.ids);
-            self.reset_arm = Some(ResetArm {
-                target_serial,
-                target_path,
-                target_ids,
-                prev_paths: devices.into_iter().map(|d| d.path).collect(),
-                saw_removal: false,
-            });
+            let target_effective_serial = self
+                .selected_device()
+                .map(|d| d.serial.clone())
+                .filter(|s| !s.is_empty());
+            if target_serial.is_none() && target_effective_serial.is_none() {
+                self.security_keys.reset = ResetDialog::default();
+                self.log(
+                    Severity::Err,
+                    "this key exposes no serial to re-identify it by after a replug, \
+                     so the armed reset can't safely target it \u{2014} not armed. \
+                     Use `keyroostctl fido reset` within ~10 s of plugging the key in instead.",
+                );
+            } else {
+                self.reset_arm = Some(ResetArm {
+                    target_serial,
+                    target_path,
+                    target_ids,
+                    target_effective_serial,
+                    prev_paths: devices.into_iter().map(|d| d.path).collect(),
+                    saw_removal: false,
+                });
+            }
         } else if cancel || !window_open {
             // Cancel button, or the window's [x] close.
             self.security_keys.reset = ResetDialog::default();
@@ -4020,16 +4072,32 @@ impl App {
             .collect()
     }
 
+    /// The resolver's stable identity for the FIDO HID device at `path`: its
+    /// USB iSerialNumber, else a CCID-read YubiKey serial. `None` when the
+    /// device is gone or the identity can't be read *yet* (a just-replugged
+    /// key's CCID interface takes a beat to register with pcscd) — callers
+    /// retry on the next poll rather than guessing.
+    fn fido_effective_serial(path: &std::path::Path) -> Option<String> {
+        let dev = keyroost_hid::enumerate()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|d| d.path == path)?;
+        keyroost_resolve::read_effective_serial(&dev)
+            .ok()
+            .map(|(serial, _)| serial)
+    }
+
     /// Poll the live FIDO list while a reset is armed: once the armed key has
-    /// been unplugged, fire the reset on its re-insertion (which the user does),
-    /// inside the ~10 s window. Matches by HID serial when the key exposes one
-    /// (so it works across USB ports) and falls back to the HID path otherwise.
+    /// been unplugged, fire the reset on its re-insertion (which the user
+    /// does), inside the ~10 s window. Matches by HID serial when the key
+    /// exposes one, else by the resolver's effective (CCID-read) serial; a
+    /// fresh same-model path alone never fires the reset (KEY-005).
     fn poll_reset_arm(&mut self) {
         let current = Self::fido_devices();
         let mut fire: Option<std::path::PathBuf> = None;
         if let Some(arm) = self.reset_arm.as_mut() {
             if let Some(target_serial) = arm.target_serial.clone() {
-                // Serial mode: identity is port-independent.
+                // HID-serial mode: identity is port-independent.
                 let here = current
                     .iter()
                     .find(|d| d.serial.as_deref() == Some(target_serial.as_str()));
@@ -4039,10 +4107,11 @@ impl App {
                     Some(_) => {}
                 }
             } else {
-                // Path mode (no serial, e.g. most YubiKeys): the armed path
-                // leaving is the unplug; a fresh path with the armed key's
-                // vendor/product ids is the re-insert. (Without the id match,
-                // any newly plugged key would receive the reset.)
+                // Effective-serial mode (no HID serial, e.g. most YubiKeys):
+                // the armed path leaving is the unplug; a fresh path is
+                // accepted as the re-insert only when its stable identity
+                // matches the armed key's. The CCID probe runs only for a
+                // model-matching fresh path, and only after removal.
                 let present = |p: &std::path::PathBuf| current.iter().any(|d| &d.path == p);
                 match &arm.target_path {
                     Some(t) if !present(t) => arm.saw_removal = true,
@@ -4052,9 +4121,19 @@ impl App {
                     fire = current
                         .iter()
                         .filter(|d| arm.target_ids.is_none() || arm.target_ids == Some(d.ids))
-                        .map(|d| &d.path)
-                        .find(|p| !arm.prev_paths.contains(p))
-                        .cloned();
+                        .filter(|d| !arm.prev_paths.contains(&d.path))
+                        .find(|d| {
+                            let cand_eff = Self::fido_effective_serial(&d.path);
+                            reset_reinsert_matches(
+                                arm.target_serial.as_deref(),
+                                arm.target_effective_serial.as_deref(),
+                                arm.target_ids,
+                                d.serial.as_deref(),
+                                cand_eff.as_deref(),
+                                d.ids,
+                            )
+                        })
+                        .map(|d| d.path.clone());
                 }
             }
         }
@@ -4071,7 +4150,13 @@ impl App {
             }
             None => {
                 if let Some(arm) = self.reset_arm.as_mut() {
-                    arm.prev_paths = current.into_iter().map(|d| d.path).collect();
+                    // Refresh the snapshot only until the unplug. After
+                    // removal it must stay frozen: a fresh path whose CCID
+                    // serial isn't readable yet has to still count as fresh
+                    // on the next poll, or the retry could never fire.
+                    if !arm.saw_removal {
+                        arm.prev_paths = current.into_iter().map(|d| d.path).collect();
+                    }
                 }
             }
         }
@@ -13396,5 +13481,80 @@ mod tests {
         let other: DeviceId = "serial:BBB".into();
         assert!(completion_still_valid(Some(&captured), Some(&captured)));
         assert!(!completion_still_valid(Some(&captured), Some(&other)));
+    }
+
+    /// KEY-005, the audited failure: the armed key exposes no serial of any
+    /// kind and a same-VID/PID key appears on a fresh path. It must NOT be
+    /// accepted — being the first same-model key to show up is not identity.
+    #[test]
+    fn reset_rearm_never_accepts_a_serial_less_same_model_key() {
+        assert!(!reset_reinsert_matches(
+            None,
+            None,
+            Some((0x1050, 0x0407)),
+            None,
+            None,
+            (0x1050, 0x0407),
+        ));
+    }
+
+    /// Only a matching *stable* identity re-arms the reset: the HID serial
+    /// when both sides have one, else the resolver's effective (CCID) serial.
+    /// An unreadable candidate identity fails closed (the poll retries).
+    #[test]
+    fn reset_rearm_matches_only_the_same_stable_identity() {
+        let ids = Some((0x1050, 0x0407));
+        // Effective (CCID-read) serial decides when there is no HID serial.
+        assert!(reset_reinsert_matches(
+            None,
+            Some("15731286"),
+            ids,
+            None,
+            Some("15731286"),
+            (0x1050, 0x0407)
+        ));
+        assert!(!reset_reinsert_matches(
+            None,
+            Some("15731286"),
+            ids,
+            None,
+            Some("9990001"),
+            (0x1050, 0x0407)
+        ));
+        // Candidate identity not readable (yet): fail closed, retry later.
+        assert!(!reset_reinsert_matches(
+            None,
+            Some("15731286"),
+            ids,
+            None,
+            None,
+            (0x1050, 0x0407)
+        ));
+        // HID serial decides when both sides expose one.
+        assert!(reset_reinsert_matches(
+            Some("S1"),
+            None,
+            ids,
+            Some("S1"),
+            None,
+            (0x1050, 0x0407)
+        ));
+        assert!(!reset_reinsert_matches(
+            Some("S1"),
+            None,
+            ids,
+            Some("S2"),
+            None,
+            (0x1050, 0x0407)
+        ));
+        // A different model never matches, whatever the serials say.
+        assert!(!reset_reinsert_matches(
+            None,
+            Some("15731286"),
+            ids,
+            None,
+            Some("15731286"),
+            (0x20a0, 0x42b2)
+        ));
     }
 }
