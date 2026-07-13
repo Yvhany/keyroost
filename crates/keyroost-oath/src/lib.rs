@@ -246,11 +246,13 @@ pub struct PutParams<'a> {
     pub imf: u32,
 }
 
-/// Build a `PUT` APDU to provision a credential.
-///
-/// Data layout: `NAME(0x71) || KEY(0x73) [|| PROPERTY(0x78) ][|| IMF(0x7A)]`.
 /// The maximum value a short-form OATH TLV (and the short APDU body) can hold.
 const MAX_SHORT_LEN: usize = 255;
+
+/// Minimum HMAC-key length the YKOATH `PUT` accepts; shorter secrets are
+/// zero-padded to this length by [`put`] (the protocol makes padding the
+/// client's job, and padding is a semantic no-op for HMAC).
+pub const MIN_HMAC_KEY_LEN: usize = 14;
 
 /// True when [`put`] can serialize `params` without exceeding the 255-byte
 /// short-APDU limits — the NAME TLV value, the KEY TLV value, and the total
@@ -258,11 +260,6 @@ const MAX_SHORT_LEN: usize = 255;
 /// input (an imported `otpauth://` URI or QR code, whose name/secret lengths
 /// are attacker-controlled) must check this first and reject rather than build.
 #[must_use]
-/// Minimum HMAC-key length the YKOATH `PUT` accepts; shorter secrets are
-/// zero-padded to this length by [`put`] (the protocol makes padding the
-/// client's job, and padding is a semantic no-op for HMAC).
-pub const MIN_HMAC_KEY_LEN: usize = 14;
-
 pub fn put_fits(params: &PutParams<'_>) -> bool {
     let name = params.name.len();
     // KEY value = prefix byte + digits byte + secret (zero-padded to the
@@ -283,6 +280,9 @@ pub fn put_fits(params: &PutParams<'_>) -> bool {
     body <= MAX_SHORT_LEN
 }
 
+/// Build a `PUT` APDU to provision a credential.
+///
+/// Data layout: `NAME(0x71) || KEY(0x73) [|| PROPERTY(0x78) ][|| IMF(0x7A)]`.
 /// The KEY value is `[ (type<<4)|algo, digits, secret... ]`.
 ///
 /// # Panics
