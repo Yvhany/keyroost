@@ -753,18 +753,39 @@ fn clear_edit_undo(ctx: &egui::Context, id: egui::Id) {
     }
 }
 
-/// Draw-time guard for a secret field: once it loses keyboard focus, purge its
-/// undo history (see [`clear_edit_undo`]). Call immediately after adding any
-/// `.password(true)` field, passing its [`egui::Response`].
+/// True when a text widget's retained undo state could still hold typed
+/// plaintext, i.e. a scrub (`clear_edit_undo`) would actually remove
+/// something. The probe is (default cursor, empty text): `has_undo` is false
+/// only for an empty history or one whose single snapshot IS that empty
+/// state — neither holds a secret. `has_redo` catches text typed and then
+/// undone; `is_in_flux` catches text typed too recently to be committed.
+fn edit_state_needs_scrub(state: &egui::text_edit::TextEditState) -> bool {
+    let undoer = state.undoer();
+    let probe = (egui::text::CCursorRange::default(), String::new());
+    undoer.has_undo(&probe) || undoer.has_redo(&probe) || undoer.is_in_flux()
+}
+
+/// Draw-time guard for a secret field: while it isn't holding keyboard focus,
+/// purge its undo history (see [`clear_edit_undo`]). Call immediately after
+/// adding any `.password(true)` field, passing its [`egui::Response`].
 ///
-/// Clearing only while unfocused keeps in-field undo working *during* editing,
-/// then scrubs the retained plaintext the moment the user moves on — which
-/// includes the frame a dialog's submit/cancel takes focus away, so the secret
-/// is gone before the dialog (and its buffer) is torn down. This needs no
-/// bookkeeping in the dialog structs or their `Drop` impls.
+/// This deliberately keys on `has_focus()` (a level) rather than
+/// `lost_focus()` (an edge): a dialog dismissed while its field still has
+/// focus (Esc, ✕ mid-typing) removes the widget before any lost-focus edge
+/// can be observed, while its `TextEditState` — undo plaintext included —
+/// persists for the process lifetime. The level-triggered form scrubs that
+/// stale state on the reopened dialog's first unfocused frame, which the
+/// edge form would miss. `edit_state_needs_scrub` skips the rewrite when the
+/// history is provably empty, so the steady-state cost is one state load per
+/// secret field per frame, no store.
 fn guard_secret_field(ctx: &egui::Context, resp: &egui::Response) {
-    if !resp.has_focus() {
-        clear_edit_undo(ctx, resp.id);
+    if resp.has_focus() {
+        return;
+    }
+    if let Some(state) = egui::TextEdit::load_state(ctx, resp.id) {
+        if edit_state_needs_scrub(&state) {
+            clear_edit_undo(ctx, resp.id);
+        }
     }
 }
 
@@ -1410,8 +1431,6 @@ struct App {
     molto_reset_confirm: bool,
     /// True while the per-slot seed-delete confirmation card is showing.
     molto_delete_confirm: bool,
-    /// True while the selected device's inline rename field is open.
-    rename_open: bool,
     /// Friendly-name draft for the selected device.
     rename_input: String,
     /// The device the open rename field targets, pinned when the field opens:
@@ -5646,7 +5665,6 @@ impl App {
                     "this device exposes no serial, so it can't be named yet",
                 );
             } else {
-                self.rename_open = true;
                 self.rename_input = dev.name.clone().unwrap_or_default();
                 // Pin the target now, so the eventual save writes against this
                 // device even if a background rescan moves the selection first.
@@ -5666,9 +5684,14 @@ impl App {
 
     /// Reset the inline-rename state (field closed, draft and pin cleared).
     fn close_rename(&mut self) {
-        self.rename_open = false;
         self.rename_input.clear();
         self.rename_target = None;
+        // The scan-burst loop stops scheduling repaints while a rename field
+        // is open (see `update`); wake the loop once so a paused burst
+        // resumes now instead of waiting for the next input event.
+        if let Some(ctx) = &self.egui_ctx {
+            ctx.request_repaint();
+        }
     }
 
     /// Persist (or clear) the friendly name for the device the rename field was
@@ -6539,17 +6562,19 @@ impl eframe::App for App {
         // Held off while an inline rename field is open: a scan replaces the
         // device list and can move the selection out from under the open field
         // (acute with the Molto2's flapping CCID reader). The pending count is
-        // kept, so the burst resumes the moment the field closes — the repaint
-        // request below keeps the loop alive to notice.
+        // kept, and `close_rename` requests a repaint, so the burst resumes
+        // the moment the field closes — without keeping a 2 Hz wakeup loop
+        // armed for the whole edit.
         if self.reset_arm.is_none() && self.pending_scans > 0 {
             let now = std::time::Instant::now();
             let due = self.next_scan_at.is_none_or(|t| now >= t);
-            if due && !self.busy() && !self.rename_open {
+            let renaming = self.rename_target.is_some();
+            if due && !self.busy() && !renaming {
                 self.refresh_devices();
                 self.pending_scans -= 1;
                 self.next_scan_at = Some(now + std::time::Duration::from_millis(1500));
             }
-            if self.pending_scans > 0 {
+            if self.pending_scans > 0 && !renaming {
                 ctx.request_repaint_after(std::time::Duration::from_millis(500));
             }
         }
@@ -7294,7 +7319,7 @@ impl App {
             ui.add_space(12.0);
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
-                    if self.rename_open {
+                    if self.rename_target.is_some() {
                         let resp = ui.add_sized(
                             [200.0, 32.0],
                             egui::TextEdit::singleline(&mut self.rename_input)
@@ -7326,7 +7351,7 @@ impl App {
                         }
                     }
                 });
-                if self.rename_open {
+                if self.rename_target.is_some() {
                     ui.add_space(3.0);
                     ui.label(
                         egui::RichText::new(
@@ -11659,7 +11684,7 @@ impl App {
                     ui.add_space(12.0);
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
-                            if self.rename_open {
+                            if self.rename_target.is_some() {
                                 let resp = ui.add_sized(
                                     [200.0, 32.0],
                                     egui::TextEdit::singleline(&mut self.rename_input)
@@ -11693,7 +11718,7 @@ impl App {
                                 }
                             }
                         });
-                        if self.rename_open {
+                        if self.rename_target.is_some() {
                             ui.add_space(3.0);
                             ui.label(
                                 egui::RichText::new(
@@ -12759,6 +12784,40 @@ mod tests {
         );
     }
 
+    /// The scrub-needed check behind `guard_secret_field`: empty history is
+    /// skipped, committed undo points / redo stacks / in-flux text are not.
+    #[test]
+    fn edit_state_scrub_check_detects_retained_plaintext() {
+        let empty = (egui::text::CCursorRange::default(), String::new());
+        let secret = (egui::text::CCursorRange::default(), "1234-pin".to_string());
+
+        // A fresh state has nothing to scrub.
+        let mut state = egui::text_edit::TextEditState::default();
+        assert!(!edit_state_needs_scrub(&state));
+
+        // Committed undo history must be detected… (an undo point commits
+        // once a state has been stable ≥1s — same technique as
+        // clear_edit_undo_purges_retained_plaintext above)
+        let mut undoer = state.undoer();
+        undoer.feed_state(0.0, &empty);
+        undoer.feed_state(1.0, &secret);
+        undoer.feed_state(2.0, &secret);
+        state.set_undoer(undoer);
+        assert!(edit_state_needs_scrub(&state));
+
+        // …and clearing satisfies the check again.
+        state.clear_undoer();
+        assert!(!edit_state_needs_scrub(&state));
+
+        // Text typed too recently to be a committed undo point still counts:
+        // the plaintext lives in the undoer's flux buffer.
+        let mut undoer = state.undoer();
+        undoer.feed_state(3.0, &empty);
+        undoer.feed_state(3.1, &secret);
+        state.set_undoer(undoer);
+        assert!(edit_state_needs_scrub(&state));
+    }
+
     /// A job that panics inside the worker must not wedge the UI: the worker
     /// catches it, delivers an error apply (so busy clears), and stays alive to
     /// run later jobs. Before the fix the thread unwound, the result channel
@@ -13239,7 +13298,7 @@ mod tests {
         let mut app = App::default();
         let a = test_key("serial:A", "AAA", Some("old-a"));
         app.apply_rename_actions(&a, /*open*/ true, false, false);
-        assert!(app.rename_open);
+        assert!(app.rename_target.is_some());
         let t = app.rename_target.clone().expect("target pinned on open");
         assert_eq!(t.serial, "AAA");
         assert_eq!(t.name_at_open.as_deref(), Some("old-a"));
@@ -13252,7 +13311,6 @@ mod tests {
 
         // Cancel clears the pin and the field.
         app.apply_rename_actions(&a, false, /*cancel*/ true, false);
-        assert!(!app.rename_open);
         assert!(app.rename_target.is_none());
     }
 
@@ -13263,7 +13321,6 @@ mod tests {
         let mut app = App::default();
         let no_serial = test_key("winfido:x", "", None);
         app.apply_rename_actions(&no_serial, true, false, false);
-        assert!(!app.rename_open);
         assert!(app.rename_target.is_none());
     }
 
