@@ -24,6 +24,15 @@ pub const CTAP2_BIO_ENROLLMENT_PREVIEW: u8 = 0x40;
 /// Fingerprint modality (the only modality CTAP currently defines).
 pub const MODALITY_FINGERPRINT: u64 = 0x01;
 
+/// Host-owned cap on capture iterations for one enrollment (audit KEY-009:
+/// device-reported `remaining_samples` must never drive an unbounded host
+/// loop — the CLI's capture loop has no cancel path at all). Real sensors
+/// report `maxCaptureSamples` of roughly 4–17 and every iteration costs the
+/// user a physical touch, so 64 leaves generous headroom for bad-quality
+/// retries while stopping a device that reports `remaining_samples >= 1`
+/// forever.
+const MAX_CAPTURE_ITERATIONS: u32 = 64;
+
 // --- request map keys (CTAP 2.1 §6.7) ---
 const KEY_MODALITY: u64 = 0x01;
 const KEY_SUB_COMMAND: u64 = 0x02;
@@ -109,6 +118,9 @@ pub struct BioEnrollment<'a, T: CtapTransport> {
     dev: &'a mut T,
     token: PinUvAuthToken,
     cmd_code: u8,
+    /// Captures performed for the in-progress enrollment, enforced against
+    /// [`MAX_CAPTURE_ITERATIONS`]. Reset by [`Self::enroll_begin`].
+    captures: u32,
 }
 
 impl<'a, T: CtapTransport> BioEnrollment<'a, T> {
@@ -120,6 +132,7 @@ impl<'a, T: CtapTransport> BioEnrollment<'a, T> {
             dev,
             token,
             cmd_code,
+            captures: 0,
         }
     }
 
@@ -186,6 +199,8 @@ impl<'a, T: CtapTransport> BioEnrollment<'a, T> {
         &mut self,
         timeout_ms: Option<u64>,
     ) -> Result<(Vec<u8>, CaptureStatus), CtapError> {
+        // A new enrollment gets a fresh host-side capture budget (KEY-009).
+        self.captures = 0;
         // Each capture blocks on the user touching the sensor. The HID layer now
         // extends its deadline on every KEEPALIVE, but raise the base timeout too
         // so a device that sends sparse keepalives still gets time to capture.
@@ -218,6 +233,15 @@ impl<'a, T: CtapTransport> BioEnrollment<'a, T> {
         template_id: &[u8],
         timeout_ms: Option<u64>,
     ) -> Result<CaptureStatus, CtapError> {
+        // Host-owned bound (KEY-009): the device's remaining_samples drives
+        // the callers' loops, so a device that never counts down must be cut
+        // off here — before anything is sent — for every frontend at once.
+        self.captures += 1;
+        if self.captures > MAX_CAPTURE_ITERATIONS {
+            return Err(CtapError::InvalidResponseShape(
+                "authenticator kept requesting more fingerprint samples past the host cap",
+            ));
+        }
         let prev_timeout = self.dev.read_timeout();
         self.dev.set_timeout(std::time::Duration::from_secs(30));
         let mut p = vec![(
@@ -420,6 +444,70 @@ mod tests {
         assert!(sample_status_message(0x07).contains("timeout"));
         // unknown codes get a generic retry hint, never panic
         assert_eq!(sample_status_message(0xFF), "retry the sample");
+    }
+
+    /// A device that always answers a valid enrollment response demanding one
+    /// more sample — the KEY-009 endless-`remaining_samples` attacker.
+    struct EndlessSampler {
+        calls: u32,
+    }
+
+    impl crate::transport::CtapTransport for EndlessSampler {
+        fn transact(&mut self, _cmd: u8, _payload: &[u8]) -> Result<Vec<u8>, CtapError> {
+            self.calls += 1;
+            // {4: templateId, 5: lastSampleStatus = good, 6: remaining = 1}.
+            let map = Value::Map(vec![
+                (Value::UInt(RESP_TEMPLATE_ID), Value::Bytes(vec![0xAA, 0xBB])),
+                (Value::UInt(RESP_LAST_ENROLL_SAMPLE_STATUS), Value::UInt(0)),
+                (Value::UInt(RESP_REMAINING_SAMPLES), Value::UInt(1)),
+            ]);
+            let mut resp = vec![0x00];
+            resp.extend_from_slice(&cbor::encode(&map));
+            Ok(resp)
+        }
+    }
+
+    #[test]
+    fn endless_remaining_samples_is_bounded_by_the_host_cap() {
+        let mut dev = EndlessSampler { calls: 0 };
+        {
+            let mut bio = BioEnrollment::new(&mut dev, fake_token(), CTAP2_BIO_ENROLLMENT);
+            // Drive the exact loop shape both frontends use.
+            let (template_id, mut status) = bio.enroll_begin(None).unwrap();
+            assert_eq!(status.remaining_samples, 1);
+            let mut result: Result<(), CtapError> = Ok(());
+            while status.remaining_samples > 0 {
+                match bio.enroll_capture_next(&template_id, None) {
+                    Ok(s) => status = s,
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
+            }
+            assert!(
+                matches!(result, Err(CtapError::InvalidResponseShape(_))),
+                "expected the host-cap error, got {result:?}"
+            );
+        }
+        // begin (1) + exactly the budget of captures; the over-budget call is
+        // rejected on the host before anything is sent to the device.
+        assert_eq!(dev.calls, MAX_CAPTURE_ITERATIONS + 1);
+    }
+
+    #[test]
+    fn enroll_begin_resets_the_capture_budget() {
+        let mut dev = EndlessSampler { calls: 0 };
+        let mut bio = BioEnrollment::new(&mut dev, fake_token(), CTAP2_BIO_ENROLLMENT);
+        let (template_id, _) = bio.enroll_begin(None).unwrap();
+        // Exhaust the budget on the first enrollment.
+        for _ in 0..MAX_CAPTURE_ITERATIONS {
+            bio.enroll_capture_next(&template_id, None).unwrap();
+        }
+        assert!(bio.enroll_capture_next(&template_id, None).is_err());
+        // A fresh enrollment gets a fresh budget.
+        let (template_id, _) = bio.enroll_begin(None).unwrap();
+        assert!(bio.enroll_capture_next(&template_id, None).is_ok());
     }
 
     // Documents the spec quirk: enumerate maps 0x2C (INVALID_OPTION) to an empty
