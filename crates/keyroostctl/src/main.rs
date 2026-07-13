@@ -6047,7 +6047,10 @@ fn run_fido_creds_list(
         if json_output() {
             let mut relying_parties = Vec::with_capacity(rps.len());
             for rp in &rps {
-                let creds = mgr.list_credentials(&rp.rp_id_hash)?;
+                let creds = match rp.rp_id_hash {
+                    Some(hash) => mgr.list_credentials(&hash)?,
+                    None => Vec::new(),
+                };
                 let credentials = creds
                     .iter()
                     .map(|c| json_out::FidoCredentialJson {
@@ -6073,7 +6076,10 @@ fn run_fido_creds_list(
             return Ok(());
         }
         for rp in &rps {
-            let creds = mgr.list_credentials(&rp.rp_id_hash)?;
+            let creds = match rp.rp_id_hash {
+                Some(hash) => mgr.list_credentials(&hash)?,
+                None => Vec::new(),
+            };
             // rp.id and rp.name are attacker-controlled (any app with the PIN
             // can register a credential); flatten control chars. The user.name /
             // display_name / user.id below print via {:?}, which already
@@ -6082,7 +6088,9 @@ fn run_fido_creds_list(
                 Some(n) if !n.is_empty() => format!("  ({})", sanitize_terminal(n)),
                 _ => String::new(),
             };
-            let count_suffix = if creds.is_empty() {
+            let count_suffix = if rp.rp_id_hash.is_none() {
+                "  (credentials unavailable: device returned a malformed rpIdHash)".to_owned()
+            } else if creds.is_empty() {
                 "  (no credentials)".to_owned()
             } else {
                 format!("  [{} credential(s)]", creds.len())

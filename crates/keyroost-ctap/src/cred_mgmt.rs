@@ -85,7 +85,13 @@ pub struct CredsMetadata {
 pub struct RelyingParty {
     pub id: String,
     pub name: Option<String>,
-    pub rp_id_hash: [u8; 32],
+    /// SHA-256 of the RP ID as reported by the authenticator — the handle
+    /// [`CredentialManager::list_credentials`] is keyed by. `None` when the
+    /// device returned a missing or wrong-length hash for this entry: the RP
+    /// is still listed, but per-RP credential queries must be skipped rather
+    /// than run against a guessed or zero-filled key (a zeroed hash would
+    /// quietly query the wrong RP).
+    pub rp_id_hash: Option<[u8; 32]>,
 }
 
 /// User entity bound to a resident credential.
@@ -274,6 +280,15 @@ fn field_uint(v: &Value, key: u64) -> Option<u64> {
 
 /// Parse one enumerateRPs response map. Public so the fuzz harness can drive
 /// it with arbitrary device bytes.
+///
+/// A missing or wrong-length `rpIdHash` does not fail the parse: the entry
+/// comes back with `rp_id_hash: None`, so one quirky entry (seen on
+/// vendor-preview `0x41` implementations) cannot abort a whole enumeration.
+/// The hash is never zero-filled — it keys every follow-up
+/// `list_credentials()` call, and a zeroed one would query the wrong RP and
+/// quietly return no/incorrect credentials — so "unusable" is carried
+/// explicitly instead. Only a response missing the RP entity itself is an
+/// error.
 pub fn parse_rp(v: &Value) -> Result<RelyingParty, CtapError> {
     let rp_entity = v
         .get_uint_key(RESP_RP)
@@ -281,7 +296,15 @@ pub fn parse_rp(v: &Value) -> Result<RelyingParty, CtapError> {
     let rp_id_hash = v
         .get_uint_key(RESP_RP_ID_HASH)
         .and_then(|x| x.as_bytes())
-        .ok_or(CtapError::InvalidResponseShape("missing rpIdHash"))?;
+        .and_then(|bytes| {
+            if bytes.len() == 32 {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(bytes);
+                Some(hash)
+            } else {
+                None
+            }
+        });
     let mut rp_id = String::new();
     let mut rp_name: Option<String> = None;
     for (k, val) in rp_entity.as_map().into_iter().flatten() {
@@ -295,18 +318,10 @@ pub fn parse_rp(v: &Value) -> Result<RelyingParty, CtapError> {
             _ => {}
         }
     }
-    // A wrong-length rpIdHash must be an error, not silently replaced with all
-    // zeros: the hash keys every follow-up list_credentials() call, so a zeroed
-    // one would query the wrong RP and quietly return no/incorrect credentials.
-    if rp_id_hash.len() != 32 {
-        return Err(CtapError::InvalidResponseShape("rpIdHash is not 32 bytes"));
-    }
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(rp_id_hash);
     Ok(RelyingParty {
         id: rp_id,
         name: rp_name,
-        rp_id_hash: hash,
+        rp_id_hash,
     })
 }
 
@@ -395,6 +410,69 @@ mod tests {
         info
     }
 
+    /// Canned-response transport: answers each transact() with the next
+    /// queued response, letting enumeration run without hardware.
+    struct ScriptedTransport {
+        responses: Vec<Vec<u8>>,
+    }
+
+    impl CtapTransport for ScriptedTransport {
+        fn transact(&mut self, _cmd: u8, _payload: &[u8]) -> Result<Vec<u8>, CtapError> {
+            if self.responses.is_empty() {
+                return Err(CtapError::EmptyResponse);
+            }
+            Ok(self.responses.remove(0))
+        }
+    }
+
+    /// CTAP success status byte followed by the CBOR-encoded body.
+    fn ok_cbor(v: &Value) -> Vec<u8> {
+        let mut out = vec![0x00];
+        out.extend_from_slice(&encode(v));
+        out
+    }
+
+    #[test]
+    fn enumeration_survives_one_malformed_rp_hash() {
+        // enumerateRPsBegin answers totalRPs=2 with a 0-byte rpIdHash (the
+        // kind of quirk seen on vendor-preview 0x41 implementations);
+        // enumerateRPsNext answers with a valid entry. One malformed hash
+        // must not abort the enumeration, and the valid RP must still come
+        // back usable.
+        let first = Value::Map(vec![
+            (
+                Value::UInt(RESP_RP),
+                Value::Map(vec![(
+                    Value::Text("id".into()),
+                    Value::Text("bad.example".into()),
+                )]),
+            ),
+            (Value::UInt(RESP_RP_ID_HASH), Value::Bytes(Vec::new())),
+            (Value::UInt(RESP_TOTAL_RPS), Value::UInt(2)),
+        ]);
+        let next = Value::Map(vec![
+            (
+                Value::UInt(RESP_RP),
+                Value::Map(vec![(
+                    Value::Text("id".into()),
+                    Value::Text("good.example".into()),
+                )]),
+            ),
+            (Value::UInt(RESP_RP_ID_HASH), Value::Bytes(vec![0xAB; 32])),
+        ]);
+        let mut dev = ScriptedTransport {
+            responses: vec![ok_cbor(&first), ok_cbor(&next)],
+        };
+        let info = info_with("credMgmt");
+        let mut mgr = CredentialManager::new(&mut dev, fake_token(), &info).unwrap();
+        let rps = mgr.list_relying_parties().unwrap();
+        assert_eq!(rps.len(), 2);
+        assert_eq!(rps[0].id, "bad.example");
+        assert_eq!(rps[0].rp_id_hash, None);
+        assert_eq!(rps[1].id, "good.example");
+        assert_eq!(rps[1].rp_id_hash, Some([0xAB; 32]));
+    }
+
     fn build_request_via(
         mgr_cmd: u8,
         token: PinUvAuthToken,
@@ -428,21 +506,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_rp_rejects_wrong_length_hash() {
+    fn parse_rp_marks_wrong_length_hash_unusable() {
         let rp_entity = Value::Map(vec![(
             Value::Text("id".into()),
             Value::Text("example.com".into()),
         )]);
-        // A 31-byte rpIdHash must be an error, not silently zero-filled (which
-        // would key later list_credentials() calls to the wrong RP).
+        // A 31-byte rpIdHash must not abort enumeration, and must not be
+        // zero-filled (a zeroed hash would key later list_credentials()
+        // calls to the wrong RP): the entry parses with an explicit `None`.
         let bad = Value::Map(vec![
             (Value::UInt(RESP_RP), rp_entity.clone()),
             (Value::UInt(RESP_RP_ID_HASH), Value::Bytes(vec![0xAA; 31])),
         ]);
-        assert!(matches!(
-            parse_rp(&bad),
-            Err(CtapError::InvalidResponseShape(_))
-        ));
+        let rp = parse_rp(&bad).unwrap();
+        assert_eq!(rp.id, "example.com");
+        assert_eq!(rp.rp_id_hash, None);
 
         // The correct 32-byte hash parses through unchanged.
         let good = Value::Map(vec![
@@ -450,7 +528,7 @@ mod tests {
             (Value::UInt(RESP_RP_ID_HASH), Value::Bytes(vec![0xAA; 32])),
         ]);
         let rp = parse_rp(&good).unwrap();
-        assert_eq!(rp.rp_id_hash, [0xAA; 32]);
+        assert_eq!(rp.rp_id_hash, Some([0xAA; 32]));
         assert_eq!(rp.id, "example.com");
     }
 
@@ -561,7 +639,7 @@ mod tests {
         let parsed = parse_rp(&rp).unwrap();
         assert_eq!(parsed.id, "example.com");
         assert_eq!(parsed.name.as_deref(), Some("Example, Inc."));
-        assert_eq!(parsed.rp_id_hash, [0x77; 32]);
+        assert_eq!(parsed.rp_id_hash, Some([0x77; 32]));
     }
 
     #[test]

@@ -2582,7 +2582,12 @@ impl App {
         let parties = mgr.list_relying_parties()?;
         let mut rps = Vec::with_capacity(parties.len());
         for rp in parties {
-            let creds = mgr.list_credentials(&rp.rp_id_hash).unwrap_or_default();
+            // A `None` hash marks an entry whose rpIdHash came back malformed:
+            // list nothing rather than query against a wrong key.
+            let creds = match rp.rp_id_hash {
+                Some(hash) => mgr.list_credentials(&hash).unwrap_or_default(),
+                None => Vec::new(),
+            };
             rps.push((rp, creds));
         }
         // While the session is fresh, also read enrolled fingerprints (when the
@@ -2674,7 +2679,12 @@ impl App {
         let parties = mgr.list_relying_parties()?;
         let mut rps = Vec::with_capacity(parties.len());
         for rp in parties {
-            let creds = mgr.list_credentials(&rp.rp_id_hash).unwrap_or_default();
+            // A `None` hash marks an entry whose rpIdHash came back malformed:
+            // list nothing rather than query against a wrong key.
+            let creds = match rp.rp_id_hash {
+                Some(hash) => mgr.list_credentials(&hash).unwrap_or_default(),
+                None => Vec::new(),
+            };
             rps.push((rp, creds));
         }
         Ok(UnlockedSession {
