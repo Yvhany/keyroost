@@ -641,6 +641,23 @@ fn wipe(s: &mut String) {
     s.zeroize();
 }
 
+/// Shared device-binding guard for background-job completions and modal
+/// submissions. `captured` is the `DeviceId` recorded when the job was
+/// dispatched (or the dialog/confirmation opened); `current` is the selection
+/// now. The completion may act only when both exist and match — `None` on
+/// either side fails closed, so an unbound completion can never act on
+/// whatever happens to be selected. This is the one place the rule lives;
+/// per-feature capture fields (Tasks: Molto session, FIDO session, advanced
+/// dialog, OATH/OpenPGP confirmations) all route their decision through it.
+///
+/// Convention for users: dispatchers capture
+/// `let for_device = self.selected_device.clone();` *before* `spawn_job`, and
+/// the apply closure's first statement is
+/// `if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) { return; }`.
+fn completion_still_valid(captured: Option<&DeviceId>, current: Option<&DeviceId>) -> bool {
+    matches!((captured, current), (Some(c), Some(now)) if c == now)
+}
+
 /// Purge egui's retained plaintext for a masked text widget.
 ///
 /// egui keeps an undo history (`TextEditState.undoer`) holding real, unmasked
@@ -2464,7 +2481,7 @@ impl App {
             };
             // Back on the UI thread: store the results.
             Box::new(move |app: &mut App| {
-                if app.selected_device != for_device {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     return; // selection changed mid-read; discard
                 }
                 match outcome {
@@ -3421,7 +3438,7 @@ impl App {
                 // Discard if the user switched devices while the read (which
                 // can block on a touch) was in flight — device B's pane must
                 // not show device A's codes.
-                if app.selected_device == for_device {
+                if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     Self::apply_oath_rows(app, result);
                 }
             })
@@ -3883,7 +3900,7 @@ impl App {
                 session.status()
             })();
             Box::new(move |app: &mut App| {
-                if app.selected_device != for_device {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     return; // selection changed mid-read; discard
                 }
                 match result {
@@ -4661,7 +4678,7 @@ impl App {
                     Ok((s, info))
                 })();
             Box::new(move |app: &mut App| {
-                if app.selected_device != for_device {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     return; // user switched devices mid-open
                 }
                 match result {
@@ -4717,7 +4734,7 @@ impl App {
                 (status, slot_keys)
             });
             Box::new(move |app: &mut App| {
-                if app.selected_device != for_device {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     return; // selection changed mid-read; discard
                 }
                 match result {
@@ -12901,5 +12918,27 @@ mod tests {
         ] {
             assert!(openpgp_cred_mismatch(&pgp, k).is_none());
         }
+    }
+
+    /// The shared device-binding guard: a completion or modal submission may
+    /// act only when the device captured at dispatch/open time still equals
+    /// the current selection.
+    #[test]
+    fn completion_guard_requires_matching_selection() {
+        let a: DeviceId = "serial:AAA".into();
+        let b: DeviceId = "serial:BBB".into();
+        assert!(completion_still_valid(Some(&a), Some(&a)));
+        assert!(!completion_still_valid(Some(&a), Some(&b)));
+    }
+
+    /// `None` on either side fails closed: an unbound completion must never
+    /// act on whatever happens to be selected, and a captured target must
+    /// never fire with nothing selected.
+    #[test]
+    fn completion_guard_fails_closed_without_capture_or_selection() {
+        let a: DeviceId = "serial:AAA".into();
+        assert!(!completion_still_valid(None, Some(&a)));
+        assert!(!completion_still_valid(Some(&a), None));
+        assert!(!completion_still_valid(None, None));
     }
 }
