@@ -50,6 +50,34 @@ impl CtapTransport for Box<dyn CtapTransport> {
         (**self).set_cancel_flag(flag);
     }
 }
+
+/// Run `f` with the transport's read timeout temporarily set to `timeout`,
+/// restoring the caller's previous deadline afterwards — on the closure's
+/// success and failure alike. Every long, user-present operation (a reset, a
+/// fingerprint capture waiting on a touch) must scope its wide window through
+/// this rather than hand-rolling save/set/restore: a caller that forgets the
+/// restore leaks its window into every later command on the device, making
+/// unrelated error paths take that long to surface.
+///
+/// The previous value comes from [`CtapTransport::read_timeout`], not the
+/// default, so an embedder's wider configured timeout survives. Not
+/// panic-safe: a panicking closure skips the restore, exactly like the
+/// hand-rolled sequences this replaces (CTAP command code returns `Result`s,
+/// it doesn't panic).
+pub fn with_timeout<T, R>(
+    dev: &mut T,
+    timeout: std::time::Duration,
+    f: impl FnOnce(&mut T) -> R,
+) -> R
+where
+    T: CtapTransport + ?Sized,
+{
+    let prev = dev.read_timeout();
+    dev.set_timeout(timeout);
+    let out = f(dev);
+    dev.set_timeout(prev);
+    out
+}
 ///
 /// `cmd` is the CTAP-HID command byte the command layer would historically pass
 /// (e.g. `CTAPHID_CBOR`). Non-HID transports interpret it as needed — the PC/SC
@@ -83,4 +111,69 @@ pub trait CtapTransport {
     /// its blocking transmit, so the default is a no-op (a reader-attached
     /// enrollment simply runs to its own timeout if not completed).
     fn set_cancel_flag(&mut self, _flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Records every set_timeout call so tests can assert the guard's exact
+    /// set-then-restore sequence, not just the final state.
+    struct MockTransport {
+        timeout: Duration,
+        set_calls: Vec<Duration>,
+    }
+
+    impl MockTransport {
+        fn new(initial: Duration) -> Self {
+            MockTransport {
+                timeout: initial,
+                set_calls: Vec::new(),
+            }
+        }
+    }
+
+    impl CtapTransport for MockTransport {
+        fn transact(&mut self, _cmd: u8, _payload: &[u8]) -> Result<Vec<u8>, CtapError> {
+            Ok(vec![0x00])
+        }
+        fn set_timeout(&mut self, timeout: Duration) {
+            self.set_calls.push(timeout);
+            self.timeout = timeout;
+        }
+        fn read_timeout(&self) -> Duration {
+            self.timeout
+        }
+    }
+
+    #[test]
+    fn with_timeout_restores_callers_deadline_on_ok() {
+        // The restore target is the *caller's* value (7s here), not the
+        // default — an embedder's widened timeout must survive.
+        let caller = Duration::from_secs(7);
+        let wide = Duration::from_secs(30);
+        let mut dev = MockTransport::new(caller);
+        let out: Result<u8, CtapError> = with_timeout(&mut dev, wide, |d| {
+            assert_eq!(d.read_timeout(), wide, "closure runs under the wide window");
+            Ok(42)
+        });
+        assert_eq!(out.unwrap(), 42);
+        assert_eq!(dev.read_timeout(), caller);
+        assert_eq!(dev.set_calls, vec![wide, caller]);
+    }
+
+    #[test]
+    fn with_timeout_restores_callers_deadline_on_err() {
+        // A failed transaction must not leak the wide window into later
+        // commands (that made unrelated error paths take 30s to surface).
+        let caller = Duration::from_secs(7);
+        let wide = Duration::from_secs(30);
+        let mut dev = MockTransport::new(caller);
+        let out: Result<u8, CtapError> =
+            with_timeout(&mut dev, wide, |_| Err(CtapError::EmptyResponse));
+        assert!(out.is_err());
+        assert_eq!(dev.read_timeout(), caller);
+        assert_eq!(dev.set_calls, vec![wide, caller]);
+    }
 }

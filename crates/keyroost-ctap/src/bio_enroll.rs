@@ -14,7 +14,7 @@ use crate::cbor::{self, Value};
 use crate::client_pin::PinUvAuthToken;
 use crate::cmd::CtapError;
 use crate::hid::CTAPHID_CBOR;
-use crate::transport::CtapTransport;
+use crate::transport::{with_timeout, CtapTransport};
 
 /// authenticatorBioEnrollment command byte (standard).
 pub const CTAP2_BIO_ENROLLMENT: u8 = 0x09;
@@ -23,6 +23,12 @@ pub const CTAP2_BIO_ENROLLMENT_PREVIEW: u8 = 0x40;
 
 /// Fingerprint modality (the only modality CTAP currently defines).
 pub const MODALITY_FINGERPRINT: u64 = 0x01;
+
+/// Wide read-deadline for the enroll capture steps: each capture blocks on
+/// the user touching the sensor. The HID layer extends its deadline on every
+/// KEEPALIVE, but raise the base timeout too so a device that sends sparse
+/// keepalives still gets time to capture.
+const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Host-owned cap on capture iterations for one enrollment (audit KEY-009:
 /// device-reported `remaining_samples` must never drive an unbounded host
@@ -201,19 +207,17 @@ impl<'a, T: CtapTransport> BioEnrollment<'a, T> {
     ) -> Result<(Vec<u8>, CaptureStatus), CtapError> {
         // A new enrollment gets a fresh host-side capture budget (KEY-009).
         self.captures = 0;
-        // Each capture blocks on the user touching the sensor. The HID layer now
-        // extends its deadline on every KEEPALIVE, but raise the base timeout too
-        // so a device that sends sparse keepalives still gets time to capture.
-        let prev_timeout = self.dev.read_timeout();
-        self.dev.set_timeout(std::time::Duration::from_secs(30));
         let params =
             timeout_ms.map(|t| Value::Map(vec![(Value::UInt(PARAM_TIMEOUT_MS), Value::UInt(t))]));
-        let resp = self.dispatch(SUB_ENROLL_BEGIN, params);
-        // Restore the caller's deadline (not the default — an embedder's wider
-        // timeout must survive) so later commands don't inherit the 30s
-        // capture window.
-        self.dev.set_timeout(prev_timeout);
-        let resp = resp?;
+        let request = self.build_request(SUB_ENROLL_BEGIN, params.as_ref());
+        let cmd_code = self.cmd_code;
+        // with_timeout scopes the capture window and restores the caller's
+        // deadline (not the default — an embedder's wider timeout must
+        // survive) on success and error alike, so later commands don't
+        // inherit the 30s capture window.
+        let resp = with_timeout(&mut *self.dev, CAPTURE_TIMEOUT, |dev| {
+            transact_cbor(dev, cmd_code, &request)
+        })?;
         let template_id = resp
             .get_uint_key(RESP_TEMPLATE_ID)
             .and_then(|v| v.as_bytes())
@@ -242,8 +246,6 @@ impl<'a, T: CtapTransport> BioEnrollment<'a, T> {
                 "authenticator kept requesting more fingerprint samples past the host cap",
             ));
         }
-        let prev_timeout = self.dev.read_timeout();
-        self.dev.set_timeout(std::time::Duration::from_secs(30));
         let mut p = vec![(
             Value::UInt(PARAM_TEMPLATE_ID),
             Value::Bytes(template_id.to_vec()),
@@ -251,10 +253,13 @@ impl<'a, T: CtapTransport> BioEnrollment<'a, T> {
         if let Some(t) = timeout_ms {
             p.push((Value::UInt(PARAM_TIMEOUT_MS), Value::UInt(t)));
         }
-        let resp = self.dispatch(SUB_ENROLL_CAPTURE_NEXT, Some(Value::Map(p)));
-        // Restore the caller's deadline (see enroll_begin).
-        self.dev.set_timeout(prev_timeout);
-        let resp = resp?;
+        let params = Value::Map(p);
+        let request = self.build_request(SUB_ENROLL_CAPTURE_NEXT, Some(&params));
+        let cmd_code = self.cmd_code;
+        // Restore the caller's deadline via with_timeout (see enroll_begin).
+        let resp = with_timeout(&mut *self.dev, CAPTURE_TIMEOUT, |dev| {
+            transact_cbor(dev, cmd_code, &request)
+        })?;
         Ok(CaptureStatus {
             last_sample_status: field_uint(&resp, RESP_LAST_ENROLL_SAMPLE_STATUS).unwrap_or(0),
             remaining_samples: field_uint(&resp, RESP_REMAINING_SAMPLES).unwrap_or(0),
@@ -344,21 +349,32 @@ impl<'a, T: CtapTransport> BioEnrollment<'a, T> {
 
     /// CBOR-encode `request`, prepend the command byte, transact, and decode.
     fn transact(&mut self, request: &Value) -> Result<Value, CtapError> {
-        let encoded = cbor::encode(request);
-        let mut payload = Vec::with_capacity(encoded.len() + 1);
-        payload.push(self.cmd_code);
-        payload.extend_from_slice(&encoded);
-        let resp = self.dev.transact(CTAPHID_CBOR, &payload)?;
-        let (status, body) = resp.split_first().ok_or(CtapError::EmptyResponse)?;
-        if *status != 0 {
-            return Err(CtapError::StatusCode(*status));
-        }
-        if body.is_empty() {
-            return Ok(Value::Map(Vec::new()));
-        }
-        let (value, _) = cbor::decode(body)?;
-        Ok(value)
+        transact_cbor(&mut *self.dev, self.cmd_code, request)
     }
+}
+
+/// Body of [`BioEnrollment::transact`] as a free function, so the enroll
+/// steps can run it inside [`with_timeout`] — which mutably borrows the
+/// transport — without also borrowing the whole session.
+fn transact_cbor(
+    dev: &mut impl CtapTransport,
+    cmd_code: u8,
+    request: &Value,
+) -> Result<Value, CtapError> {
+    let encoded = cbor::encode(request);
+    let mut payload = Vec::with_capacity(encoded.len() + 1);
+    payload.push(cmd_code);
+    payload.extend_from_slice(&encoded);
+    let resp = dev.transact(CTAPHID_CBOR, &payload)?;
+    let (status, body) = resp.split_first().ok_or(CtapError::EmptyResponse)?;
+    if *status != 0 {
+        return Err(CtapError::StatusCode(*status));
+    }
+    if body.is_empty() {
+        return Ok(Value::Map(Vec::new()));
+    }
+    let (value, _) = cbor::decode(body)?;
+    Ok(value)
 }
 
 fn field_uint(v: &Value, key: u64) -> Option<u64> {

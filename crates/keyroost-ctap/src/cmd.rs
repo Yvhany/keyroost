@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::cbor::{self, Value};
 use crate::hid::{HidTransportError, CTAPHID_CBOR};
-use crate::transport::CtapTransport;
+use crate::transport::{with_timeout, CtapTransport};
 
 pub const CTAP2_GET_INFO: u8 = 0x04;
 pub const CTAP2_RESET: u8 = 0x07;
@@ -214,16 +214,14 @@ pub fn get_info(dev: &mut impl CtapTransport) -> Result<AuthenticatorInfo, CtapE
 /// seconds of plug-in *and* a physical touch — failures with status 0x2D
 /// usually mean the touch window has closed.
 pub fn reset(dev: &mut impl CtapTransport) -> Result<(), CtapError> {
-    // Save the caller's deadline, not the default: an embedder that widened
-    // the timeout for a slow transport must get *its* value back.
-    let prev_timeout = dev.read_timeout();
-    dev.set_timeout(RESET_TIMEOUT);
-    let result = dev.transact(CTAPHID_CBOR, &[CTAP2_RESET]);
-    // Restore the previous deadline unconditionally, so a later command on
-    // this device doesn't inherit the 30s reset window (which would make error
-    // paths — e.g. spammed foreign-CID frames — take 30s to surface).
-    dev.set_timeout(prev_timeout);
-    let resp = result?;
+    // with_timeout scopes the wide reset window: it saves the caller's
+    // deadline (not the default — an embedder that widened the timeout for a
+    // slow transport must get *its* value back) and restores it on success
+    // and error alike, so a later command on this device doesn't inherit the
+    // 30s reset window.
+    let resp = with_timeout(dev, RESET_TIMEOUT, |d| {
+        d.transact(CTAPHID_CBOR, &[CTAP2_RESET])
+    })?;
     let (status, _) = split_status(&resp)?;
     if status != 0 {
         return Err(CtapError::StatusCode(status));
