@@ -303,9 +303,14 @@ impl HidOtpTransport {
 
     #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
     fn open_io(path: &Path) -> Result<HidIo, OtpTransportError> {
+        // O_NONBLOCK so read_report can poll with a budget instead of
+        // blocking forever on a silent device (audit KEY-011); hidraw writes
+        // do not consult it.
+        use std::os::unix::fs::OpenOptionsExt;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(keyroost_hid::O_NONBLOCK)
             .open(path)
             .map_err(|e| OtpTransportError::TransportUnavailable(e.to_string()))?;
         Ok(HidIo::Hidraw(file))
@@ -353,8 +358,10 @@ impl HidOtpTransport {
         let n = match &mut self.io {
             #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
             HidIo::Hidraw(f) => {
-                use std::io::Read;
-                f.read(&mut buf[..hidframe::REPORT_PAYLOAD])
+                // Bounded read (KEY-011): the fd is O_NONBLOCK and the helper
+                // polls with a budget; `0` means the budget elapsed with no
+                // report, and the transmit loop re-checks its deadline.
+                keyroost_hid::read_nonblocking_bounded(f, &mut buf[..hidframe::REPORT_PAYLOAD])
                     .map_err(|e| OtpTransportError::TransportUnavailable(e.to_string()))?
             }
             #[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
@@ -363,8 +370,7 @@ impl HidOtpTransport {
                 // `keyroost_hid::read_report_bounded` for the poll contract):
                 // `0` means the poll interval elapsed with no report; the
                 // transmit loop treats that as "retry" and re-checks its
-                // deadline. (The Linux hidraw path above has no per-read
-                // timeout without poll(2)/unsafe and stays blocking.)
+                // deadline.
                 keyroost_hid::read_report_bounded(d, &mut buf[..hidframe::REPORT_PAYLOAD])
                     .map_err(|e| OtpTransportError::TransportUnavailable(e.to_string()))?
             }
@@ -712,14 +718,13 @@ pub struct Token2OtpSession {
 const MAX_ENUM_PAGES: usize = 256;
 const MAX_ENUM_ENTRIES: usize = 1024;
 
-/// How long the HID probe waits for the OTP applet to answer before giving up.
-/// On Linux the hidraw `read()` is blocking and the kernel surfaces no timeout,
-/// so a key whose FIDO HID interface enumerates but whose OTP-over-HID channel
-/// is disabled (e.g. when the keyboard interface is enabled, changing the USB
-/// composite) would otherwise block forever here instead of falling back to
-/// PC/SC. Bounding the probe lets `detect` fail over to CCID, which carries the
-/// same applet. Only used on the Linux hidraw path; the hidapi backend bounds
-/// its own reads.
+/// How long the HID probe waits for the OTP applet to answer before giving up
+/// and falling back to PC/SC (which carries the same applet). Reads are now
+/// bounded on every backend (`keyroost_hid::read_nonblocking_bounded` /
+/// `read_report_bounded`), but the transport's default per-command timeout is
+/// 20 s — far too long for a detect-time probe — so the probe still runs on a
+/// worker thread bounded by this shorter deadline. Only used on the Linux
+/// hidraw path; the hidapi backend probes directly.
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 const HID_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -728,18 +733,19 @@ const HID_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// On success returns the transport back (it's reused as the live channel). On
 /// failure — including the probe exceeding [`HID_PROBE_TIMEOUT`] — returns an
-/// error; the transport is dropped (on Linux it may still be owned by a detached
-/// worker thread blocked in `read()`, which is harmless and ends when the read
-/// returns or the process exits).
+/// error; the transport is dropped (on Linux it may briefly be owned by an
+/// abandoned worker thread, which now ends on its own when the transport's
+/// bounded read loop hits its deadline).
 fn probe_hid_owned(
     mut t: HidOtpTransport,
 ) -> Result<HidOtpTransport, (OtpTransportError, Option<HidOtpTransport>)> {
     #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
     {
-        // hidraw read() is blocking with no kernel timeout, so run the probe on
-        // a worker thread and bound it with a channel recv deadline. If it times
-        // out we abandon the thread (and the transport it owns) and report a
-        // timeout so the caller can fall back to PC/SC.
+        // The probe must answer within HID_PROBE_TIMEOUT (3 s) but the
+        // transport's own command timeout is 20 s, so run it on a worker
+        // thread and bound the wait with a channel recv deadline. An
+        // abandoned worker no longer blocks forever: the bounded read loop
+        // exits at the transport timeout and the thread ends (KEY-011).
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let res = probe_hid(&mut t);
@@ -1373,5 +1379,34 @@ mod enumerate_bounds_tests {
         let entries = session.enumerate(0).expect("two pages must enumerate");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].account_name, "alice");
+    }
+}
+
+#[cfg(all(test, target_os = "linux", not(feature = "hidapi-backend")))]
+mod hidraw_bounded_read_tests {
+    use super::*;
+
+    /// KEY-011 for the Token2 OTP HID path: a silent device must produce a
+    /// timeout error within the transport deadline, not a blocked read.
+    #[test]
+    fn silent_device_times_out_instead_of_blocking() {
+        use std::os::unix::net::UnixStream;
+        let (a, _b) = UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap(); // same fd state open_io now sets
+        let file = std::fs::File::from(std::os::fd::OwnedFd::from(a));
+        let mut t = HidOtpTransport {
+            io: HidIo::Hidraw(file),
+            timeout: Duration::from_millis(300),
+            button_prompt: None,
+            debug: false,
+            resp_sensitive: false,
+        };
+        let start = Instant::now();
+        let res = t.transmit(&t2::get_ecdh_pubkey(), false);
+        assert!(
+            matches!(res, Err(OtpTransportError::TransportUnavailable(_))),
+            "expected the no-response timeout, got {res:?}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 }

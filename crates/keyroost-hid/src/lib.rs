@@ -208,10 +208,10 @@ pub const READ_POLL_MS: i32 = 500;
 ///   `keyroost-ctap` rejects `n != buf.len()`; the Token2 OTP framing
 ///   tolerates a short frame and hands `buf[..n]` to its reassembler.
 /// - **Linux hidraw**: the dependency-free production backend on Linux reads
-///   `/dev/hidrawN` directly, which has no per-read timeout without `poll(2)`
-///   (`unsafe`/a dep this workspace avoids). That path stays blocking and is
-///   bounded only cooperatively; this helper governs macOS/Windows (and Linux
-///   under the testing-oriented `hidapi-backend` feature).
+///   `/dev/hidrawN` through [`read_nonblocking_bounded`], the `O_NONBLOCK`
+///   counterpart of this helper with the same `0 = no report yet` contract;
+///   this helper governs macOS/Windows (and Linux under the testing-oriented
+///   `hidapi-backend` feature).
 #[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
 pub fn read_report_bounded(
     dev: &hidapi::HidDevice,
@@ -219,6 +219,67 @@ pub fn read_report_bounded(
 ) -> Result<usize, hidapi::HidError> {
     buf.fill(0);
     dev.read_timeout(buf, READ_POLL_MS)
+}
+
+/// `O_NONBLOCK`, hand-defined because std exposes no fcntl constants and this
+/// crate's Linux backend is deliberately dependency-free (`libc` would be a
+/// new direct dependency, and `poll(2)` would need `unsafe`, which the
+/// workspace forbids). `0o4000` is the value on every Linux target keyroost
+/// ships (x86_64, aarch64, armv7, riscv64, ppc64le, s390x); it differs only
+/// on mips/sparc/alpha/hppa, which are not supported targets.
+#[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+pub const O_NONBLOCK: i32 = 0o4000;
+
+/// How long one bounded hidraw read waits before reporting "no report yet"
+/// (`Ok(0)`). Mirrors the hidapi backend's `READ_POLL_MS` (500 ms) so
+/// deadline/cancel responsiveness is the same on every platform.
+#[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+pub const HIDRAW_READ_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Sleep between attempts inside [`read_nonblocking_bounded`]'s poll loop —
+/// short enough to add no perceptible latency to a real response, long enough
+/// not to spin the CPU while waiting.
+#[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+const NONBLOCK_POLL_SLEEP: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// One bounded input-report read against an `O_NONBLOCK` hidraw `File` — the
+/// Linux counterpart of [`read_report_bounded`] (audit KEY-011: the deadline
+/// must bound device *silence*, not just the frame count).
+///
+/// Same contract as the hidapi helper: `Ok(n)` when a report of `n` bytes
+/// arrived, `Ok(0)` when [`HIDRAW_READ_BUDGET`] elapsed with no report —
+/// callers loop on `Ok(0)`, re-checking their overall deadline and cancel
+/// flag. `buf` is zeroed first so no stale tail survives a short read.
+///
+/// The fd **must** have been opened with [`O_NONBLOCK`] (via
+/// `OpenOptions::custom_flags`); on a blocking fd this degenerates to the old
+/// unbounded read. A `read` of 0 bytes (EOF — the device node vanished
+/// mid-wait) is also reported as `Ok(0)` after the budget, so callers resolve
+/// it at their overall deadline instead of spinning. Generic over `Read` so
+/// tests can drive it with a nonblocking socket instead of real hardware.
+#[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+pub fn read_nonblocking_bounded<F: std::io::Read>(
+    f: &mut F,
+    buf: &mut [u8],
+) -> io::Result<usize> {
+    buf.fill(0);
+    let deadline = std::time::Instant::now() + HIDRAW_READ_BUDGET;
+    loop {
+        match f.read(buf) {
+            Ok(0) => {} // EOF/unplug: treat as silence; bounded below
+            Ok(n) => return Ok(n),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
+            Err(e) => return Err(e),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(0);
+        }
+        std::thread::sleep(NONBLOCK_POLL_SLEEP);
+    }
 }
 
 /// Dependency-free Linux backend: enumerate `/dev/hidraw*` via sysfs metadata.
@@ -475,5 +536,45 @@ mod tests {
             ..fido
         };
         assert!(dfu.bootloader_label().is_some());
+    }
+}
+
+#[cfg(all(test, target_os = "linux", not(feature = "hidapi-backend")))]
+mod nonblocking_read_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::time::Instant;
+
+    #[test]
+    fn silent_fd_returns_zero_within_the_budget() {
+        // A connected socket with a peer that never writes is a genuinely
+        // silent fd — the exact shape of a device that accepts a request and
+        // then says nothing (KEY-011).
+        let (mut a, _b) = UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 64];
+        let start = Instant::now();
+        let n = read_nonblocking_bounded(&mut a, &mut buf).unwrap();
+        assert_eq!(n, 0, "a silent fd must poll out, not block");
+        let elapsed = start.elapsed();
+        assert!(elapsed >= HIDRAW_READ_BUDGET, "returned early: {elapsed:?}");
+        assert!(
+            elapsed < HIDRAW_READ_BUDGET * 4,
+            "took far longer than the budget: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn available_data_is_returned_immediately() {
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        b.write_all(&[0x42; 8]).unwrap();
+        let mut buf = [0u8; 64];
+        let start = Instant::now();
+        let n = read_nonblocking_bounded(&mut a, &mut buf).unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(&buf[..8], &[0x42; 8]);
+        assert!(start.elapsed() < HIDRAW_READ_BUDGET);
     }
 }

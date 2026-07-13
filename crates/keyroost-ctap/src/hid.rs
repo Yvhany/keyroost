@@ -9,24 +9,19 @@
 //! `CTAPHID_INIT`. KEEPALIVE frames during long-running operations are
 //! consumed transparently.
 //!
-//! Read bounding differs by backend. The hidapi backend (macOS/Windows) polls
-//! with a timeout (`keyroost_hid::READ_POLL_MS`), so the overall deadline and the
-//! cooperative-cancel flag are honored even if a device goes completely silent
-//! mid-response — it cannot block a caller forever. The Linux hidraw `File`
-//! backend has no per-read timeout: the kernel driver doesn't surface one, and
-//! we deliberately avoid `unsafe` (workspace lints forbid it) so we can't set
-//! `O_NONBLOCK` + `poll(2)` without an extra dep. There, a `read()` blocks until
-//! a report arrives, so the deadline bounds *silence between* frames but not a
-//! device that sends nothing at all after the first frame — the residual
-//! total-silence hang (an unplugged/broken/hostile device) is bounded only
-//! cooperatively via the cancel flag at keepalives. In practice CTAP
-//! authenticators respond within milliseconds or send periodic KEEPALIVEs.
+//! Read bounding is uniform across backends (audit KEY-011). The hidapi
+//! backend (macOS/Windows) polls with a timeout via
+//! `keyroost_hid::read_report_bounded`; the Linux hidraw `File` backend opens
+//! the node `O_NONBLOCK` and polls via
+//! `keyroost_hid::read_nonblocking_bounded`. On every backend the overall
+//! deadline and the cooperative-cancel flag are honored even if a device goes
+//! completely silent mid-response — it cannot block a caller forever.
 
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 use std::fs::{File, OpenOptions};
 use std::io;
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -198,10 +193,19 @@ impl CtapHidDevice {
         self.cancel = Some(flag);
     }
 
-    /// Linux backend: open the `/dev/hidraw*` node read/write.
+    /// Linux backend: open the `/dev/hidraw*` node read/write, `O_NONBLOCK`
+    /// so [`Self::read_report`] can poll with a budget instead of blocking
+    /// forever on a silent device (audit KEY-011). hidraw writes do not
+    /// consult `O_NONBLOCK` (the kernel issues output reports synchronously),
+    /// so `write_all` is unaffected.
     #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
     fn open_io(path: &Path) -> Result<HidIo, HidTransportError> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(keyroost_hid::O_NONBLOCK)
+            .open(path)?;
         Ok(HidIo::Hidraw(file))
     }
 
@@ -233,21 +237,31 @@ impl CtapHidDevice {
 
     /// Read one 64-byte input report into `buf`.
     ///
-    /// Returns `Ok(true)` when a full report was read, `Ok(false)` when a
-    /// bounded backend polled with no report available (the caller re-checks its
-    /// overall deadline and cancel flag, then retries). The hidapi backend
-    /// (macOS/Windows) reads through [`keyroost_hid::read_report_bounded`] so a
-    /// device that goes silent mid-response can't block forever — see that
-    /// helper for the poll contract. The Linux hidraw path has no per-read
-    /// timeout without `poll(2)` (which needs `unsafe`/a dep the crate
-    /// forbids), so it stays blocking and always returns `Ok(true)`; a truly
-    /// silent device there is bounded only cooperatively (the cancel flag, at
-    /// keepalives) — see the module docs.
+    /// Returns `Ok(true)` when a full report was read, `Ok(false)` when the
+    /// bounded backend polled with no report available (the caller re-checks
+    /// its overall deadline and cancel flag, then retries). The hidapi
+    /// backend (macOS/Windows) reads through
+    /// [`keyroost_hid::read_report_bounded`]; the Linux hidraw backend reads
+    /// through [`keyroost_hid::read_nonblocking_bounded`] against the
+    /// `O_NONBLOCK` fd set in `open_io`. Either way a device that goes silent
+    /// mid-response cannot block a caller past its deadline (audit KEY-011).
     fn read_report(&mut self, buf: &mut [u8]) -> Result<bool, HidTransportError> {
         match &mut self.io {
             #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
             HidIo::Hidraw(f) => {
-                f.read_exact(buf)?;
+                let n = keyroost_hid::read_nonblocking_bounded(f, buf)?;
+                if n == 0 {
+                    // Read budget elapsed with no report; let the caller loop.
+                    return Ok(false);
+                }
+                // CTAPHID input reports are a fixed 64 bytes; a short read
+                // must not let the zero-filled tail parse as frame content.
+                if n != buf.len() {
+                    return Err(HidTransportError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("short HID read: {} of {} bytes", n, buf.len()),
+                    )));
+                }
                 Ok(true)
             }
             #[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
@@ -546,6 +560,32 @@ impl crate::transport::CtapTransport for CtapHidDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KEY-011: a device that accepts a request and then goes silent must be
+    /// bounded by the configured deadline, not block in read() forever. A
+    /// socketpair end with a mute peer is exactly that fd.
+    #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+    #[test]
+    fn recv_times_out_on_a_silent_device_instead_of_blocking() {
+        use std::os::unix::net::UnixStream;
+        let (a, _b) = UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap(); // same fd state open_io now sets
+        let file = std::fs::File::from(std::os::fd::OwnedFd::from(a));
+        let mut dev = CtapHidDevice {
+            io: HidIo::Hidraw(file),
+            channel_id: 1,
+            timeout: Duration::from_millis(300),
+            cancel: None,
+        };
+        let start = Instant::now();
+        let res = dev.recv(1, CTAPHID_CBOR);
+        assert!(
+            matches!(res, Err(HidTransportError::Timeout)),
+            "expected Timeout, got {res:?}"
+        );
+        // One 500 ms read budget + the 300 ms deadline, with generous slack.
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
 
     #[test]
     fn init_response_capability_flags() {
