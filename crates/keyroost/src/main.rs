@@ -131,6 +131,12 @@ struct SecurityKeysState {
     pin_input: String,
     /// Active unlocked session: token + cached resident credentials.
     session: Option<UnlockedSession>,
+    /// The device `session` was unlocked on. Follow-on operations (reload,
+    /// delete, bio, large-blob writes) must obtain the session through
+    /// `App::fido_session()`, which refuses it when this no longer matches
+    /// the selection (KEY-012): the session retains the PIN, and a PIN
+    /// cached for one key must never authorize work on another.
+    session_device: Option<DeviceId>,
     /// Change-PIN modal state.
     change_pin: ChangePinDialog,
     /// Reset-confirmation modal state.
@@ -369,6 +375,13 @@ struct OathState {
     add: OathAddDialog,
     /// Credential name awaiting a delete confirmation, if any.
     confirm_delete: Option<String>,
+    /// Password accepted by the last successful unlock+list of the current
+    /// selection. `password_input` is consumed (wiped) by every op's apply,
+    /// so on-demand reads that happen much later — HOTP "Read code" — send
+    /// this retained copy instead of an empty string (which could never
+    /// unlock a protected applet and re-locked the pane every time).
+    /// Cleared on selection change and on a rejected password.
+    unlocked_password: Option<zeroize::Zeroizing<String>>,
 }
 
 /// One credential row in the OATH pane: its stored name and the last code we
@@ -660,6 +673,19 @@ fn wipe(s: &mut String) {
 /// `if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) { return; }`.
 fn completion_still_valid(captured: Option<&DeviceId>, current: Option<&DeviceId>) -> bool {
     matches!((captured, current), (Some(c), Some(now)) if c == now)
+}
+
+/// The password an OATH op should send: the freshly typed entry when there
+/// is one, else the password retained from the last successful unlock of the
+/// current selection (see `OathState::unlocked_password`). Falls back to
+/// empty — correct for an unprotected applet.
+fn oath_effective_password(oath: &OathState) -> zeroize::Zeroizing<String> {
+    if !oath.password_input.is_empty() {
+        return zeroize::Zeroizing::new(oath.password_input.clone());
+    }
+    oath.unlocked_password
+        .clone()
+        .unwrap_or_else(|| zeroize::Zeroizing::new(String::new()))
 }
 
 /// Purge egui's retained plaintext for a masked text widget.
@@ -2581,17 +2607,24 @@ impl App {
             self.security_keys.error = Some("PIN is empty".into());
             return;
         }
+        let for_device = self.selected_device.clone();
         self.spawn_job("Unlocking\u{2026} (enter PIN / touch)", move || {
             let result = Self::open_and_unlock(&target, &pin).map_err(|e| e.to_string());
-            Box::new(move |app: &mut App| match result {
-                Ok(sess) => {
-                    // Surface fingerprints read during unlock so the list shows
-                    // without a separate Reload.
-                    app.security_keys.fingerprints = sess.fingerprints.clone();
-                    app.security_keys.session = Some(sess);
-                    app.security_keys.error = None;
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // selection changed mid-unlock; discard (drops the PIN)
                 }
-                Err(e) => app.security_keys.error = Some(format!("unlock failed: {}", e)),
+                match result {
+                    Ok(sess) => {
+                        // Surface fingerprints read during unlock so the list shows
+                        // without a separate Reload.
+                        app.security_keys.fingerprints = sess.fingerprints.clone();
+                        app.security_keys.session = Some(sess);
+                        app.security_keys.session_device = for_device.clone();
+                        app.security_keys.error = None;
+                    }
+                    Err(e) => app.security_keys.error = Some(format!("unlock failed: {}", e)),
+                }
             })
         });
     }
@@ -2660,8 +2693,23 @@ impl App {
         })
     }
 
+    /// The unlocked FIDO session, but only while it is still bound to the
+    /// current selection (KEY-012). Every dispatcher that reuses the cached
+    /// session/PIN must get it through here, not `security_keys.session`.
+    fn fido_session(&self) -> Option<&UnlockedSession> {
+        if completion_still_valid(
+            self.security_keys.session_device.as_ref(),
+            self.selected_device.as_ref(),
+        ) {
+            self.security_keys.session.as_ref()
+        } else {
+            None
+        }
+    }
+
     fn lock_session(&mut self) {
         self.security_keys.session = None;
+        self.security_keys.session_device = None;
         wipe(&mut self.security_keys.pin_input);
     }
 
@@ -2695,17 +2743,29 @@ impl App {
         let Some(target) = self.selected_fido_target() else {
             return;
         };
+        if self.fido_session().is_none() {
+            return; // no session, or one bound to a different device (KEY-012)
+        }
         let Some(session) = self.security_keys.session.take() else {
             return;
         };
         let token = session.token;
         let pin = session.pin;
+        let for_device = self.selected_device.clone();
         self.spawn_job("Refreshing credentials\u{2026}", move || {
             let result =
                 Self::refresh_with_token(&target, token, pin).map_err(SessionOpError::from_boxed);
-            Box::new(move |app: &mut App| match result {
-                Ok(fresh) => app.security_keys.session = Some(fresh),
-                Err(e) => app.fail_session_op(&e, "refresh failed"),
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // selection changed mid-refresh; drop the session + PIN
+                }
+                match result {
+                    Ok(fresh) => {
+                        app.security_keys.session = Some(fresh);
+                        app.security_keys.session_device = for_device.clone();
+                    }
+                    Err(e) => app.fail_session_op(&e, "refresh failed"),
+                }
             })
         });
     }
@@ -2800,21 +2860,27 @@ impl App {
         let Some(target) = self.selected_fido_target() else {
             return;
         };
-        let Some(session) = self.security_keys.session.as_ref() else {
+        let Some(session) = self.fido_session() else {
             self.security_keys.error = Some("unlock the key first".into());
             return;
         };
         let pin = session.pin.clone();
+        let for_device = self.selected_device.clone();
         self.spawn_job("Reading fingerprints\u{2026}", move || {
             let result = Self::with_fresh_bio(&target, &pin, |bio| {
                 bio.enumerate().map_err(SessionOpError::from_ctap)
             });
-            Box::new(move |app: &mut App| match result {
-                Ok(list) => {
-                    app.security_keys.fingerprints = Some(list);
-                    app.security_keys.error = None;
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // selection changed mid-read; discard
                 }
-                Err(e) => app.fail_session_op(&e, "fingerprint list failed"),
+                match result {
+                    Ok(list) => {
+                        app.security_keys.fingerprints = Some(list);
+                        app.security_keys.error = None;
+                    }
+                    Err(e) => app.fail_session_op(&e, "fingerprint list failed"),
+                }
             })
         });
     }
@@ -2829,7 +2895,7 @@ impl App {
         let Some(target) = self.selected_fido_target() else {
             return;
         };
-        let Some(session) = self.security_keys.session.as_ref() else {
+        let Some(session) = self.fido_session() else {
             self.security_keys.error = Some("unlock the key first".into());
             return;
         };
@@ -2847,6 +2913,7 @@ impl App {
             .unwrap_or_default();
         self.security_keys.fp_progress = Some(progress.clone());
 
+        let for_device = self.selected_device.clone();
         self.spawn_job("Enrolling fingerprint\u{2026}", move || {
             use keyroost_ctap::bio_enroll::sample_status_message;
             let result = (|| -> Result<Vec<keyroost_ctap::Enrollment>, SessionOpError> {
@@ -2944,6 +3011,10 @@ impl App {
             }
 
             Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // selection changed mid-enroll; the progress cell
+                            // was already dropped + cancelled on selection change
+                }
                 match result {
                     Ok(list) => {
                         app.security_keys.fingerprints = Some(list);
@@ -2973,19 +3044,25 @@ impl App {
         let Some(target) = self.selected_fido_target() else {
             return;
         };
-        let Some(session) = self.security_keys.session.as_ref() else {
+        let Some(session) = self.fido_session() else {
             return;
         };
         let pin = session.pin.clone();
+        let for_device = self.selected_device.clone();
         self.spawn_job("Deleting fingerprint\u{2026}", move || {
             let result = Self::with_fresh_bio(&target, &pin, |bio| {
                 bio.remove_enrollment(&template_id)
                     .map_err(SessionOpError::from_ctap)?;
                 bio.enumerate().map_err(SessionOpError::from_ctap)
             });
-            Box::new(move |app: &mut App| match result {
-                Ok(list) => app.security_keys.fingerprints = Some(list),
-                Err(e) => app.fail_session_op(&e, "delete failed"),
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // selection changed mid-op; discard the stale completion
+                }
+                match result {
+                    Ok(list) => app.security_keys.fingerprints = Some(list),
+                    Err(e) => app.fail_session_op(&e, "delete failed"),
+                }
             })
         });
     }
@@ -2998,19 +3075,25 @@ impl App {
         let Some(target) = self.selected_fido_target() else {
             return;
         };
-        let Some(session) = self.security_keys.session.as_ref() else {
+        let Some(session) = self.fido_session() else {
             return;
         };
         let pin = session.pin.clone();
+        let for_device = self.selected_device.clone();
         self.spawn_job("Renaming fingerprint\u{2026}", move || {
             let result = Self::with_fresh_bio(&target, &pin, |bio| {
                 bio.set_friendly_name(&template_id, &new_name)
                     .map_err(SessionOpError::from_ctap)?;
                 bio.enumerate().map_err(SessionOpError::from_ctap)
             });
-            Box::new(move |app: &mut App| match result {
-                Ok(list) => app.security_keys.fingerprints = Some(list),
-                Err(e) => app.fail_session_op(&e, "rename failed"),
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // selection changed mid-op; discard the stale completion
+                }
+                match result {
+                    Ok(list) => app.security_keys.fingerprints = Some(list),
+                    Err(e) => app.fail_session_op(&e, "rename failed"),
+                }
             })
         });
     }
@@ -3144,24 +3227,31 @@ impl App {
         let Some(target) = self.selected_fido_target() else {
             return;
         };
-        let Some(session) = self.security_keys.session.as_ref() else {
+        let Some(session) = self.fido_session() else {
             return;
         };
         let token = session.token.clone();
         // The refresh after delete needs its own token; clone for the chained op.
         let token_refresh = token.clone();
         let pin_refresh = session.pin.clone();
+        let for_device = self.selected_device.clone();
         self.spawn_job("Deleting credential\u{2026}", move || {
             // Delete, then re-list in the same job so the UI updates atomically.
             let result = Self::try_delete(&target, token, &cred_id)
                 .and_then(|()| Self::refresh_with_token(&target, token_refresh, pin_refresh))
                 .map_err(SessionOpError::from_boxed);
-            Box::new(move |app: &mut App| match result {
-                Ok(fresh) => {
-                    app.security_keys.session = Some(fresh);
-                    app.security_keys.error = None;
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // selection changed mid-delete; drop the refresh
                 }
-                Err(e) => app.fail_session_op(&e, "delete failed"),
+                match result {
+                    Ok(fresh) => {
+                        app.security_keys.session = Some(fresh);
+                        app.security_keys.session_device = for_device.clone();
+                        app.security_keys.error = None;
+                    }
+                    Err(e) => app.fail_session_op(&e, "delete failed"),
+                }
             })
         });
     }
@@ -3405,23 +3495,34 @@ impl App {
             return;
         };
         let cred = name.to_owned();
-        let password = zeroize::Zeroizing::new(self.oath.password_input.clone());
+        // The listing already consumed (wiped) password_input, so this read
+        // sends the retained accepted password — an empty string here could
+        // never unlock a protected applet and re-locked the pane every time.
+        let password = oath_effective_password(&self.oath);
+        let for_device = self.selected_device.clone();
         self.spawn_job("Reading code\u{2026}", move || {
             let result = (|| -> Result<String, TransportError> {
                 let mut session = Self::oath_open_unlock(&reader, &password)?;
                 Ok(session.calculate_hotp(&cred)?.code)
             })();
             Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // selection changed mid-read; discard
+                }
                 // The typed password is consumed whatever the outcome (mirrors
                 // apply_oath_rows).
                 wipe(&mut app.oath.password_input);
                 match result {
                     Ok(code) => {
+                        // This password worked (or none was needed): retain it,
+                        // like a successful listing does.
+                        app.oath.unlocked_password = Some(password);
                         if let Some(row) = app.oath.creds.iter_mut().find(|r| r.name == cred) {
                             row.code = Some(code);
                         }
                     }
                     Err(TransportError::OathPasswordRejected) => {
+                        app.oath.unlocked_password = None;
                         app.oath.locked = true;
                         app.oath.error = Some("wrong OATH password".into());
                     }
@@ -3432,7 +3533,15 @@ impl App {
     }
 
     /// Store the outcome of an op that ends by (re)listing credentials.
-    fn apply_oath_rows(app: &mut App, result: Result<(Vec<OathRow>, usize), TransportError>) {
+    /// `password` is the password the op sent: on success it is retained in
+    /// `unlocked_password` for later on-demand reads (HOTP "Read code" runs
+    /// long after `password_input` was consumed); on a rejected password the
+    /// retained copy is dropped too.
+    fn apply_oath_rows(
+        app: &mut App,
+        result: Result<(Vec<OathRow>, usize), TransportError>,
+        password: zeroize::Zeroizing<String>,
+    ) {
         // The typed password is consumed whatever the outcome — success,
         // wrong-password, or a transport error must not leave it buffered for
         // an automatic retry against (potentially) a different key.
@@ -3454,12 +3563,16 @@ impl App {
         }
         match result {
             Ok((rows, skipped)) => {
+                // The applet accepted this password (or needed none): retain
+                // it for on-demand reads against the same selection.
+                app.oath.unlocked_password = Some(password);
                 app.oath.creds = rows;
                 app.oath.skipped = skipped;
                 app.oath.loaded = true;
                 app.oath.locked = false;
             }
             Err(TransportError::OathPasswordRejected) => {
+                app.oath.unlocked_password = None;
                 app.oath.locked = true;
                 // The add modal already shows this; don't double-report when it
                 // is the one that failed.
@@ -3468,6 +3581,8 @@ impl App {
                 }
             }
             Err(e) => {
+                // A transport error says nothing about the password; keep any
+                // retained copy so a transient failure doesn't force a retype.
                 if !modal_busy {
                     app.oath.error = Some(e.to_string());
                 }
@@ -3483,7 +3598,7 @@ impl App {
             self.oath.error = Some("no OATH key selected".into());
             return;
         };
-        let password = zeroize::Zeroizing::new(self.oath.password_input.clone());
+        let password = oath_effective_password(&self.oath);
         let for_device = self.selected_device.clone();
         self.spawn_job("Reading OATH codes\u{2026}", move || {
             let result = Self::oath_open_unlock(&name, &password)
@@ -3493,7 +3608,7 @@ impl App {
                 // can block on a touch) was in flight — device B's pane must
                 // not show device A's codes.
                 if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                    Self::apply_oath_rows(app, result);
+                    Self::apply_oath_rows(app, result, password);
                 }
             })
         });
@@ -3520,9 +3635,10 @@ impl App {
             keyroost_oath::OathType::Hotp
         };
         let require_touch = self.oath.add.require_touch;
-        let password = zeroize::Zeroizing::new(self.oath.password_input.clone());
+        let password = oath_effective_password(&self.oath);
         // The form stays open showing the spinner; it is wiped/closed on the
         // modal's Done (success) or Cancel/✕/Esc. Do not reset it here.
+        let for_device = self.selected_device.clone();
         self.spawn_job("Adding credential\u{2026}", move || {
             let result = (|| -> Result<(Vec<OathRow>, usize), TransportError> {
                 let mut session = Self::oath_open_unlock(&name, &password)?;
@@ -3537,7 +3653,11 @@ impl App {
                 })?;
                 Self::oath_list_rows(&mut session)
             })();
-            Box::new(move |app: &mut App| Self::apply_oath_rows(app, result))
+            Box::new(move |app: &mut App| {
+                if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    Self::apply_oath_rows(app, result, password);
+                }
+            })
         });
     }
 
@@ -3549,14 +3669,19 @@ impl App {
             return;
         };
         let cred_name = name.to_owned();
-        let password = zeroize::Zeroizing::new(self.oath.password_input.clone());
+        let password = oath_effective_password(&self.oath);
+        let for_device = self.selected_device.clone();
         self.spawn_job("Deleting credential\u{2026}", move || {
             let result = (|| -> Result<(Vec<OathRow>, usize), TransportError> {
                 let mut session = Self::oath_open_unlock(&reader, &password)?;
                 session.delete(&cred_name)?;
                 Self::oath_list_rows(&mut session)
             })();
-            Box::new(move |app: &mut App| Self::apply_oath_rows(app, result))
+            Box::new(move |app: &mut App| {
+                if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    Self::apply_oath_rows(app, result, password);
+                }
+            })
         });
     }
 
@@ -4614,6 +4739,7 @@ impl App {
         self.security_keys.info = None;
         self.security_keys.init = None;
         self.security_keys.session = None;
+        self.security_keys.session_device = None;
         self.security_keys.error = None;
         // Large-blob state is per-key; drop it so the next key auto-loads fresh.
         self.security_keys.large_blobs = None;
@@ -4625,11 +4751,25 @@ impl App {
         self.security_keys.lb_status = None;
         self.security_keys.lb_confirm_delete = None;
         self.security_keys.lb_confirm_clear = false;
+        // Fingerprint state is per-key: the cached list, the pending delete /
+        // rename, the name draft, and a live enroll wizard must not carry
+        // over (KEY-012). A running enroll worker is told to cancel; it
+        // aborts at the next KEEPALIVE.
+        self.security_keys.fingerprints = None;
+        self.security_keys.fp_new_name.clear();
+        self.security_keys.fp_confirm_delete = None;
+        self.security_keys.fp_rename = None;
+        if let Some(p) = self.security_keys.fp_progress.take() {
+            if let Ok(g) = p.lock() {
+                g.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         self.oath.creds.clear();
         self.oath.skipped = 0;
         self.oath.loaded = false;
         self.oath.locked = false;
         self.oath.error = None;
+        self.oath.unlocked_password = None;
         self.openpgp.status = None;
         self.openpgp.loaded = false;
         self.openpgp.error = None;
@@ -8395,7 +8535,7 @@ impl App {
             self.security_keys.lb_status = Some("No FIDO key selected.".into());
             return;
         };
-        let Some(session) = self.security_keys.session.as_ref() else {
+        let Some(session) = self.fido_session() else {
             self.security_keys.lb_status =
                 Some("Unlock the key with your PIN first to add data.".into());
             return;
@@ -8406,6 +8546,7 @@ impl App {
         // never loaded).
         let loaded = self.security_keys.large_blobs.clone();
 
+        let for_device = self.selected_device.clone();
         self.spawn_job("Saving to large blobs\u{2026}", move || {
             let result = (|| -> Result<
                 (
@@ -8446,21 +8587,26 @@ impl App {
                 Ok((array, cap))
             })();
 
-            Box::new(move |app: &mut App| match result {
-                Ok((array, cap)) => {
-                    let n = array.entries.len();
-                    app.security_keys.large_blobs = Some(array);
-                    app.security_keys.lb_capacity = Some(cap);
-                    app.security_keys.lb_new_text.clear();
-                    app.security_keys.lb_show_add = false;
-                    app.security_keys.lb_status = Some(format!(
-                        "Saved. {n} entr{} total.",
-                        if n == 1 { "y" } else { "ies" }
-                    ));
-                    app.security_keys.error = None;
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // selection changed mid-op; discard the stale completion
                 }
-                Err(e) => {
-                    app.security_keys.lb_status = Some(format!("Save failed: {e}"));
+                match result {
+                    Ok((array, cap)) => {
+                        let n = array.entries.len();
+                        app.security_keys.large_blobs = Some(array);
+                        app.security_keys.lb_capacity = Some(cap);
+                        app.security_keys.lb_new_text.clear();
+                        app.security_keys.lb_show_add = false;
+                        app.security_keys.lb_status = Some(format!(
+                            "Saved. {n} entr{} total.",
+                            if n == 1 { "y" } else { "ies" }
+                        ));
+                        app.security_keys.error = None;
+                    }
+                    Err(e) => {
+                        app.security_keys.lb_status = Some(format!("Save failed: {e}"));
+                    }
                 }
             })
         });
@@ -8473,13 +8619,14 @@ impl App {
             self.security_keys.lb_status = Some("No FIDO key selected.".into());
             return;
         };
-        let Some(session) = self.security_keys.session.as_ref() else {
+        let Some(session) = self.fido_session() else {
             self.security_keys.lb_status =
                 Some("Unlock the key with your PIN first to edit notes.".into());
             return;
         };
         let pin = session.pin.clone();
 
+        let for_device = self.selected_device.clone();
         self.spawn_job("Saving edit to large blobs\u{2026}", move || {
             let result = (|| -> Result<
                 (
@@ -8521,17 +8668,22 @@ impl App {
                 Ok((array, cap))
             })();
 
-            Box::new(move |app: &mut App| match result {
-                Ok((array, cap)) => {
-                    app.security_keys.large_blobs = Some(array);
-                    app.security_keys.lb_capacity = Some(cap);
-                    app.security_keys.lb_editing = None;
-                    app.security_keys.lb_edit_text.clear();
-                    app.security_keys.lb_status = Some("Note updated.".into());
-                    app.security_keys.error = None;
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // selection changed mid-op; discard the stale completion
                 }
-                Err(e) => {
-                    app.security_keys.lb_status = Some(format!("Edit failed: {e}"));
+                match result {
+                    Ok((array, cap)) => {
+                        app.security_keys.large_blobs = Some(array);
+                        app.security_keys.lb_capacity = Some(cap);
+                        app.security_keys.lb_editing = None;
+                        app.security_keys.lb_edit_text.clear();
+                        app.security_keys.lb_status = Some("Note updated.".into());
+                        app.security_keys.error = None;
+                    }
+                    Err(e) => {
+                        app.security_keys.lb_status = Some(format!("Edit failed: {e}"));
+                    }
                 }
             })
         });
@@ -8589,7 +8741,7 @@ impl App {
         let Some(array) = self.security_keys.large_blobs.clone() else {
             return;
         };
-        let Some(session) = self.security_keys.session.as_ref() else {
+        let Some(session) = self.fido_session() else {
             self.security_keys.lb_status =
                 Some("Unlock the key with your PIN first to modify large blobs.".into());
             return;
@@ -8606,6 +8758,7 @@ impl App {
         // of `add_large_blob_note` / `edit_large_blob_note` / the CLI delete.
         let target_entry = array.entries[idx].clone();
 
+        let for_device = self.selected_device.clone();
         self.spawn_job("Updating large blobs\u{2026}", move || {
             let result = (|| -> Result<
                 (
@@ -8655,17 +8808,23 @@ impl App {
                 Ok((array, cap))
             })();
 
-            Box::new(move |app: &mut App| match result {
-                Ok((array, cap)) => {
-                    let n = array.entries.len();
-                    app.security_keys.large_blobs = Some(array);
-                    app.security_keys.lb_capacity = Some(cap);
-                    app.security_keys.lb_selected = None;
-                    app.security_keys.lb_status = Some(format!("Entry deleted. {n} remaining."));
-                    app.security_keys.error = None;
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // selection changed mid-op; discard the stale completion
                 }
-                Err(e) => {
-                    app.security_keys.lb_status = Some(format!("Update failed: {e}"));
+                match result {
+                    Ok((array, cap)) => {
+                        let n = array.entries.len();
+                        app.security_keys.large_blobs = Some(array);
+                        app.security_keys.lb_capacity = Some(cap);
+                        app.security_keys.lb_selected = None;
+                        app.security_keys.lb_status =
+                            Some(format!("Entry deleted. {n} remaining."));
+                        app.security_keys.error = None;
+                    }
+                    Err(e) => {
+                        app.security_keys.lb_status = Some(format!("Update failed: {e}"));
+                    }
                 }
             })
         });
@@ -8684,7 +8843,7 @@ impl App {
         if self.security_keys.large_blobs.is_none() {
             return;
         }
-        let Some(session) = self.security_keys.session.as_ref() else {
+        let Some(session) = self.fido_session() else {
             self.security_keys.lb_status =
                 Some("Unlock the key with your PIN first to modify large blobs.".into());
             return;
@@ -8695,6 +8854,7 @@ impl App {
         // the worker.
         let new_entries = Vec::new();
 
+        let for_device = self.selected_device.clone();
         self.spawn_job("Clearing large blobs\u{2026}", move || {
             let result = (|| -> Result<
                 (
@@ -8731,18 +8891,23 @@ impl App {
                 Ok((array, cap))
             })();
 
-            Box::new(move |app: &mut App| match result {
-                Ok((array, cap)) => {
-                    let n = array.entries.len();
-                    app.security_keys.large_blobs = Some(array);
-                    app.security_keys.lb_capacity = Some(cap);
-                    app.security_keys.lb_selected = None;
-                    app.security_keys.lb_status =
-                        Some(format!("Storage cleared. {n} entries remaining."));
-                    app.security_keys.error = None;
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // selection changed mid-op; discard the stale completion
                 }
-                Err(e) => {
-                    app.security_keys.lb_status = Some(format!("Clear failed: {e}"));
+                match result {
+                    Ok((array, cap)) => {
+                        let n = array.entries.len();
+                        app.security_keys.large_blobs = Some(array);
+                        app.security_keys.lb_capacity = Some(cap);
+                        app.security_keys.lb_selected = None;
+                        app.security_keys.lb_status =
+                            Some(format!("Storage cleared. {n} entries remaining."));
+                        app.security_keys.error = None;
+                    }
+                    Err(e) => {
+                        app.security_keys.lb_status = Some(format!("Clear failed: {e}"));
+                    }
                 }
             })
         });
@@ -12757,6 +12922,7 @@ mod tests {
                 }],
                 0,
             )),
+            zeroize::Zeroizing::new(String::new()),
         );
         assert!(!app.oath.add.busy);
         assert_eq!(app.oath.add.result, Some(Ok(())));
@@ -12767,14 +12933,22 @@ mod tests {
         let mut app = App::default();
         app.oath.add = OathAddDialog::opened();
         app.oath.add.busy = true;
-        App::apply_oath_rows(&mut app, Err(TransportError::OathPasswordRejected));
+        App::apply_oath_rows(
+            &mut app,
+            Err(TransportError::OathPasswordRejected),
+            zeroize::Zeroizing::new(String::new()),
+        );
         assert!(!app.oath.add.busy);
         assert_eq!(app.oath.add.result, Some(Err("wrong OATH password".into())));
         assert!(app.oath.error.is_none());
 
         // No modal open: the pane-level error path still works (unlock/refresh).
         let mut app = App::default();
-        App::apply_oath_rows(&mut app, Err(TransportError::OathPasswordRejected));
+        App::apply_oath_rows(
+            &mut app,
+            Err(TransportError::OathPasswordRejected),
+            zeroize::Zeroizing::new(String::new()),
+        );
         assert!(!app.oath.add.open);
         assert!(app.oath.locked);
         assert_eq!(app.oath.error.as_deref(), Some("wrong OATH password"));
@@ -13083,5 +13257,72 @@ mod tests {
         });
         app.on_device_selected();
         assert!(app.security_keys.advanced.is_none());
+    }
+
+    /// KEY-012: a selection change severs the FIDO session binding and every
+    /// piece of pending fingerprint state, and signals cancel to a live
+    /// enroll worker.
+    #[test]
+    fn selection_change_clears_fido_session_binding_and_fingerprint_state() {
+        let mut app = App::default();
+        app.security_keys.session_device = Some("serial:AAA".into());
+        app.security_keys.fingerprints = Some(Vec::new());
+        app.security_keys.fp_new_name = "index".into();
+        app.security_keys.fp_confirm_delete = Some(vec![1, 2]);
+        app.security_keys.fp_rename = Some((vec![1, 2], "thumb".into()));
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(EnrollProgress::default()));
+        let cancel = progress.lock().unwrap().cancel.clone();
+        app.security_keys.fp_progress = Some(progress);
+
+        app.on_device_selected();
+
+        assert!(app.security_keys.session_device.is_none());
+        assert!(app.security_keys.fingerprints.is_none());
+        assert!(app.security_keys.fp_new_name.is_empty());
+        assert!(app.security_keys.fp_confirm_delete.is_none());
+        assert!(app.security_keys.fp_rename.is_none());
+        assert!(app.security_keys.fp_progress.is_none());
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "an in-flight enroll must be told to cancel"
+        );
+    }
+
+    /// The HOTP-read regression: a successful listing consumes the typed
+    /// password but retains the accepted copy, so a later on-demand HOTP
+    /// read can still unlock the protected applet.
+    #[test]
+    fn oath_listing_retains_the_accepted_password_for_on_demand_reads() {
+        let mut app = App::default();
+        app.oath.password_input = "hunter2".into();
+        let password = oath_effective_password(&app.oath);
+        assert_eq!(&*password, "hunter2", "typed entry wins while present");
+
+        App::apply_oath_rows(&mut app, Ok((Vec::new(), 0)), password);
+        assert!(
+            app.oath.password_input.is_empty(),
+            "typed entry is consumed"
+        );
+        assert_eq!(
+            app.oath.unlocked_password.as_deref().map(String::as_str),
+            Some("hunter2"),
+            "the accepted password is retained for on-demand reads"
+        );
+        // …which is exactly what read_hotp_code will now pick up:
+        assert_eq!(&*oath_effective_password(&app.oath), "hunter2");
+    }
+
+    /// A rejected password is never retained (and re-locks the pane).
+    #[test]
+    fn oath_rejected_password_is_not_retained() {
+        let mut app = App::default();
+        app.oath.unlocked_password = Some(zeroize::Zeroizing::new("stale".into()));
+        App::apply_oath_rows(
+            &mut app,
+            Err(TransportError::OathPasswordRejected),
+            zeroize::Zeroizing::new("wrong".into()),
+        );
+        assert!(app.oath.unlocked_password.is_none());
+        assert!(app.oath.locked);
     }
 }
