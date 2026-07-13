@@ -185,6 +185,46 @@ fn request_is_sensitive(apdu: &[u8]) -> bool {
         && matches!(apdu.get(3), Some(0x02) | Some(0x00))
 }
 
+/// Build the APDU to resend after a `6C xx` ("wrong Le") status word.
+///
+/// ISO 7816-4: `6C xx` tells the host to reissue the *same* command with
+/// `Le = xx`. Where that Le goes depends on the case of the original APDU:
+///
+/// * case 1 (bare 4-byte header, e.g. ERASE_ALL): **append** Le → case 2;
+/// * case 2 (header + Le, e.g. GET_ECDH_PUBKEY / READ_CONFIG / GET RESPONSE):
+///   **replace** the trailing Le byte — appending would produce the malformed
+///   `… Le_old Le_new`;
+/// * case 3 (header + Lc + data, e.g. WRITE_SEED / ENUM_CODES / SELECT —
+///   `keyroost_token2otp::build_apdu` appends no Le): **append** Le → case 4.
+///   The last byte here is *data* (seed ciphertext, an account-name byte) and
+///   must never be overwritten;
+/// * case 4 (header + Lc + data + Le): **replace** the trailing Le byte.
+///
+/// Classification is by structure, not length: only an APDU that provably
+/// ends in Le gets its last byte replaced. Every Token2 OTP body command is
+/// short-form (bodies are well under 256 bytes); an extended-form APDU
+/// (`Lc = 00 hi lo`, unused in practice) never matches the case-4 length
+/// check and safely falls through to append.
+fn resend_with_le(original: &[u8], le: u8) -> Vec<u8> {
+    let mut out = original.to_vec();
+    let ends_in_le = match out.len() {
+        0..=4 => false, // case 1 (or truncated): nothing to replace
+        5 => true,      // case 2: the 5th byte is Le
+        n => {
+            // Short-form body APDU: header + Lc + `Lc` data bytes (case 3),
+            // or the same plus one trailing Le (case 4).
+            let lc = out[4] as usize;
+            n == 5 + lc + 1
+        }
+    };
+    if ends_in_le {
+        *out.last_mut().unwrap() = le;
+    } else {
+        out.push(le);
+    }
+    out
+}
+
 /// USB-HID transport for the Token2 OTP applet (spec §4).
 pub struct HidOtpTransport {
     io: HidIo,
@@ -620,21 +660,12 @@ impl PcScOtpTransport {
                             "card kept answering 6C to the corrected Le",
                         )));
                     }
-                    let le = sw_bytes[1];
-                    // Re-send with the card-suggested Le. Per ISO 7816, 6C is
-                    // only returned to a command that carried Le (case 2, e.g.
-                    // GET_PUBKEY / READ_CONFIG), so replace that trailing byte
-                    // rather than appending a second one — appending produced
-                    // `… Le_old Le_new`, a malformed APDU. (Mirrors the CTAP
-                    // PC/SC path. A bare 4-byte case-1 header — e.g.
-                    // ERASE_ALL — falls back to appending, forming valid
-                    // case 2.)
-                    to_send = apdu.to_vec();
-                    if to_send.len() >= 5 {
-                        *to_send.last_mut().unwrap() = le;
-                    } else {
-                        to_send.push(le);
-                    }
+                    // Re-send the *original* command with the card-suggested
+                    // Le, attached according to the APDU's ISO 7816 case —
+                    // see `resend_with_le`. Replacing the last byte of a
+                    // body-carrying (case 3) command would corrupt its final
+                    // data byte.
+                    to_send = resend_with_le(apdu, sw_bytes[1]);
                     acc.clear(); // the 6C response carried no data
                     chunks = 0;
                     continue;
@@ -1149,5 +1180,71 @@ mod trace_redaction_tests {
         assert!(!request_is_sensitive(&cmd::GET_ECDH_PUBKEY));
         assert!(!request_is_sensitive(&cmd::READ_CONFIG));
         assert!(!request_is_sensitive(&[0x00, 0xA4, 0x04, 0x00]));
+    }
+}
+
+#[cfg(test)]
+mod le_retry_tests {
+    use super::*;
+
+    #[test]
+    fn case_2_replaces_the_trailing_le() {
+        // READ_CONFIG is header + Le (case 2): 80 C5 02 00 40.
+        let apdu = t2::read_config(64);
+        assert_eq!(
+            resend_with_le(&apdu, 0x0A),
+            vec![0x80, 0xC5, 0x02, 0x00, 0x0A]
+        );
+        // GET RESPONSE (00 C0 00 00 Le) is also case 2.
+        assert_eq!(
+            resend_with_le(&[0x00, 0xC0, 0x00, 0x00, 0x20], 0x08),
+            vec![0x00, 0xC0, 0x00, 0x00, 0x08]
+        );
+    }
+
+    #[test]
+    fn case_3_appends_le_and_keeps_the_body_intact() {
+        // WRITE_SEED with a body is case 3 — header + Lc + data, no trailing
+        // Le (keyroost_token2otp::build_apdu appends none). Its last byte is
+        // *data*; the branch regression overwrote it (seed ciphertext /
+        // account-name byte) on a 6C retry.
+        let body = [0xAA; 16];
+        let apdu = t2::build_apdu(cmd::WRITE_SEED, &body);
+        let resent = resend_with_le(&apdu, 0x2A);
+        let mut expected = apdu.clone();
+        expected.push(0x2A);
+        assert_eq!(resent, expected);
+        assert_eq!(resent[resent.len() - 2], 0xAA); // last body byte survived
+
+        // ENUM_CODES (subcommand + timestamp body) likewise appends.
+        let apdu = t2::build_apdu(cmd::ENUM_CODES, &serialize_enum_all(0x1122_3344));
+        let mut expected = apdu.clone();
+        expected.push(0x10);
+        assert_eq!(resend_with_le(&apdu, 0x10), expected);
+
+        // SELECT (header + Lc + AID) is case 3 too.
+        let apdu = t2::build_select(&t2::OTP_APPLET_AID);
+        let mut expected = apdu.clone();
+        expected.push(0x00);
+        assert_eq!(resend_with_le(&apdu, 0x00), expected);
+    }
+
+    #[test]
+    fn case_1_appends_le_forming_case_2() {
+        // ERASE_ALL is a bare 4-byte header (case 1).
+        assert_eq!(
+            resend_with_le(&t2::erase_all(), 0x00),
+            vec![0x80, 0xC5, 0x05, 0x02, 0x00]
+        );
+    }
+
+    #[test]
+    fn case_4_replaces_the_trailing_le() {
+        // header + Lc(2) + 2 data bytes + Le: len == 5 + Lc + 1 ends in Le.
+        let apdu = [0x80, 0xC5, 0x05, 0x00, 0x02, 0x03, 0x07, 0x10];
+        assert_eq!(
+            resend_with_le(&apdu, 0x40),
+            vec![0x80, 0xC5, 0x05, 0x00, 0x02, 0x03, 0x07, 0x40]
+        );
     }
 }
