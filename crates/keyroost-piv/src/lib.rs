@@ -407,6 +407,25 @@ impl core::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// A PIN/PUK value the fixed 8-byte PIV field can't represent (SP 800-73:
+/// 6–8 bytes, `0xFF`-padded). Returned instead of padding or truncating: a
+/// truncated value would build a VERIFY/CHANGE for a *different*,
+/// valid-length secret and burn a retry against the card. Only the length is
+/// captured — never the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinLengthError {
+    /// The rejected length, in bytes.
+    pub len: usize,
+}
+
+impl core::fmt::Display for PinLengthError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "PIV PIN/PUK must be 6-8 bytes (got {})", self.len)
+    }
+}
+
+impl std::error::Error for PinLengthError {}
+
 // ---------------------------------------------------------------------------
 // APDU builders
 // ---------------------------------------------------------------------------
@@ -448,16 +467,16 @@ pub fn get_data(tag: &[u8]) -> Vec<u8> {
 }
 
 /// VERIFY the application PIN. The PIN is padded to 8 bytes with `0xFF` per
-/// SP 800-73. The PIN bytes come from the caller and are never logged.
-#[must_use]
-pub fn verify_pin(pin: &[u8]) -> Vec<u8> {
-    build_apdu(
+/// SP 800-73 and must be 6–8 bytes ([`PinLengthError`] otherwise). The PIN
+/// bytes come from the caller and are never logged.
+pub fn verify_pin(pin: &[u8]) -> Result<Vec<u8>, PinLengthError> {
+    Ok(build_apdu(
         0x00,
         Instruction::Verify.code(),
         0x00,
         PIN_REF_APPLICATION,
-        &pad_pin(pin),
-    )
+        &pad_pin(pin)?,
+    ))
 }
 
 /// VERIFY with an empty body — queries the PIN retry counter without consuming a
@@ -678,33 +697,33 @@ pub fn encode_certificate(der: &[u8]) -> Vec<u8> {
 }
 
 /// CHANGE REFERENCE DATA: change the PIN (`PIN_REF_APPLICATION`) or PUK
-/// (`PIN_REF_PUK`) from `old` to `new`. Both are padded to 8 bytes.
-#[must_use]
-pub fn change_reference(reference: u8, old: &[u8], new: &[u8]) -> Vec<u8> {
-    let mut body = pad_pin(old);
-    body.extend_from_slice(&pad_pin(new));
-    build_apdu(
+/// (`PIN_REF_PUK`) from `old` to `new`. Both are padded to 8 bytes and must be
+/// 6–8 bytes ([`PinLengthError`] otherwise).
+pub fn change_reference(reference: u8, old: &[u8], new: &[u8]) -> Result<Vec<u8>, PinLengthError> {
+    let mut body = pad_pin(old)?;
+    body.extend_from_slice(&pad_pin(new)?);
+    Ok(build_apdu(
         0x00,
         Instruction::ChangeReference.code(),
         0x00,
         reference,
         &body,
-    )
+    ))
 }
 
 /// RESET RETRY COUNTER: unblock the PIN using the PUK, setting a new PIN. Both
-/// `puk` and `new_pin` are padded to 8 bytes.
-#[must_use]
-pub fn unblock_pin(puk: &[u8], new_pin: &[u8]) -> Vec<u8> {
-    let mut body = pad_pin(puk);
-    body.extend_from_slice(&pad_pin(new_pin));
-    build_apdu(
+/// `puk` and `new_pin` are padded to 8 bytes and must be 6–8 bytes
+/// ([`PinLengthError`] otherwise).
+pub fn unblock_pin(puk: &[u8], new_pin: &[u8]) -> Result<Vec<u8>, PinLengthError> {
+    let mut body = pad_pin(puk)?;
+    body.extend_from_slice(&pad_pin(new_pin)?);
+    Ok(build_apdu(
         0x00,
         Instruction::ResetRetryCounter.code(),
         0x00,
         PIN_REF_APPLICATION,
         &body,
-    )
+    ))
 }
 
 /// Yubico SET MANAGEMENT KEY: replace the 9B card-management key. `require_touch`
@@ -779,20 +798,17 @@ pub fn clear_certificate(slot: Slot) -> Vec<u8> {
 /// PIV PINs and PUKs are 6–8 bytes (SP 800-73). An over-length value must never
 /// be silently truncated: that would build a VERIFY/CHANGE for a *different*,
 /// valid-length secret than the caller supplied and burn a retry against the
-/// card. Callers validate length first (the transport layer's `check_pin_len`);
-/// this asserts the same 6–8 contract so a direct byte-layer consumer that skips
-/// validation fails loudly here instead of transmitting the wrong secret.
-fn pad_pin(pin: &[u8]) -> Zeroizing<Vec<u8>> {
-    assert!(
-        (6..=8).contains(&pin.len()),
-        "PIV PIN/PUK must be 6-8 bytes (got {})",
-        pin.len()
-    );
+/// card. This crate is a published byte layer, so a direct consumer that skips
+/// its own validation gets a typed [`PinLengthError`] here instead of an abort.
+fn pad_pin(pin: &[u8]) -> Result<Zeroizing<Vec<u8>>, PinLengthError> {
+    if !(6..=8).contains(&pin.len()) {
+        return Err(PinLengthError { len: pin.len() });
+    }
     // Zeroizing so this padded secret (and any body built from it) is wiped on
     // drop; the final APDU is wrapped in Zeroizing by the transport layer.
     let mut out = Zeroizing::new(vec![0xFFu8; 8]);
     out[..pin.len()].copy_from_slice(pin);
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -966,7 +982,7 @@ mod tests {
     fn verify_pin_pads_to_eight() {
         // 00 20 00 80 08 31 32 33 34 35 36 FF FF   ("123456" + FF FF)
         assert_eq!(
-            verify_pin(b"123456"),
+            verify_pin(b"123456").unwrap(),
             vec![0x00, 0x20, 0x00, 0x80, 0x08, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0xFF, 0xFF]
         );
     }
@@ -1114,7 +1130,7 @@ mod tests {
     #[test]
     fn change_pin_bytes() {
         // 00 24 00 80 10 <old pad8> <new pad8>
-        let apdu = change_reference(PIN_REF_APPLICATION, b"123456", b"654321");
+        let apdu = change_reference(PIN_REF_APPLICATION, b"123456", b"654321").unwrap();
         assert_eq!(&apdu[..5], &[0x00, 0x24, 0x00, 0x80, 0x10]);
         assert_eq!(
             &apdu[5..],
@@ -1127,7 +1143,7 @@ mod tests {
 
     #[test]
     fn unblock_pin_bytes() {
-        let apdu = unblock_pin(b"12345678", b"000000");
+        let apdu = unblock_pin(b"12345678", b"000000").unwrap();
         assert_eq!(&apdu[..5], &[0x00, 0x2C, 0x00, 0x80, 0x10]);
         assert_eq!(&apdu[5..13], b"12345678");
         assert_eq!(
@@ -1339,7 +1355,7 @@ mod tests {
     #[test]
     fn pad_pin_pads_short_within_range() {
         // A 6-byte PIN is 0xFF-padded to the fixed 8-byte field.
-        let apdu = verify_pin(b"123456");
+        let apdu = verify_pin(b"123456").unwrap();
         assert_eq!(
             &apdu[5..],
             &[0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0xFF, 0xFF]
@@ -1347,12 +1363,33 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "6-8 bytes")]
     fn pad_pin_rejects_over_length_instead_of_truncating() {
         // A >8-byte value must never be silently truncated into a different,
-        // valid-length PIN — that would build a VERIFY for the wrong secret and
-        // burn a retry against the card. Fail loudly instead.
-        let _ = verify_pin(b"1234567890");
+        // valid-length PIN — that would build a VERIFY for the wrong secret
+        // and burn a retry against the card. This crate is published, so the
+        // contract is a typed error, not a process abort.
+        assert_eq!(
+            verify_pin(b"1234567890").unwrap_err(),
+            PinLengthError { len: 10 }
+        );
+    }
+
+    #[test]
+    fn pin_length_boundaries_error_instead_of_panicking() {
+        // 6 and 8 are the inclusive SP 800-73 bounds; everything outside is a
+        // typed error from every PIN-carrying builder.
+        for bad in [&b""[..], b"12345", b"123456789"] {
+            assert_eq!(
+                verify_pin(bad).unwrap_err(),
+                PinLengthError { len: bad.len() }
+            );
+            assert!(change_reference(PIN_REF_APPLICATION, bad, b"654321").is_err());
+            assert!(change_reference(PIN_REF_APPLICATION, b"123456", bad).is_err());
+            assert!(unblock_pin(bad, b"000000").is_err());
+            assert!(unblock_pin(b"12345678", bad).is_err());
+        }
+        assert!(verify_pin(b"123456").is_ok());
+        assert!(verify_pin(b"12345678").is_ok());
     }
 
     #[test]

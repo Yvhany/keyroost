@@ -215,12 +215,13 @@ impl PivSession {
     }
 
     /// Present the PIV application PIN. Required before private-key use and
-    /// set-pin-retries. The PIN must be 6–8 bytes — the byte layer pads/truncates
-    /// to the card's fixed 8-byte field, so an unchecked over-length PIN would
-    /// silently verify (and store) something other than what the user typed.
+    /// set-pin-retries. The PIN must be 6–8 bytes — the byte layer returns a
+    /// typed error on anything else rather than pad/truncate, so an unchecked
+    /// over-length PIN can never silently verify (and store) something other
+    /// than what the user typed, and no retry counter is consumed.
     pub fn verify_pin(&mut self, pin: &[u8]) -> Result<(), TransportError> {
-        check_pin_len(pin)?;
-        let apdu = Zeroizing::new(piv::verify_pin(pin));
+        let apdu =
+            Zeroizing::new(piv::verify_pin(pin).map_err(|_| TransportError::PivBadPinLength)?);
         let (_, sw) = self.transmit_full(&apdu)?;
         map_pin_sw(sw)
     }
@@ -228,9 +229,10 @@ impl PivSession {
     /// Change the PIV PIN. A wrong `old` PIN consumes a try and reports the
     /// remaining count. Both PINs must be 6–8 bytes.
     pub fn change_pin(&mut self, old: &[u8], new: &[u8]) -> Result<(), TransportError> {
-        check_pin_len(old)?;
-        check_pin_len(new)?;
-        let apdu = Zeroizing::new(piv::change_reference(piv::PIN_REF_APPLICATION, old, new));
+        let apdu = Zeroizing::new(
+            piv::change_reference(piv::PIN_REF_APPLICATION, old, new)
+                .map_err(|_| TransportError::PivBadPinLength)?,
+        );
         let (_, sw) = self.transmit_full(&apdu)?;
         map_pin_sw(sw)
     }
@@ -238,9 +240,10 @@ impl PivSession {
     /// Change the PUK. A wrong `old` PUK consumes a try and reports the count.
     /// Both PUKs must be 6–8 bytes.
     pub fn change_puk(&mut self, old: &[u8], new: &[u8]) -> Result<(), TransportError> {
-        check_pin_len(old)?;
-        check_pin_len(new)?;
-        let apdu = Zeroizing::new(piv::change_reference(piv::PIN_REF_PUK, old, new));
+        let apdu = Zeroizing::new(
+            piv::change_reference(piv::PIN_REF_PUK, old, new)
+                .map_err(|_| TransportError::PivBadPinLength)?,
+        );
         let (_, sw) = self.transmit_full(&apdu)?;
         map_pin_sw(sw)
     }
@@ -248,9 +251,9 @@ impl PivSession {
     /// Unblock a blocked PIN using the PUK, setting a new PIN. A wrong PUK
     /// consumes a try and reports the remaining count. Both must be 6–8 bytes.
     pub fn unblock_pin(&mut self, puk: &[u8], new_pin: &[u8]) -> Result<(), TransportError> {
-        check_pin_len(puk)?;
-        check_pin_len(new_pin)?;
-        let apdu = Zeroizing::new(piv::unblock_pin(puk, new_pin));
+        let apdu = Zeroizing::new(
+            piv::unblock_pin(puk, new_pin).map_err(|_| TransportError::PivBadPinLength)?,
+        );
         let (_, sw) = self.transmit_full(&apdu)?;
         map_pin_sw(sw)
     }
@@ -534,17 +537,6 @@ fn public_key_from_metadata(raw: &[u8]) -> Result<PublicKey, keyroost_piv::Parse
             exponent: e.to_vec(),
         }),
         _ => Err(keyroost_piv::ParseError::NotPublicKey),
-    }
-}
-
-/// Reject PIN/PUK values the card field can't represent (SP 800-73-4 fixes the
-/// field at 8 bytes, 0xFF-padded; 6 is the universal minimum). Checked here so
-/// every front-end gets it, before a retry counter is consumed.
-fn check_pin_len(pin: &[u8]) -> Result<(), TransportError> {
-    if (6..=8).contains(&pin.len()) {
-        Ok(())
-    } else {
-        Err(TransportError::PivBadPinLength)
     }
 }
 
