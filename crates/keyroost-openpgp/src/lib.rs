@@ -864,6 +864,31 @@ fn strip_leading_zero(field: &[u8]) -> &[u8] {
     }
 }
 
+/// The key's public exponent is wider than the exponent field the card
+/// declared in its algorithm attributes, so the import cannot be built
+/// faithfully — truncating would import a *different* key. `e_bits` is
+/// device-supplied, so a buggy or hostile card can force this; it must
+/// surface as an error, never a panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExponentTooWide {
+    /// Minimal big-endian byte length of the key's exponent.
+    pub e_len: usize,
+    /// Byte width of the card-declared field: `(e_bits + 7) / 8`.
+    pub field_len: usize,
+}
+
+impl core::fmt::Display for ExponentTooWide {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "RSA exponent ({} bytes) is wider than the card's declared exponent field ({} bytes)",
+            self.e_len, self.field_len
+        )
+    }
+}
+
+impl std::error::Error for ExponentTooWide {}
+
 /// Right-justify the public exponent into a fixed `reqlen`-byte field,
 /// zero-padding on the left.
 ///
@@ -871,30 +896,30 @@ fn strip_leading_zero(field: &[u8]) -> &[u8] {
 /// algorithm attributes; the import must present exactly `(e_bits + 7) / 8`
 /// bytes (GnuPG does the same — see `build_privkey_template`). For the usual
 /// `e = 65537` and a card declaring `e_bits = 32` this turns `01 00 01` into
-/// `00 01 00 01`. If the (minimal) exponent is already at least `reqlen` bytes
-/// its low `reqlen` bytes are used unchanged.
-fn pad_exponent(e: &[u8], reqlen: usize) -> Vec<u8> {
+/// `00 01 00 01`. An exponent wider than the declared field can't be imported
+/// faithfully — truncating it would import a *different* key — and `reqlen`
+/// derives from the device-supplied `e_bits`, so that case is a typed
+/// [`ExponentTooWide`] error, never a panic.
+fn pad_exponent(e: &[u8], reqlen: usize) -> Result<Vec<u8>, ExponentTooWide> {
     let e = strip_leading_zero(e);
-    // An exponent wider than the card's declared field can't be imported
-    // faithfully — truncating it would import a *different* key. `reqlen` is
-    // derived from the card's declared `e_bits`, so a malformed/hostile
-    // attribute could make this fire; callers with a device-supplied `e_bits`
-    // must gate on [`rsa_exponent_fits`] first (the transport layer does).
-    assert!(
-        e.len() <= reqlen,
-        "RSA exponent is wider than the card's declared exponent field"
-    );
+    if e.len() > reqlen {
+        return Err(ExponentTooWide {
+            e_len: e.len(),
+            field_len: reqlen,
+        });
+    }
     let mut out = vec![0u8; reqlen];
     out[reqlen - e.len()..].copy_from_slice(e);
-    out
+    Ok(out)
 }
 
 /// True when exponent `e` fits the card's declared exponent field, `e_bits`
-/// wide. [`import_rsa_key`] / [`extended_header_list`] **panic** when it does
-/// not, so a caller passing a device-supplied `e_bits` (e.g. from
-/// [`parse_rsa_algorithm_attributes`]) must check this first and reject — a
-/// card advertising an implausibly small exponent field would otherwise abort
-/// the process mid-import.
+/// wide. Cheap pre-check for callers that want to reject a device-supplied
+/// `e_bits` (e.g. from [`parse_rsa_algorithm_attributes`]) before doing any
+/// build work — the transport layer does, as redundant defense. The builders
+/// themselves ([`import_rsa_key`] / [`extended_header_list`]) return
+/// [`ExponentTooWide`] on the same condition, so skipping this check cannot
+/// panic.
 #[must_use]
 pub fn rsa_exponent_fits(e: &[u8], e_bits: u16) -> bool {
     strip_leading_zero(e).len() <= e_bits.div_ceil(8) as usize
@@ -920,14 +945,13 @@ pub fn rsa_exponent_fits(e: &[u8], e_bits: u16) -> bool {
 /// right-justified to `(e_bits + 7) / 8` bytes (see [`pad_exponent`]); the
 /// other fields keep their minimal big-endian length, and `7F48` declares each
 /// length so the card can split `5F48` correctly.
-#[must_use]
 pub fn extended_header_list(
     crt: KeyCrt,
     key: &RsaPrivateKeyParts,
     format: RsaImportFormat,
     e_bits: u16,
-) -> Vec<u8> {
-    let e = pad_exponent(key.e, e_bits.div_ceil(8) as usize);
+) -> Result<Vec<u8>, ExponentTooWide> {
+    let e = pad_exponent(key.e, e_bits.div_ceil(8) as usize)?;
     let p = strip_leading_zero(key.p);
     let q = strip_leading_zero(key.q);
     let u = strip_leading_zero(key.u);
@@ -976,7 +1000,7 @@ pub fn extended_header_list(
     body.extend_from_slice(&ber_tlv(0x7F48, &template));
     body.extend_from_slice(&Zeroizing::new(ber_tlv(0x5F48, &key_data)));
 
-    ber_tlv(0x4D, &body)
+    Ok(ber_tlv(0x4D, &body))
 }
 
 /// Build an *extended-length* command APDU: `CLA INS P1 P2 00 Lc-hi Lc-lo DATA`.
@@ -1018,15 +1042,20 @@ fn build_apdu_extended(cla: u8, ins: u8, p1: u8, p2: u8, data: &[u8]) -> Vec<u8>
 /// same reason. Using `0xDA` here makes the card reject with `SW=6B00`.
 pub const INS_PUT_DATA_ODD: u8 = 0xDB;
 
-#[must_use]
 pub fn import_rsa_key(
     crt: KeyCrt,
     key: &RsaPrivateKeyParts,
     format: RsaImportFormat,
     e_bits: u16,
-) -> Vec<u8> {
-    let header_list = Zeroizing::new(extended_header_list(crt, key, format, e_bits));
-    build_apdu_extended(0x00, INS_PUT_DATA_ODD, 0x3F, 0xFF, &header_list)
+) -> Result<Vec<u8>, ExponentTooWide> {
+    let header_list = Zeroizing::new(extended_header_list(crt, key, format, e_bits)?);
+    Ok(build_apdu_extended(
+        0x00,
+        INS_PUT_DATA_ODD,
+        0x3F,
+        0xFF,
+        &header_list,
+    ))
 }
 
 /// Build an "odd" PUT DATA (`0xDB`) as an **ISO 7816 command-chaining**
@@ -1070,16 +1099,15 @@ pub fn put_data_odd_chained(p1: u8, p2: u8, data: &[u8], max_chunk: usize) -> Ve
 /// Command-chaining form of [`import_rsa_key`]: the same `4D` Extended Header
 /// List, but emitted as a sequence of chained `0xDB` PUT DATA APDUs (see
 /// [`put_data_odd_chained`]) instead of one extended-length APDU.
-#[must_use]
 pub fn import_rsa_key_chained(
     crt: KeyCrt,
     key: &RsaPrivateKeyParts,
     format: RsaImportFormat,
     e_bits: u16,
     max_chunk: usize,
-) -> Vec<Vec<u8>> {
-    let header_list = Zeroizing::new(extended_header_list(crt, key, format, e_bits));
-    put_data_odd_chained(0x3F, 0xFF, &header_list, max_chunk)
+) -> Result<Vec<Vec<u8>>, ExponentTooWide> {
+    let header_list = Zeroizing::new(extended_header_list(crt, key, format, e_bits)?);
+    Ok(put_data_odd_chained(0x3F, 0xFF, &header_list, max_chunk))
 }
 
 // ---------------------------------------------------------------------------
@@ -2193,7 +2221,7 @@ mod tests {
     fn extended_header_list_crt_synthetic_exact_bytes() {
         // CRT format, e_bits = 17 -> e_reqlen = 3 (e already 3 bytes, no pad).
         let key = synthetic_crt_key();
-        let ehl = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Crt, 17);
+        let ehl = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Crt, 17).unwrap();
 
         // 7F48 value: 91 03  92 02  93 02  94 02  95 01  96 02
         //   (each = tag + BER length, no value) -> 6 x 2 = 12 bytes = 0x0C.
@@ -2224,7 +2252,7 @@ mod tests {
     fn extended_header_list_pads_exponent_to_e_bits() {
         // e_bits = 32 -> e_reqlen = 4; e = 01 00 01 is left-padded to 00 01 00 01.
         let key = synthetic_crt_key();
-        let ehl = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Crt, 32);
+        let ehl = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Crt, 32).unwrap();
         // 91 entry now declares BER length 4 (2 bytes: 91 04)...
         assert_eq!(&ehl[7..9], &[0x91, 0x04]);
         // ...the 7F48 value is 12 bytes (6 x 2), so 5F48 starts at offset 19.
@@ -2237,7 +2265,7 @@ mod tests {
     fn extended_header_list_standard_omits_crt() {
         // Standard format emits only e, p, q (the card derives the rest).
         let key = synthetic_crt_key();
-        let ehl = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Standard, 17);
+        let ehl = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Standard, 17).unwrap();
         let expected = vec![
             0x4D, 0x15, // 4D, len 21
             0xB6, 0x00, //
@@ -2255,7 +2283,8 @@ mod tests {
     fn extended_header_list_crt_with_modulus_appends_n() {
         // CrtWithModulus adds a 97 entry for n and appends n to 5F48.
         let key = synthetic_crt_key();
-        let ehl = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::CrtWithModulus, 17);
+        let ehl =
+            extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::CrtWithModulus, 17).unwrap();
         // 7F48 gains 97 03; its value is now 14 bytes (0x0E): 6 CRT entries + 97 03.
         assert_eq!(&ehl[4..7], &[0x7F, 0x48, 0x0E]);
         // The 97 entry is the last template entry (after 12 bytes of entries).
@@ -2268,9 +2297,9 @@ mod tests {
     fn extended_header_list_crt_per_slot() {
         let key = synthetic_crt_key();
         // The CRT is the empty template at bytes [2..4] of the 4D value.
-        let sign = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Crt, 17);
-        let dec = extended_header_list(KeyCrt::Decrypt, &key, RsaImportFormat::Crt, 17);
-        let auth = extended_header_list(KeyCrt::Auth, &key, RsaImportFormat::Crt, 17);
+        let sign = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Crt, 17).unwrap();
+        let dec = extended_header_list(KeyCrt::Decrypt, &key, RsaImportFormat::Crt, 17).unwrap();
+        let auth = extended_header_list(KeyCrt::Auth, &key, RsaImportFormat::Crt, 17).unwrap();
         assert_eq!(sign[2..4], [0xB6, 0x00]);
         assert_eq!(dec[2..4], [0xB8, 0x00]);
         assert_eq!(auth[2..4], [0xA4, 0x00]);
@@ -2281,17 +2310,14 @@ mod tests {
     #[test]
     fn import_rsa_key_crt_synthetic_full_apdu() {
         let key = synthetic_crt_key();
-        let apdu = import_rsa_key(KeyCrt::Sign, &key, RsaImportFormat::Crt, 17);
+        let apdu = import_rsa_key(KeyCrt::Sign, &key, RsaImportFormat::Crt, 17).unwrap();
 
         // 4D object = 2 (tag+len) + 32 (value) = 34 bytes = 0x22.
         // Extended APDU: 00 DB 3F FF 00 00 22 <34 bytes> (odd PUT DATA).
         let mut expected = vec![0x00, 0xDB, 0x3F, 0xFF, 0x00, 0x00, 0x22];
-        expected.extend_from_slice(&extended_header_list(
-            KeyCrt::Sign,
-            &key,
-            RsaImportFormat::Crt,
-            17,
-        ));
+        expected.extend_from_slice(
+            &extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Crt, 17).unwrap(),
+        );
         assert_eq!(apdu, expected);
         assert_eq!(apdu.len(), 7 + 34);
     }
@@ -2315,7 +2341,7 @@ mod tests {
             dq: &[],
             n: &[],
         };
-        let ehl = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Standard, 17);
+        let ehl = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Standard, 17).unwrap();
 
         // 7F48 value: 91 03  92 81 80  93 81 80 -> 2 + 3 + 3 = 8 bytes = 0x08.
         let template = [
@@ -2359,7 +2385,7 @@ mod tests {
             dq: &[],
             n: &[],
         };
-        let apdu = import_rsa_key(KeyCrt::Sign, &key, RsaImportFormat::Standard, 17);
+        let apdu = import_rsa_key(KeyCrt::Sign, &key, RsaImportFormat::Standard, 17).unwrap();
         // EHL = 281 bytes = 0x0119. APDU = 00 DB 3F FF 00 01 19 <281> (odd PUT DATA).
         assert_eq!(&apdu[..7], &[0x00, 0xDB, 0x3F, 0xFF, 0x00, 0x01, 0x19]);
         assert_eq!(apdu.len(), 7 + 281);
@@ -2410,14 +2436,52 @@ mod tests {
             dq: &[],
             n: &[],
         };
-        let ehl = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Standard, 17);
-        let chunks = import_rsa_key_chained(KeyCrt::Sign, &key, RsaImportFormat::Standard, 17, 254);
+        let ehl = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Standard, 17).unwrap();
+        let chunks =
+            import_rsa_key_chained(KeyCrt::Sign, &key, RsaImportFormat::Standard, 17, 254).unwrap();
         // EHL is 281 bytes -> 254 + 27 = two chunks.
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0][0], 0x10); // chaining bit set on the non-final link
         assert_eq!(chunks[1][0], 0x00); // cleared on the final link
         let body: Vec<u8> = chunks.iter().flat_map(|c| c[5..].iter().copied()).collect();
         assert_eq!(body, ehl);
+    }
+
+    #[test]
+    fn import_builders_error_on_impossible_card_exponent_widths() {
+        // KEY-019: e_bits is card-supplied (a hostile or buggy card controls
+        // it). A field narrower than the key's exponent must surface as a
+        // typed error from every builder — never a panic — because truncating
+        // would import a *different* key and panicking aborts mid-import.
+        let key = synthetic_crt_key(); // e = 01 00 01 (3 bytes minimal)
+        for e_bits in [0u16, 8] {
+            assert!(
+                extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Crt, e_bits).is_err()
+            );
+            assert!(import_rsa_key(KeyCrt::Sign, &key, RsaImportFormat::Crt, e_bits).is_err());
+            assert!(
+                import_rsa_key_chained(KeyCrt::Sign, &key, RsaImportFormat::Crt, e_bits, 254)
+                    .is_err()
+            );
+        }
+        // Wide-enough declared fields still build: 17 bits -> 3 bytes, 32 -> 4.
+        for e_bits in [17u16, 32] {
+            assert!(extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Crt, e_bits).is_ok());
+            assert!(import_rsa_key(KeyCrt::Sign, &key, RsaImportFormat::Crt, e_bits).is_ok());
+            assert!(
+                import_rsa_key_chained(KeyCrt::Sign, &key, RsaImportFormat::Crt, e_bits, 254)
+                    .is_ok()
+            );
+        }
+        // The error reports both widths (3-byte exponent vs 1-byte field).
+        let err = import_rsa_key(KeyCrt::Sign, &key, RsaImportFormat::Crt, 8).unwrap_err();
+        assert_eq!(
+            err,
+            ExponentTooWide {
+                e_len: 3,
+                field_len: 1
+            }
+        );
     }
 
     #[test]

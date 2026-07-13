@@ -284,9 +284,11 @@ impl OpenPgpSession {
     ) -> Result<(), TransportError> {
         let attrs = self.rsa_attributes(crt)?;
 
-        // The card declares its exponent-field width; the pure builder pads the
-        // key's exponent to it and panics if the exponent is wider (a malformed
-        // attribute like e_bits=8 would otherwise abort mid-import). Reject it.
+        // The card declares its exponent-field width; the pure builders return
+        // a typed ExponentTooWide if the key's exponent is wider. Reject a
+        // malformed/hostile attribute (e.g. e_bits=8 against e=65537) here
+        // first, before any build work — redundant defense in front of the
+        // byte layer's own error.
         if !pgp::rsa_exponent_fits(key.e, attrs.e_bits) {
             return Err(TransportError::OpenPgpExponentTooWide);
         }
@@ -295,7 +297,10 @@ impl OpenPgpSession {
         // (so the fallback can be exercised on a card that also accepts extended
         // length, e.g. for verification). Otherwise: extended length first.
         if std::env::var_os("KEYROOST_OPENPGP_FORCE_CHAINING").is_none() {
-            let apdu = Zeroizing::new(pgp::import_rsa_key(crt, key, attrs.format, attrs.e_bits));
+            let apdu = Zeroizing::new(
+                pgp::import_rsa_key(crt, key, attrs.format, attrs.e_bits)
+                    .map_err(|_| TransportError::OpenPgpExponentTooWide)?,
+            );
             let (_, sw) = self.transmit_full(&apdu)?;
             if sw == pgp::SW_OK {
                 return Ok(());
@@ -319,6 +324,7 @@ impl OpenPgpSession {
 
         let chunks: Vec<Zeroizing<Vec<u8>>> =
             pgp::import_rsa_key_chained(crt, key, attrs.format, attrs.e_bits, 254)
+                .map_err(|_| TransportError::OpenPgpExponentTooWide)?
                 .into_iter()
                 .map(Zeroizing::new)
                 .collect();
