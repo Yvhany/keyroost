@@ -69,6 +69,11 @@ pub enum OtpTransportError {
     /// contact/NFC reader is available. Enable one of the interfaces (or place
     /// the key on a reader) and retry.
     NoUsableInterface,
+    /// The device kept reporting "more enumeration pages" (or streaming
+    /// entries) past the host-owned caps — a device-controlled continuation
+    /// flag must never drive unbounded host work (audit KEY-009), so this is
+    /// treated as a buggy or hostile token rather than looped on forever.
+    EnumerationCapExceeded,
 }
 
 impl std::fmt::Display for OtpTransportError {
@@ -91,6 +96,11 @@ impl std::fmt::Display for OtpTransportError {
                 f,
                 "the OTP applet is not reachable over HID or CCID — HID may be \
                  disabled on the key; enable it, or use a contact/NFC reader"
+            ),
+            OtpTransportError::EnumerationCapExceeded => write!(
+                f,
+                "the device kept reporting more OTP entries than any supported \
+                 token stores; aborting enumeration"
             ),
         }
     }
@@ -701,6 +711,17 @@ pub struct Token2OtpSession {
     is_pcsc: bool,
 }
 
+/// Host-owned caps on the `ENUM_CODES` pagination loop (audit KEY-009). Both
+/// the more-pages bit and the page contents are device-controlled, so a
+/// hostile key could otherwise keep a GUI worker or CLI command paging (and
+/// allocating) forever. The largest shipping Token2 OTP stores are on the
+/// order of 100 entries (the Molto2 line tops out at 100 slots; the PIN+ /
+/// T2F2 FIDO keys store fewer), and a well-formed page carries at least one
+/// entry, so 256 pages / 1024 entries is more than an order of magnitude of
+/// headroom over real hardware while still terminating promptly.
+const MAX_ENUM_PAGES: usize = 256;
+const MAX_ENUM_ENTRIES: usize = 1024;
+
 /// How long the HID probe waits for the OTP applet to answer before giving up.
 /// On Linux the hidraw `read()` is blocking and the kernel surfaces no timeout,
 /// so a key whose FIDO HID interface enumerates but whose OTP-over-HID channel
@@ -881,12 +902,24 @@ impl Token2OtpSession {
         }
         let mut page = t2::parse_enum_page(&data)?;
         let mut entries = page.entries;
+        let mut pages = 1usize;
         while page.more_pages {
+            // Device-controlled continuation flag: enforce the host caps
+            // *before* issuing another transmit (KEY-009).
+            pages += 1;
+            if pages > MAX_ENUM_PAGES || entries.len() > MAX_ENUM_ENTRIES {
+                return Err(OtpTransportError::EnumerationCapExceeded);
+            }
             let cont = t2::build_apdu(cmd::ENUM_CODES_CONTINUE, &timestamp.to_be_bytes());
             let (data, sw) = self.transport.transmit(&cont, false)?;
             OtpError::check(sw)?;
             page = t2::parse_enum_page(&data)?;
             entries.extend(page.entries);
+        }
+        // A single final page could still be entry-stuffed; apply the total
+        // cap to the result as well.
+        if entries.len() > MAX_ENUM_ENTRIES {
+            return Err(OtpTransportError::EnumerationCapExceeded);
         }
         Ok(entries)
     }
@@ -1246,5 +1279,95 @@ mod le_retry_tests {
             resend_with_le(&apdu, 0x40),
             vec![0x80, 0xC5, 0x05, 0x00, 0x02, 0x03, 0x07, 0x40]
         );
+    }
+}
+
+#[cfg(test)]
+mod enumerate_bounds_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// One valid single-entry ENUM page (the spec §10.1 worked example, same
+    /// bytes as the known-answer tests in `keyroost_token2otp::entry`), with
+    /// the more-pages bit optionally OR'd into the leading type byte.
+    fn one_entry_page(more_pages: bool) -> Vec<u8> {
+        let first = if more_pages { 0x81 } else { 0x01 };
+        let mut payload = vec![first, 0xC1, 0x00, 0x1E, 0x06, 0x00, 0x04];
+        payload.extend_from_slice(b"Test");
+        payload.push(0x05);
+        payload.extend_from_slice(b"alice");
+        payload.push(0x06);
+        payload.extend_from_slice(b"123456");
+        payload
+    }
+
+    /// A key that never stops paging: every response is a valid one-entry
+    /// page with the more-pages bit set.
+    struct EndlessPages {
+        transmits: Rc<Cell<usize>>,
+    }
+
+    impl OtpTransport for EndlessPages {
+        fn transmit(
+            &mut self,
+            _apdu: &[u8],
+            _detect_button_wait: bool,
+        ) -> Result<(Vec<u8>, u16), OtpTransportError> {
+            self.transmits.set(self.transmits.get() + 1);
+            Ok((one_entry_page(true), 0x9000))
+        }
+    }
+
+    #[test]
+    fn endless_more_pages_is_bounded_by_host_caps() {
+        let transmits = Rc::new(Cell::new(0));
+        let mut session = Token2OtpSession {
+            transport: Box::new(EndlessPages {
+                transmits: transmits.clone(),
+            }),
+            is_pcsc: false,
+        };
+        let res = session.enumerate(0);
+        assert!(
+            matches!(res, Err(OtpTransportError::EnumerationCapExceeded)),
+            "endless more_pages must fail with the cap error, got {res:?}"
+        );
+        // Boundedness, not just eventual failure: the host stops issuing
+        // continuations at its own cap.
+        assert!(
+            transmits.get() <= MAX_ENUM_PAGES,
+            "issued {} transmits, cap is {}",
+            transmits.get(),
+            MAX_ENUM_PAGES
+        );
+    }
+
+    /// A well-behaved two-page enumeration still works (regression guard).
+    struct TwoPages {
+        sent: usize,
+    }
+
+    impl OtpTransport for TwoPages {
+        fn transmit(
+            &mut self,
+            _apdu: &[u8],
+            _detect_button_wait: bool,
+        ) -> Result<(Vec<u8>, u16), OtpTransportError> {
+            let more = self.sent == 0; // first page continues, second is last
+            self.sent += 1;
+            Ok((one_entry_page(more), 0x9000))
+        }
+    }
+
+    #[test]
+    fn normal_two_page_enumeration_is_unaffected() {
+        let mut session = Token2OtpSession {
+            transport: Box::new(TwoPages { sent: 0 }),
+            is_pcsc: false,
+        };
+        let entries = session.enumerate(0).expect("two pages must enumerate");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].account_name, "alice");
     }
 }
