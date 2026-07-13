@@ -1227,6 +1227,12 @@ fn main() -> eframe::Result<()> {
 struct App {
     /// Active PC/SC session, if any.
     session: Option<Session>,
+    /// The device id `session` was opened for. A mutating op may only take
+    /// the session while this still matches `selected_device` (KEY-004): the
+    /// apply closures of Molto ops hand the session back unconditionally, so
+    /// the binding — not the `Option` — is what keeps a session opened for
+    /// key A from serving actions the user aims at key B.
+    molto_session_device: Option<DeviceId>,
     /// Last device info read.
     info: Option<DeviceInfo>,
     /// Whether the session has been authenticated.
@@ -1860,6 +1866,15 @@ impl App {
         if self.busy() {
             return None;
         }
+        if !self.molto_session_usable() {
+            // Session bound to a different device than the current selection
+            // (e.g. a delayed open or hand-back landed after the user
+            // switched keys). Never serve it; drop it instead (KEY-004).
+            self.session = None;
+            self.molto_session_device = None;
+            self.log(Severity::Warn, "not connected");
+            return None;
+        }
         match self.session.take() {
             Some(s) => Some(s),
             None => {
@@ -1867,6 +1882,14 @@ impl App {
                 None
             }
         }
+    }
+
+    /// True while the stored Molto2 session is bound to the current selection.
+    fn molto_session_usable(&self) -> bool {
+        completion_still_valid(
+            self.molto_session_device.as_ref(),
+            self.selected_device.as_ref(),
+        )
     }
 
     fn authenticate(&mut self) {
@@ -4605,6 +4628,7 @@ impl App {
         self.close_rename();
         self.authenticated = false;
         self.session = None;
+        self.molto_session_device = None;
         self.info = None;
         self.slot_meta = None;
 
@@ -4625,6 +4649,9 @@ impl App {
         let Some(reader) = self.selected_device().and_then(|d| d.reader.clone()) else {
             return;
         };
+        // Tag the job with the device it opens — a delayed completion must
+        // not repopulate the pane after the user switches keys (KEY-004).
+        let for_device = self.selected_device.clone();
         self.spawn_job("Opening Molto2\u{2026}", move || {
             let result = (|| -> Result<(Session, DeviceInfo, Option<Vec<ProfilePublicData>>), TransportError> {
                 let mut s = Session::open_named(&reader)?;
@@ -4637,28 +4664,34 @@ impl App {
                     .ok();
                 Ok((s, info, meta))
             })();
-            Box::new(move |app: &mut App| match result {
-                Ok((s, info, meta)) => {
-                    app.log(Severity::Ok, format!("opened Molto2 {}", info.serial));
-                    // Enumeration's gentle probe usually fills these already;
-                    // refresh them here as a fallback in case that read failed.
-                    if let Some(id) = app.selected_device.clone() {
-                        let named = keyroost_keyring::Keyring::load_default()
-                            .ok()
-                            .and_then(|k| k.name_for(Some(&info.serial)).map(str::to_owned));
-                        if let Some(dev) = app.devices.iter_mut().find(|d| d.id == id) {
-                            dev.serial = info.serial.clone();
-                            if dev.name.is_none() {
-                                dev.name = named;
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // user switched devices mid-open; drop the session
+                }
+                match result {
+                    Ok((s, info, meta)) => {
+                        app.log(Severity::Ok, format!("opened Molto2 {}", info.serial));
+                        // Enumeration's gentle probe usually fills these already;
+                        // refresh them here as a fallback in case that read failed.
+                        if let Some(id) = for_device.clone() {
+                            let named = keyroost_keyring::Keyring::load_default()
+                                .ok()
+                                .and_then(|k| k.name_for(Some(&info.serial)).map(str::to_owned));
+                            if let Some(dev) = app.devices.iter_mut().find(|d| d.id == id) {
+                                dev.serial = info.serial.clone();
+                                if dev.name.is_none() {
+                                    dev.name = named;
+                                }
                             }
                         }
+                        app.session = Some(s);
+                        app.molto_session_device = for_device;
+                        app.info = Some(info);
+                        app.slot_meta = meta;
+                        app.authenticated = false;
                     }
-                    app.session = Some(s);
-                    app.info = Some(info);
-                    app.slot_meta = meta;
-                    app.authenticated = false;
+                    Err(e) => app.log(Severity::Err, format!("open Molto2: {e}")),
                 }
-                Err(e) => app.log(Severity::Err, format!("open Molto2: {e}")),
             })
         });
     }
@@ -12940,5 +12973,36 @@ mod tests {
         assert!(!completion_still_valid(None, Some(&a)));
         assert!(!completion_still_valid(Some(&a), None));
         assert!(!completion_still_valid(None, None));
+    }
+
+    /// KEY-004: the stored Molto2 session is bound to the device it was
+    /// opened for; once the selection moves, no mutating op may take it.
+    #[test]
+    fn molto_session_stays_bound_to_the_device_it_opened_for() {
+        let mut app = App {
+            selected_device: Some("serial:AAA".into()),
+            molto_session_device: Some("serial:AAA".into()),
+            ..Default::default()
+        };
+        assert!(app.molto_session_usable());
+
+        // The user switches selection: the binding no longer matches…
+        app.selected_device = Some("serial:BBB".into());
+        assert!(!app.molto_session_usable());
+        // …and take_molto_session refuses, dropping the stale binding.
+        assert!(app.take_molto_session().is_none());
+        assert!(app.molto_session_device.is_none());
+    }
+
+    /// A selection change always severs the Molto session binding, so a
+    /// handed-back session from an in-flight job can never be used later.
+    #[test]
+    fn selection_change_clears_the_molto_session_binding() {
+        let mut app = App {
+            molto_session_device: Some("serial:AAA".into()),
+            ..Default::default()
+        };
+        app.on_device_selected();
+        assert!(app.molto_session_device.is_none());
     }
 }
