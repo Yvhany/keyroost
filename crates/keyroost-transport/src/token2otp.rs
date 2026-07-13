@@ -195,6 +195,30 @@ fn request_is_sensitive(apdu: &[u8]) -> bool {
         && matches!(apdu.get(3), Some(0x02) | Some(0x00))
 }
 
+/// Render one debug-trace line. Sensitive payloads (seed blobs on the way
+/// out, ENUM_CODES entry data on the way back) are length-redacted;
+/// everything else is dumped as lowercase hex. This is the single place the
+/// redaction policy is *rendered* — the four former inline copies of this
+/// block had drifted apart in wording. Pure, so the "secrets never reach the
+/// trace" guarantee is unit-testable.
+fn trace_line(label: &str, bytes: &[u8], sensitive: bool) -> String {
+    if sensitive {
+        format!("[token2otp {label}] <{} bytes redacted>", bytes.len())
+    } else {
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        format!("[token2otp {label}] {hex}")
+    }
+}
+
+/// Print one debug-trace line to stderr when `debug` is on. Every byte dump
+/// in this module — both transports, both directions — must go through here
+/// so the redaction policy in [`trace_line`] cannot drift per call site.
+fn trace_bytes(debug: bool, label: &str, bytes: &[u8], sensitive: bool) {
+    if debug {
+        eprintln!("{}", trace_line(label, bytes, sensitive));
+    }
+}
+
 /// Build the APDU to resend after a `6C xx` ("wrong Le") status word.
 ///
 /// ISO 7816-4: `6C xx` tells the host to reissue the *same* command with
@@ -345,27 +369,10 @@ impl HidOtpTransport {
                     .map_err(|e| OtpTransportError::TransportUnavailable(e.to_string()))?
             }
         };
-        if self.debug && n > 0 {
-            if self.resp_sensitive {
-                eprintln!("[token2otp HID raw-frame] ({n} bytes) <redacted>");
-            } else {
-                let hex: String = buf[..n].iter().map(|b| format!("{b:02x}")).collect();
-                eprintln!("[token2otp HID raw-frame] ({n} bytes) {hex}");
-            }
+        if n > 0 {
+            trace_bytes(self.debug, "HID raw-frame", &buf[..n], self.resp_sensitive);
         }
         Ok(n)
-    }
-
-    fn trace(&self, dir: &str, bytes: &[u8], sensitive: bool) {
-        if !self.debug {
-            return;
-        }
-        if sensitive {
-            eprintln!("[token2otp HID {dir}] <{} bytes redacted>", bytes.len());
-        } else {
-            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-            eprintln!("[token2otp HID {dir}] {hex}");
-        }
     }
 }
 
@@ -377,7 +384,7 @@ impl OtpTransport for HidOtpTransport {
     ) -> Result<(Vec<u8>, u16), OtpTransportError> {
         // Seed-bearing commands (WRITE_SEED / WRITE_HOTP_SEED) carry the ECDH
         // blob; redact those from the trace (matches the OATH PUT redaction).
-        self.trace("send", apdu, request_is_sensitive(apdu));
+        trace_bytes(self.debug, "HID send", apdu, request_is_sensitive(apdu));
 
         // Decide once whether the response frames carry secrets (ENUM_CODES
         // entries: account names + live OTP codes) so the per-frame and parsed
@@ -431,17 +438,14 @@ impl OtpTransport for HidOtpTransport {
             .into_response()
             .ok_or(OtpTransportError::EmptyResponse)?;
         if self.debug {
-            if self.resp_sensitive {
-                eprintln!(
-                    "[token2otp HID parsed] data=<{} bytes redacted> sw={sw:#06x}",
-                    data.len()
-                );
-            } else {
-                let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
-                eprintln!("[token2otp HID parsed] data={hex} sw={sw:#06x}");
-            }
+            trace_bytes(
+                true,
+                &format!("HID parsed sw={sw:#06x}"),
+                &data,
+                self.resp_sensitive,
+            );
         }
-        self.trace("recv", &data, self.resp_sensitive);
+        trace_bytes(self.debug, "HID recv", &data, self.resp_sensitive);
         Ok((data, sw))
     }
 
@@ -553,14 +557,7 @@ impl PcScOtpTransport {
         // resends a different header into `to_send`, but the secret verdict must
         // follow the command the user actually issued.
         let resp_sensitive = response_is_sensitive(apdu);
-        if self.debug {
-            if request_is_sensitive(apdu) {
-                eprintln!("[token2otp PCSC send] <{} bytes redacted>", apdu.len());
-            } else {
-                let hex: String = apdu.iter().map(|b| format!("{b:02x}")).collect();
-                eprintln!("[token2otp PCSC send] {hex}");
-            }
-        }
+        trace_bytes(self.debug, "PCSC send", apdu, request_is_sensitive(apdu));
         // Remember which applet a SELECT switches us to (SELECT = `00 A4 04 00
         // Lc aid...`), so the reset-recovery path below can re-SELECT it. This
         // covers both the open-time SELECT and the FIDO/OTP applet switches the
@@ -630,14 +627,7 @@ impl PcScOtpTransport {
                 }
                 Err(e) => return Err(OtpTransportError::Pcsc(e)),
             };
-            if self.debug {
-                if resp_sensitive {
-                    eprintln!("[token2otp PCSC recv] <{} bytes redacted>", resp.len());
-                } else {
-                    let hex: String = resp.iter().map(|b| format!("{b:02x}")).collect();
-                    eprintln!("[token2otp PCSC recv] {hex}");
-                }
-            }
+            trace_bytes(self.debug, "PCSC recv", resp, resp_sensitive);
             if resp.len() < 2 {
                 return Err(OtpTransportError::EmptyResponse);
             }
@@ -1213,6 +1203,20 @@ mod trace_redaction_tests {
         assert!(!request_is_sensitive(&cmd::GET_ECDH_PUBKEY));
         assert!(!request_is_sensitive(&cmd::READ_CONFIG));
         assert!(!request_is_sensitive(&[0x00, 0xA4, 0x04, 0x00]));
+    }
+
+    #[test]
+    fn trace_line_redacts_sensitive_payloads() {
+        use super::trace_line;
+        let secret = [0xDE, 0xAD, 0xBE, 0xEF];
+        // A sensitive payload must never reach the trace as hex — only its
+        // length may appear.
+        let line = trace_line("PCSC send", &secret, true);
+        assert!(!line.contains("deadbeef"), "secret bytes leaked: {line}");
+        assert_eq!(line, "[token2otp PCSC send] <4 bytes redacted>");
+        // A non-sensitive payload prints as lowercase hex.
+        let clear = trace_line("HID recv", &secret, false);
+        assert_eq!(clear, "[token2otp HID recv] deadbeef");
     }
 }
 
