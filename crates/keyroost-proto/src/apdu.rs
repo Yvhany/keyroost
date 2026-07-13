@@ -62,9 +62,39 @@ pub fn mac(sm4_key: &[u8; 16], header: &[u8; 5], payload: &[u8]) -> [u8; 4] {
     [last[0], last[1], last[2], last[3]]
 }
 
-/// Build a case-3 short APDU (header + Lc + data, no Le).
-pub fn build_apdu(cla: u8, ins: u8, p1: u8, p2: u8, data: &[u8]) -> Vec<u8> {
-    assert!(data.len() <= 255, "short APDU body too large");
+/// Error from [`try_build_apdu`]: the body exceeds the 255-byte case-3
+/// short-APDU limit, so no valid 1-byte `Lc` exists for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApduBodyTooLong {
+    /// The offending body length in bytes.
+    pub len: usize,
+}
+
+impl core::fmt::Display for ApduBodyTooLong {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "APDU body is {} bytes; a case-3 short APDU holds at most 255",
+            self.len
+        )
+    }
+}
+
+impl std::error::Error for ApduBodyTooLong {}
+
+/// Build a case-3 short APDU (header + Lc + data, no Le), rejecting a body
+/// past the 255-byte limit instead of panicking. Use this for bodies whose
+/// length a caller or a device can influence.
+pub fn try_build_apdu(
+    cla: u8,
+    ins: u8,
+    p1: u8,
+    p2: u8,
+    data: &[u8],
+) -> Result<Vec<u8>, ApduBodyTooLong> {
+    if data.len() > 255 {
+        return Err(ApduBodyTooLong { len: data.len() });
+    }
     let mut out = Vec::with_capacity(5 + data.len());
     out.push(cla);
     out.push(ins);
@@ -72,7 +102,20 @@ pub fn build_apdu(cla: u8, ins: u8, p1: u8, p2: u8, data: &[u8]) -> Vec<u8> {
     out.push(p2);
     out.push(data.len() as u8);
     out.extend_from_slice(data);
-    out
+    Ok(out)
+}
+
+/// Build a case-3 short APDU (header + Lc + data, no Le).
+///
+/// # Panics
+/// Panics if `data` exceeds 255 bytes. Fine for the fixed-size Molto2
+/// command bodies in `commands.rs`; anything caller- or device-sized goes
+/// through [`try_build_apdu`].
+pub fn build_apdu(cla: u8, ins: u8, p1: u8, p2: u8, data: &[u8]) -> Vec<u8> {
+    match try_build_apdu(cla, ins, p1, p2, data) {
+        Ok(apdu) => apdu,
+        Err(e) => panic!("short APDU body too large: {} bytes", e.len),
+    }
 }
 
 /// Build a case-2 short APDU (header + Le only). `le` of 0 means "up to 256 bytes".
@@ -113,5 +156,20 @@ mod tests {
     fn build_apdu_layout() {
         let apdu = build_apdu(0x84, 0xC5, 0x01, 0x02, &[0xde, 0xad]);
         assert_eq!(apdu, [0x84, 0xC5, 0x01, 0x02, 0x02, 0xde, 0xad]);
+    }
+
+    #[test]
+    fn try_build_apdu_boundary() {
+        // At the exact 255-byte case-3 limit the APDU builds; one byte over
+        // is a typed error, not a panic (device/caller-length safety).
+        let body = [0u8; 255];
+        let apdu = try_build_apdu(0x00, 0xA2, 0x00, 0x01, &body).unwrap();
+        assert_eq!(apdu.len(), 5 + 255);
+        assert_eq!(apdu[4], 255);
+        let over = [0u8; 256];
+        assert_eq!(
+            try_build_apdu(0x00, 0xA2, 0x00, 0x01, &over),
+            Err(ApduBodyTooLong { len: 256 })
+        );
     }
 }

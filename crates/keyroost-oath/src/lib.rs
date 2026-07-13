@@ -22,7 +22,7 @@
 //! [`verify_validate`], and [`derive_access_key`] build/parse the Yubico
 //! `SET_CODE` / `VALIDATE` exchange (the transport layer only transmits them).
 
-use keyroost_proto::apdu::{build_apdu, build_apdu_get};
+use keyroost_proto::apdu::{build_apdu, build_apdu_get, try_build_apdu};
 use zeroize::Zeroizing;
 
 pub mod crypto;
@@ -197,11 +197,46 @@ pub const fn prefix_byte(oath_type: OathType, algorithm: Algorithm) -> u8 {
 // TLV in the commands we build).
 // ---------------------------------------------------------------------------
 
+/// Error from the fallible APDU builders: a caller- or device-supplied value
+/// would overflow the short-APDU framing. Names come from users, imported
+/// `otpauth://` URIs / QR codes, *and from the card's own LIST response* — a
+/// hostile card can list a protocol-valid name too long to use in a
+/// follow-up command, so overflow must be an error, never a panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildError {
+    /// A single TLV value exceeds the 255-byte short-form length. `what`
+    /// names the field; `len` is the encoded TLV value length.
+    ValueTooLong { what: &'static str, len: usize },
+    /// The composed command body exceeds the 255-byte short-APDU limit.
+    BodyTooLong { len: usize },
+}
+
+impl core::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            BuildError::ValueTooLong { what, len } => write!(
+                f,
+                "OATH {what} is {len} bytes; a short-form TLV holds at most 255"
+            ),
+            BuildError::BodyTooLong { len } => write!(
+                f,
+                "OATH command body is {len} bytes; a short APDU holds at most 255"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BuildError {}
+
 /// Append a short-form TLV (`tag`, 1-byte length, value) to `out`.
 ///
+/// For values whose length is a host-side constant (challenges, response
+/// HMACs, the property byte, the IMF counter, the derived access key).
+/// Caller- or device-controlled values (names, secrets) go through
+/// [`try_push_tlv`] instead.
+///
 /// # Panics
-/// Panics if `value` is longer than 255 bytes, which no OATH command we build
-/// can produce (names, keys, and challenges are all small).
+/// Panics if `value` is longer than 255 bytes.
 fn push_tlv(out: &mut Vec<u8>, tag: Tag, value: &[u8]) {
     assert!(
         value.len() <= 255,
@@ -210,6 +245,32 @@ fn push_tlv(out: &mut Vec<u8>, tag: Tag, value: &[u8]) {
     out.push(tag.code());
     out.push(value.len() as u8);
     out.extend_from_slice(value);
+}
+
+/// Append a short-form TLV, rejecting a value past the 255-byte short-form
+/// length instead of panicking. `what` names the field for the error.
+fn try_push_tlv(
+    out: &mut Vec<u8>,
+    tag: Tag,
+    what: &'static str,
+    value: &[u8],
+) -> Result<(), BuildError> {
+    if value.len() > MAX_SHORT_LEN {
+        return Err(BuildError::ValueTooLong {
+            what,
+            len: value.len(),
+        });
+    }
+    out.push(tag.code());
+    out.push(value.len() as u8);
+    out.extend_from_slice(value);
+    Ok(())
+}
+
+/// Frame `data` as a case-3 short APDU with CLA `0x00`, mapping an over-long
+/// composed body to [`BuildError::BodyTooLong`].
+fn finish_apdu(ins: u8, p1: u8, p2: u8, data: &[u8]) -> Result<Vec<u8>, BuildError> {
+    try_build_apdu(0x00, ins, p1, p2, data).map_err(|e| BuildError::BodyTooLong { len: e.len })
 }
 
 // ---------------------------------------------------------------------------
@@ -254,55 +315,22 @@ const MAX_SHORT_LEN: usize = 255;
 /// client's job, and padding is a semantic no-op for HMAC).
 pub const MIN_HMAC_KEY_LEN: usize = 14;
 
-/// True when [`put`] can serialize `params` without exceeding the 255-byte
-/// short-APDU limits — the NAME TLV value, the KEY TLV value, and the total
-/// body. `put` **panics** past these bounds, so callers handling untrusted
-/// input (an imported `otpauth://` URI or QR code, whose name/secret lengths
-/// are attacker-controlled) must check this first and reject rather than build.
-#[must_use]
-pub fn put_fits(params: &PutParams<'_>) -> bool {
-    let name = params.name.len();
-    // KEY value = prefix byte + digits byte + secret (zero-padded to the
-    // minimum the card accepts — mirror of put()'s encoding).
-    let key_val = 2 + params.secret.len().max(MIN_HMAC_KEY_LEN);
-    if name > MAX_SHORT_LEN || key_val > MAX_SHORT_LEN {
-        return false;
-    }
-    // Body = NAME TLV + KEY TLV (+ optional PROPERTY and IMF TLVs), each TLV
-    // being tag(1) + len(1) + value.
-    let mut body = (2 + name) + (2 + key_val);
-    if params.require_touch {
-        body += 2 + 1;
-    }
-    if params.imf != 0 {
-        body += 2 + core::mem::size_of::<u32>();
-    }
-    body <= MAX_SHORT_LEN
-}
-
 /// Build a `PUT` APDU to provision a credential.
 ///
 /// Data layout: `NAME(0x71) || KEY(0x73) [|| PROPERTY(0x78) ][|| IMF(0x7A)]`.
 /// The KEY value is `[ (type<<4)|algo, digits, secret... ]`.
 ///
-/// # Panics
-/// Panics if the name/secret would overflow the 255-byte short-APDU body; call
-/// [`put_fits`] first for attacker-controlled input.
-#[must_use]
-pub fn put(params: &PutParams<'_>) -> Vec<u8> {
-    // Keep `put_fits` mechanically honest: it must never reject params this
-    // function can encode. (The reverse drift — `put_fits` accepting params
-    // that overflow — is caught by the boundary test and the size asserts
-    // below.)
-    debug_assert!(
-        put_fits(params),
-        "put() called with params put_fits() rejects"
-    );
+/// # Errors
+/// Returns [`BuildError`] when the name, the encoded key, or the composed
+/// body exceeds the 255-byte short-APDU limits. Names and secrets are
+/// attacker-controlled via imported `otpauth://` URIs and QR codes, so the
+/// overflow is a typed error rather than a panic.
+pub fn put(params: &PutParams<'_>) -> Result<Vec<u8>, BuildError> {
     // `key` and `data` hold the raw HMAC secret; wipe these intermediates on
     // drop. (The returned APDU also carries the secret and is wrapped in
     // Zeroizing by the transport layer.)
     let mut data = Zeroizing::new(Vec::new());
-    push_tlv(&mut data, Tag::Name, params.name.as_bytes());
+    try_push_tlv(&mut data, Tag::Name, "name", params.name.as_bytes())?;
 
     let mut key = Zeroizing::new(Vec::with_capacity(
         2 + params.secret.len().max(MIN_HMAC_KEY_LEN),
@@ -316,34 +344,39 @@ pub fn put(params: &PutParams<'_>) -> Vec<u8> {
     while key.len() < 2 + MIN_HMAC_KEY_LEN {
         key.push(0);
     }
-    push_tlv(&mut data, Tag::Key, &key);
+    try_push_tlv(&mut data, Tag::Key, "key", &key)?;
 
     if params.require_touch {
-        push_tlv(&mut data, Tag::Property, &[PROPERTY_REQUIRE_TOUCH]);
+        try_push_tlv(&mut data, Tag::Property, "property", &[PROPERTY_REQUIRE_TOUCH])?;
     }
     if params.imf != 0 {
-        push_tlv(&mut data, Tag::Imf, &params.imf.to_be_bytes());
+        try_push_tlv(&mut data, Tag::Imf, "imf", &params.imf.to_be_bytes())?;
     }
 
-    build_apdu(0x00, Instruction::Put.code(), 0x00, 0x00, &data)
+    finish_apdu(Instruction::Put.code(), 0x00, 0x00, &data)
 }
 
 /// Build a `DELETE` APDU removing the credential named `name`.
 /// Data layout: `NAME(0x71) <name>`.
-#[must_use]
-pub fn delete(name: &str) -> Vec<u8> {
+///
+/// # Errors
+/// Returns [`BuildError`] when `name` overflows the short-APDU framing.
+pub fn delete(name: &str) -> Result<Vec<u8>, BuildError> {
     let mut data = Vec::new();
-    push_tlv(&mut data, Tag::Name, name.as_bytes());
-    build_apdu(0x00, Instruction::Delete.code(), 0x00, 0x00, &data)
+    try_push_tlv(&mut data, Tag::Name, "name", name.as_bytes())?;
+    finish_apdu(Instruction::Delete.code(), 0x00, 0x00, &data)
 }
 
 /// Build a `RENAME` APDU. Data layout: `NAME(0x71) <old> || NAME(0x71) <new>`.
-#[must_use]
-pub fn rename(old: &str, new: &str) -> Vec<u8> {
+///
+/// # Errors
+/// Returns [`BuildError`] when either name (or the composed body) overflows
+/// the short-APDU framing.
+pub fn rename(old: &str, new: &str) -> Result<Vec<u8>, BuildError> {
     let mut data = Vec::new();
-    push_tlv(&mut data, Tag::Name, old.as_bytes());
-    push_tlv(&mut data, Tag::Name, new.as_bytes());
-    build_apdu(0x00, Instruction::Rename.code(), 0x00, 0x00, &data)
+    try_push_tlv(&mut data, Tag::Name, "old name", old.as_bytes())?;
+    try_push_tlv(&mut data, Tag::Name, "new name", new.as_bytes())?;
+    finish_apdu(Instruction::Rename.code(), 0x00, 0x00, &data)
 }
 
 /// Build a `LIST` APDU (case-2; the response is a sequence of `NAME_LIST` TLVs).
@@ -355,38 +388,33 @@ pub fn list() -> Vec<u8> {
 /// Build a `CALCULATE` APDU requesting a truncated OTP for `name`.
 ///
 /// `challenge` is the 8-byte big-endian counter (for TOTP,
-/// `floor(unix_time / period)`). P2 is set to [`P2_TRUNCATED`] so the card
-/// returns a `TRUNCATED_RESPONSE` (`0x76`).
+/// `floor(unix_time / period)`). P1 is 0; P2 is set to [`P2_TRUNCATED`] so the
+/// card returns a `TRUNCATED_RESPONSE` (`0x76`).
 /// Data layout: `NAME(0x71) <name> || CHALLENGE(0x74) <8 bytes>`.
-#[must_use]
-pub fn calculate(name: &str, challenge: &[u8; 8]) -> Vec<u8> {
+///
+/// # Errors
+/// Returns [`BuildError`] when `name` overflows the short-APDU framing —
+/// reachable with a name taken straight from a hostile card's own LIST
+/// response, so this must never panic.
+pub fn calculate(name: &str, challenge: &[u8; 8]) -> Result<Vec<u8>, BuildError> {
     let mut data = Vec::new();
-    push_tlv(&mut data, Tag::Name, name.as_bytes());
+    try_push_tlv(&mut data, Tag::Name, "name", name.as_bytes())?;
     push_tlv(&mut data, Tag::Challenge, challenge);
-    build_apdu(
-        0x00,
-        Instruction::Calculate.code(),
-        0x00,
-        P2_TRUNCATED,
-        &data,
-    )
+    finish_apdu(Instruction::Calculate.code(), 0x00, P2_TRUNCATED, &data)
 }
 
 /// Build a `CALCULATE` APDU for a HOTP credential, which carries an **empty**
 /// challenge: the card increments and uses its own internal counter. Data
 /// layout: `NAME(0x71) <name> || CHALLENGE(0x74) <0 bytes>`.
-#[must_use]
-pub fn calculate_hotp(name: &str) -> Vec<u8> {
+///
+/// # Errors
+/// Returns [`BuildError`] when `name` overflows the short-APDU framing (see
+/// [`calculate`] — the name may come from the card's own LIST response).
+pub fn calculate_hotp(name: &str) -> Result<Vec<u8>, BuildError> {
     let mut data = Vec::new();
-    push_tlv(&mut data, Tag::Name, name.as_bytes());
+    try_push_tlv(&mut data, Tag::Name, "name", name.as_bytes())?;
     push_tlv(&mut data, Tag::Challenge, &[]);
-    build_apdu(
-        0x00,
-        Instruction::Calculate.code(),
-        0x00,
-        P2_TRUNCATED,
-        &data,
-    )
+    finish_apdu(Instruction::Calculate.code(), 0x00, P2_TRUNCATED, &data)
 }
 
 /// Build a `CALCULATE_ALL` APDU (truncated). Data layout: `CHALLENGE(0x74) <8 bytes>`.
@@ -849,44 +877,99 @@ mod tests {
     }
 
     #[test]
-    fn put_fits_accepts_normal_credentials() {
-        assert!(put_fits(&params_with("alice@example.com", 20)));
-        assert!(put_fits(&params_with("x", 64)));
-    }
-
-    #[test]
-    fn put_fits_rejects_oversize_and_put_would_not_panic_when_checked() {
-        // A 300-byte name (e.g. from a hostile otpauth URI) overflows the NAME
-        // TLV; a huge secret overflows the KEY TLV; a name+secret that each fit
+    fn put_rejects_oversize_values() {
+        // A 300-byte name (e.g. from a hostile otpauth URI) overflows the
+        // NAME TLV; a huge secret overflows the KEY TLV (len counts the
+        // encoded prefix+digits+secret value); a name+secret that each fit
         // but jointly exceed 255 overflows the body.
         let long_name: &'static str = Box::leak("n".repeat(300).into_boxed_str());
-        assert!(!put_fits(&params_with(long_name, 20)));
-        assert!(!put_fits(&params_with("x", 300)));
+        assert_eq!(
+            put(&params_with(long_name, 20)),
+            Err(BuildError::ValueTooLong {
+                what: "name",
+                len: 300
+            })
+        );
+        assert_eq!(
+            put(&params_with("x", 300)),
+            Err(BuildError::ValueTooLong {
+                what: "key",
+                len: 302
+            })
+        );
         let name_200: &'static str = Box::leak("n".repeat(200).into_boxed_str());
-        assert!(!put_fits(&params_with(name_200, 64)));
+        assert!(matches!(
+            put(&params_with(name_200, 64)),
+            Err(BuildError::BodyTooLong { .. })
+        ));
     }
 
     #[test]
-    fn put_fits_boundary_matches_put_encoding() {
-        // Mechanical tie between put_fits()'s arithmetic and put()'s actual
-        // encoding, with every optional TLV present: at the exact 255-byte
-        // body boundary put_fits must say yes AND put must encode without
-        // panicking; one byte over, put_fits must say no. If a future TLV is
-        // added to put() without updating put_fits, the "fits" case here
-        // trips put()'s internal size assert and fails this test.
+    fn put_boundary_at_exact_short_apdu_limit() {
+        // Body = NAME(2+100) + KEY(2+2+140) + PROPERTY(2+1) + IMF(2+4) = 255:
+        // must encode, with Lc = 255. One more name byte: typed error.
         let name_at: &'static str = Box::leak("n".repeat(100).into_boxed_str());
-        // Body = NAME(2+100) + KEY(2+2+140) + PROPERTY(2+1) + IMF(2+4) = 255.
         let mut at = params_with(name_at, 140);
         at.require_touch = true;
         at.imf = 1;
-        assert!(put_fits(&at));
-        let apdu = put(&at);
-        assert!(!apdu.is_empty());
+        let apdu = put(&at).expect("255-byte body must encode");
+        assert_eq!(apdu[4], 255);
 
         let mut over = at;
         let name_over: &'static str = Box::leak("n".repeat(101).into_boxed_str());
         over.name = name_over;
-        assert!(!put_fits(&over));
+        assert_eq!(put(&over), Err(BuildError::BodyTooLong { len: 256 }));
+    }
+
+    #[test]
+    fn delete_and_calculate_boundaries() {
+        // delete body = (2 + name).
+        let n253: &'static str = Box::leak("n".repeat(253).into_boxed_str());
+        assert_eq!(delete(n253).unwrap()[4], 255);
+        let n254: &'static str = Box::leak("n".repeat(254).into_boxed_str());
+        assert_eq!(delete(n254), Err(BuildError::BodyTooLong { len: 256 }));
+        let n256: &'static str = Box::leak("n".repeat(256).into_boxed_str());
+        assert_eq!(
+            delete(n256),
+            Err(BuildError::ValueTooLong {
+                what: "name",
+                len: 256
+            })
+        );
+
+        // calculate body = (2 + name) + (2 + 8).
+        let ch = [0u8; 8];
+        let n243: &'static str = Box::leak("n".repeat(243).into_boxed_str());
+        assert_eq!(calculate(n243, &ch).unwrap()[4], 255);
+        let n244: &'static str = Box::leak("n".repeat(244).into_boxed_str());
+        assert_eq!(calculate(n244, &ch), Err(BuildError::BodyTooLong { len: 256 }));
+
+        // calculate_hotp body = (2 + name) + 2 (empty challenge TLV).
+        let n251: &'static str = Box::leak("n".repeat(251).into_boxed_str());
+        assert_eq!(calculate_hotp(n251).unwrap()[4], 255);
+        let n252: &'static str = Box::leak("n".repeat(252).into_boxed_str());
+        assert_eq!(calculate_hotp(n252), Err(BuildError::BodyTooLong { len: 256 }));
+    }
+
+    #[test]
+    fn device_listed_overlong_name_yields_error_not_panic() {
+        // KEY-018 malicious-card path: a protocol-valid NAME_LIST TLV may
+        // carry up to 254 bytes of name. Such a name must parse out of LIST
+        // and then fail the follow-up CALCULATE with a bounded error —
+        // never a panic in the worker that computes codes per listed name.
+        let name = "n".repeat(250);
+        let mut buf = vec![0x72, 251, 0x21]; // NAME_LIST, len = prefix + 250, TOTP/SHA1
+        buf.extend_from_slice(name.as_bytes());
+        let listing = parse_list(&buf).unwrap();
+        assert_eq!(listing.credentials.len(), 1);
+        let listed = &listing.credentials[0].name;
+        assert_eq!(listed.len(), 250);
+        assert_eq!(
+            calculate(listed, &[0u8; 8]),
+            Err(BuildError::BodyTooLong { len: 262 })
+        );
+        // The same name still fits a DELETE, so the entry stays removable.
+        assert!(delete(listed).is_ok());
     }
 
     #[test]
@@ -905,7 +988,7 @@ mod tests {
             require_touch: false,
             imf: 0,
         };
-        let apdu = put(&params);
+        let apdu = put(&params).unwrap();
         // header: 00 01 00 00
         // NAME(71) len2 "ab" = 71 02 61 62
         // KEY(73) len16: prefix (0x20|0x01=0x21) digits(06) secret(01 02 03)
@@ -925,12 +1008,12 @@ mod tests {
     fn put_pads_short_secret_and_leaves_long_alone() {
         // The 10-byte "JBSWY3DPEHPK3PXP" doc secret must pad to 14 key bytes…
         let short = params_with("x", 10);
-        let apdu = put(&short);
+        let apdu = put(&short).unwrap();
         let key_len = apdu[apdu.iter().position(|&b| b == 0x73).unwrap() + 1];
         assert_eq!(key_len, 2 + MIN_HMAC_KEY_LEN as u8);
         // …while a 20-byte RFC 6238 key is sent as-is.
         let long = params_with("y", 20);
-        let apdu = put(&long);
+        let apdu = put(&long).unwrap();
         let key_len = apdu[apdu.iter().position(|&b| b == 0x73).unwrap() + 1];
         assert_eq!(key_len, 2 + 20);
     }
@@ -946,7 +1029,7 @@ mod tests {
             require_touch: true,
             imf: 1,
         };
-        let apdu = put(&params);
+        let apdu = put(&params).unwrap();
         // Expected bytes changed with client-side key padding (see
         // put_bytes_fixed_vector): the 1-byte secret pads to 14 key bytes.
         let expected = vec![
@@ -965,7 +1048,7 @@ mod tests {
     #[test]
     fn calculate_bytes_fixed_vector() {
         let challenge = [0x00, 0x00, 0x00, 0x00, 0x03, 0x4F, 0x09, 0x6D];
-        let apdu = calculate("ab", &challenge);
+        let apdu = calculate("ab", &challenge).unwrap();
         // header: 00 A2 00 01 (P2 truncated)
         // NAME(71) 02 "ab", CHALLENGE(74) 08 <8 bytes>
         // Lc = 4 + 10 = 14 = 0x0E
@@ -978,7 +1061,7 @@ mod tests {
 
     #[test]
     fn delete_bytes() {
-        let apdu = delete("ab");
+        let apdu = delete("ab").unwrap();
         assert_eq!(
             apdu,
             vec![0x00, 0x02, 0x00, 0x00, 0x04, 0x71, 0x02, 0x61, 0x62]
@@ -988,7 +1071,7 @@ mod tests {
     #[test]
     fn calculate_hotp_has_empty_challenge() {
         // NAME(0x71,2)"ab" + CHALLENGE(0x74,0). P2 = truncated (0x01).
-        let apdu = calculate_hotp("ab");
+        let apdu = calculate_hotp("ab").unwrap();
         assert_eq!(
             apdu,
             vec![0x00, 0xA2, 0x00, 0x01, 0x06, 0x71, 0x02, 0x61, 0x62, 0x74, 0x00]

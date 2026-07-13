@@ -121,8 +121,10 @@ pub enum TransportError {
     /// start, or an algorithm that cannot sign).
     X509(keyroost_piv::x509::X509Error),
     /// An OATH credential's name and/or secret would overflow the 255-byte
-    /// short-APDU body. Caught before building the APDU (the pure builder would
-    /// otherwise panic); reachable from an imported otpauth:// URI or QR code.
+    /// short-APDU body. Mapped from the byte layer's fallible builders;
+    /// reachable from an imported otpauth:// URI or QR code, and from a
+    /// hostile card whose LIST response names are too long to use in
+    /// follow-up CALCULATE/DELETE commands.
     OathCredentialTooLong,
     /// The RSA key's public exponent is wider than the OpenPGP card's declared
     /// exponent field (`e_bits`). Caught before building the import (the pure
