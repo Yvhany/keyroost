@@ -10523,7 +10523,7 @@ impl App {
         // --- Selected key content (single column under the strip) -----------
         ui.add_space(14.0);
         ui.label(
-            egui::RichText::new(format!("State: {}", &sel_state))
+            egui::RichText::new(format!("State: {sel_state}"))
                 .font(theme::f_reg(12.5))
                 .color(p.txt2),
         );
@@ -10916,7 +10916,7 @@ impl App {
         // cards (unchanged from the old detail column) in single-column flow.
         ui.add_space(14.0);
         ui.label(
-            egui::RichText::new(format!("State: {}", &sel_state))
+            egui::RichText::new(format!("State: {sel_state}"))
                 .font(theme::f_reg(12.5))
                 .color(p.txt2),
         );
