@@ -178,8 +178,8 @@ impl OathSession {
         let challenge = oath::totp_challenge(unix_time, period);
         // `name` may come straight from the card's own LIST response; an
         // overlong one must surface as an error, not a panic (KEY-018).
-        let apdu = oath::calculate(name, &challenge)
-            .map_err(|_| TransportError::OathCredentialTooLong)?;
+        let apdu =
+            oath::calculate(name, &challenge).map_err(|_| TransportError::OathCredentialTooLong)?;
         let (data, sw) = self.transmit_full(&apdu)?;
         ok_or_apdu("oath calculate", sw)?;
         oath::parse_calculate(&data).map_err(TransportError::OathParse)
@@ -189,8 +189,7 @@ impl OathSession {
     /// counter, so no challenge is supplied. A touch-required credential blocks
     /// until the user touches the key.
     pub fn calculate_hotp(&mut self, name: &str) -> Result<oath::OtpCode, TransportError> {
-        let apdu =
-            oath::calculate_hotp(name).map_err(|_| TransportError::OathCredentialTooLong)?;
+        let apdu = oath::calculate_hotp(name).map_err(|_| TransportError::OathCredentialTooLong)?;
         let (data, sw) = self.transmit_full(&apdu)?;
         ok_or_apdu("oath calculate (hotp)", sw)?;
         oath::parse_calculate(&data).map_err(TransportError::OathParse)
@@ -201,9 +200,8 @@ impl OathSession {
         // An over-long name/secret (e.g. from an imported otpauth:// URI)
         // surfaces as a typed error from the fallible builder.
         // The PUT body carries the raw TOTP/HOTP seed — wipe it after transmit.
-        let apdu = Zeroizing::new(
-            oath::put(params).map_err(|_| TransportError::OathCredentialTooLong)?,
-        );
+        let apdu =
+            Zeroizing::new(oath::put(params).map_err(|_| TransportError::OathCredentialTooLong)?);
         let (_, sw) = self.transmit_full(&apdu)?;
         ok_or_apdu("oath put", sw)
     }

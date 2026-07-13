@@ -258,10 +258,7 @@ const NONBLOCK_POLL_SLEEP: std::time::Duration = std::time::Duration::from_milli
 /// it at their overall deadline instead of spinning. Generic over `Read` so
 /// tests can drive it with a nonblocking socket instead of real hardware.
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
-pub fn read_nonblocking_bounded<F: std::io::Read>(
-    f: &mut F,
-    buf: &mut [u8],
-) -> io::Result<usize> {
+pub fn read_nonblocking_bounded<F: std::io::Read>(f: &mut F, buf: &mut [u8]) -> io::Result<usize> {
     buf.fill(0);
     let deadline = std::time::Instant::now() + HIDRAW_READ_BUDGET;
     loop {

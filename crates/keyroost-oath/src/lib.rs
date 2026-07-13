@@ -347,7 +347,12 @@ pub fn put(params: &PutParams<'_>) -> Result<Vec<u8>, BuildError> {
     try_push_tlv(&mut data, Tag::Key, "key", &key)?;
 
     if params.require_touch {
-        try_push_tlv(&mut data, Tag::Property, "property", &[PROPERTY_REQUIRE_TOUCH])?;
+        try_push_tlv(
+            &mut data,
+            Tag::Property,
+            "property",
+            &[PROPERTY_REQUIRE_TOUCH],
+        )?;
     }
     if params.imf != 0 {
         try_push_tlv(&mut data, Tag::Imf, "imf", &params.imf.to_be_bytes())?;
@@ -942,13 +947,19 @@ mod tests {
         let n243: &'static str = Box::leak("n".repeat(243).into_boxed_str());
         assert_eq!(calculate(n243, &ch).unwrap()[4], 255);
         let n244: &'static str = Box::leak("n".repeat(244).into_boxed_str());
-        assert_eq!(calculate(n244, &ch), Err(BuildError::BodyTooLong { len: 256 }));
+        assert_eq!(
+            calculate(n244, &ch),
+            Err(BuildError::BodyTooLong { len: 256 })
+        );
 
         // calculate_hotp body = (2 + name) + 2 (empty challenge TLV).
         let n251: &'static str = Box::leak("n".repeat(251).into_boxed_str());
         assert_eq!(calculate_hotp(n251).unwrap()[4], 255);
         let n252: &'static str = Box::leak("n".repeat(252).into_boxed_str());
-        assert_eq!(calculate_hotp(n252), Err(BuildError::BodyTooLong { len: 256 }));
+        assert_eq!(
+            calculate_hotp(n252),
+            Err(BuildError::BodyTooLong { len: 256 })
+        );
     }
 
     #[test]

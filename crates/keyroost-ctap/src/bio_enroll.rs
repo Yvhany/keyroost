@@ -457,7 +457,10 @@ mod tests {
             self.calls += 1;
             // {4: templateId, 5: lastSampleStatus = good, 6: remaining = 1}.
             let map = Value::Map(vec![
-                (Value::UInt(RESP_TEMPLATE_ID), Value::Bytes(vec![0xAA, 0xBB])),
+                (
+                    Value::UInt(RESP_TEMPLATE_ID),
+                    Value::Bytes(vec![0xAA, 0xBB]),
+                ),
                 (Value::UInt(RESP_LAST_ENROLL_SAMPLE_STATUS), Value::UInt(0)),
                 (Value::UInt(RESP_REMAINING_SAMPLES), Value::UInt(1)),
             ]);
