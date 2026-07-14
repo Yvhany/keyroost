@@ -13,6 +13,25 @@ pub struct Frame {
     pub rgba: Vec<u8>,
 }
 
+/// Byte length of a `w × h` RGBA8 frame (`w * h * 4`), or an error if it
+/// overflows `usize`. Pulled out of `capture_virtual_screen` so this guard
+/// is exercised off-Windows: on a 32-bit target `usize` is 32-bit and a
+/// large multi-monitor desktop can wrap the product, which would undersize
+/// the buffer `GetDIBits` writes into (a heap overflow). This crate is
+/// published to crates.io, where a consumer's release profile may not
+/// enable overflow-checks, so the check is explicit rather than relying on
+/// them. Inputs are the already-validated non-negative dimensions cast to
+/// `usize`.
+// Off-Windows the only caller is the cfg(windows) capture path, so the fn is
+// otherwise "dead" there — but it must stay compiled on every target so the
+// host test suite exercises the overflow branch.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn rgba_buf_len_checked(w: usize, h: usize) -> Result<usize, String> {
+    w.checked_mul(h)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| "virtual screen dimensions too large to capture".into())
+}
+
 /// Capture the whole virtual screen (all monitors). Returns an error string
 /// describing why capture failed; on non-Windows targets it is always an error.
 #[cfg(windows)]
@@ -43,10 +62,7 @@ pub fn capture_virtual_screen() -> Result<Frame, String> {
         // an undersized buffer from a wrapped length would be a heap overflow.
         // (This crate is published to crates.io, where a consumer's release
         // profile may not enable overflow-checks — so don't rely on those.)
-        let buf_len = (w as usize)
-            .checked_mul(h as usize)
-            .and_then(|n| n.checked_mul(4))
-            .ok_or("virtual screen dimensions too large to capture")?;
+        let buf_len = rgba_buf_len_checked(w as usize, h as usize)?;
 
         let screen = GetDC(std::ptr::null_mut());
         if screen.is_null() {
@@ -136,4 +152,28 @@ pub fn capture_virtual_screen() -> Result<Frame, String> {
 #[cfg(not(windows))]
 pub fn capture_virtual_screen() -> Result<Frame, String> {
     Err("the GDI screen-capture backend is Windows-only".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rgba_buf_len_checked;
+
+    #[test]
+    fn computes_a_normal_frame_length() {
+        assert_eq!(rgba_buf_len_checked(1920, 1080), Ok(1920 * 1080 * 4));
+    }
+
+    #[test]
+    fn zero_area_is_zero() {
+        assert_eq!(rgba_buf_len_checked(0, 0), Ok(0));
+    }
+
+    #[test]
+    fn overflow_is_an_error_not_a_wrap() {
+        // Guards 32-bit `usize` consumers: w*h*4 that exceeds usize::MAX
+        // must return Err, never a wrapped (undersized) length that would
+        // let GetDIBits overrun the readback buffer.
+        assert!(rgba_buf_len_checked(usize::MAX / 2, 3).is_err());
+        assert!(rgba_buf_len_checked(usize::MAX, 1).is_err());
+    }
 }
