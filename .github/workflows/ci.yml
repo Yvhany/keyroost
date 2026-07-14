@@ -19,6 +19,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # KEY-001 regression guard: release/packaging files must not fetch or execute
+  # anything from a mutable ref (master/continuous/:latest/bare image tag)
+  # unless a checksum step content-pins it (marked `# pinned-verified:`).
+  pinned-inputs:
+    name: Release inputs are immutable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Check release/packaging inputs are pinned
+        run: bash packaging/ci/check-pinned-inputs.sh
+
   # One source tree, compiled and tested three ways. This matrix is what keeps
   # the macOS/Windows code (the cfg-gated hidapi HID backend) from rotting: a
   # Linux-only change that breaks another platform fails the PR here, so we never

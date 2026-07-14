@@ -53,18 +53,27 @@ BIN="${REPO_ROOT}/target/release/keyroost"
 [ -x "${BIN}" ] || { echo "ERROR: ${BIN} not built"; exit 1; }
 
 # ---------------------------------------------------------------------------
-# 2. Fetch linuxdeploy + its appimage plugin (continuous builds). These bundle
-#    the binary's dependent .so files into the AppDir and emit the AppImage.
-#    TODO(maintainer): pin specific linuxdeploy/appimagetool releases for
-#    reproducibility instead of "continuous".
+# 2. Fetch linuxdeploy + its appimage plugin. Upstream publishes only the
+#    rolling `continuous` release, so we pin by CONTENT: the sha256 below is
+#    resolved from the release asset's recorded digest and re-verified on
+#    every build. A changed upstream binary fails the build closed rather
+#    than silently shipping unreviewed code into an official AppImage.
 # ---------------------------------------------------------------------------
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 LD_BASE="https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous"
 LDP_BASE="https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous"
-fetch() { [ -f "$2" ] || curl -fsSL -o "$2" "$1"; chmod +x "$2"; }
-fetch "${LD_BASE}/linuxdeploy-x86_64.AppImage"                    linuxdeploy.AppImage
-fetch "${LDP_BASE}/linuxdeploy-plugin-appimage-x86_64.AppImage"   linuxdeploy-plugin-appimage.AppImage
+# pinned-verified: sha256 checked below before chmod +x / execution
+LD_SHA256="e87ee0815d109282fdda73e34c2361d64d02b0ffaea3674b18f1fd1f6a687dcf"
+# pinned-verified: sha256 checked below before chmod +x / execution
+LDP_SHA256="1da16a46fa5e058ae740e7c35ed0d36d86cb869ac9cc8a5fd9a1847d7978d99a"
+fetch() { # url dest sha256
+  [ -f "$2" ] || curl -fsSL -o "$2" "$1"
+  echo "$3  $2" | sha256sum -c -
+  chmod +x "$2"
+}
+fetch "${LD_BASE}/linuxdeploy-x86_64.AppImage"                  linuxdeploy.AppImage                 "${LD_SHA256}"
+fetch "${LDP_BASE}/linuxdeploy-plugin-appimage-x86_64.AppImage" linuxdeploy-plugin-appimage.AppImage "${LDP_SHA256}"
 
 # In CI/containers without FUSE, run the tools extracted:
 export APPIMAGE_EXTRACT_AND_RUN=1

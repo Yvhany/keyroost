@@ -67,6 +67,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write # gh release upload writes a release asset
+      id-token: write # attest-build-provenance signs the AppImage
+      attestations: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -107,6 +109,20 @@ jobs:
           echo "zsync=${zsync}" >> "$GITHUB_OUTPUT"
           echo "zsync ${zsync:-<none>}"
 
+      # Give the AppImage the same provenance + checksum treatment the main
+      # release archives get in release.yml.
+      - name: Attest AppImage provenance
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: ${{ steps.find.outputs.path }}
+
+      - name: Checksum AppImage
+        run: |
+          set -euo pipefail
+          img="${{ steps.find.outputs.path }}"
+          ( cd "$(dirname "${img}")" && sha256sum "$(basename "${img}")" > "$(basename "${img}").sha256" )
+
       - name: Upload AppImage as artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -129,7 +145,7 @@ jobs:
           zsync="${{ steps.find.outputs.zsync }}"
           for i in 1 2 3 4 5 6; do
             if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-              gh release upload "${GITHUB_REF_NAME}" "${img}" ${zsync:+"${zsync}"} \
+              gh release upload "${GITHUB_REF_NAME}" "${img}" "${img}.sha256" ${zsync:+"${zsync}"} \
                 --repo "${GITHUB_REPOSITORY}" --clobber
               exit 0
             fi
@@ -150,7 +166,10 @@ jobs:
     # The official flatpak-builder action expects to run inside the freedesktop
     # flatpak image so the runtime/SDK + flatpak-builder are present.
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
+      # freedesktop-25.08, pinned to the immutable index digest (KEY-001). To
+      # take an upstream refresh, re-resolve the tag's digest and update here;
+      # the pinned-inputs CI job rejects a return to the floating tag.
+      image: ghcr.io/flathub-infra/flatpak-github-actions@sha256:bfd8c547d9607860b39ead830f13dfa2b712bd3edd4965ce5473e000f8c37a5b
       options: --privileged
     # Read-only token here: this job only BUILDS. The dependent flatpak-publish
     # job (on a normal ubuntu runner, where gh + git are guaranteed present)
@@ -167,8 +186,10 @@ jobs:
       - name: Generate cargo-sources.json
         run: |
           set -euo pipefail
-          pip install --quiet 'aiohttp>=3.9.5,<4' 'PyYAML>=6.0.2,<7' 'tomlkit>=0.13.3,<1.0'
-          curl -fsSLO https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+          pip install --require-hashes -r packaging/flatpak/requirements.txt
+          gen_sha256="b373c8ab1a05378ec5d8ed0645c7b127bcec7d2f7a1798694fbc627d570d856c"
+          curl -fsSLO "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/737c0085912f9f7dabf9341d4608e2a77a51a73a/cargo/flatpak-cargo-generator.py"
+          echo "${gen_sha256}  flatpak-cargo-generator.py" | sha256sum -c -
           python3 flatpak-cargo-generator.py Cargo.lock \
             -o packaging/flatpak/cargo-sources.json
           echo "generated $(python3 -c 'import json,sys; print(len(json.load(open("packaging/flatpak/cargo-sources.json"))))') source entries"
@@ -246,12 +267,23 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write # gh release upload + git push of the OSTree tree to Pages
+      id-token: write # attest-build-provenance signs the .flatpak
+      attestations: write
     steps:
       - name: Download flatpak payload
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: keyroost-flatpak
           path: out
+
+      # Same provenance + checksum treatment the main release archives get.
+      - name: Attest .flatpak provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: out/keyroost.flatpak
+
+      - name: Checksum .flatpak
+        run: ( cd out && sha256sum keyroost.flatpak > keyroost.flatpak.sha256 )
 
       # Attach the single-file bundle to the release (offline / one-off install).
       # Retry-and-clobber: this workflow and release.yml run concurrently on the
@@ -263,7 +295,7 @@ jobs:
           set -euo pipefail
           for i in 1 2 3 4 5 6; do
             if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-              gh release upload "${GITHUB_REF_NAME}" out/keyroost.flatpak \
+              gh release upload "${GITHUB_REF_NAME}" out/keyroost.flatpak out/keyroost.flatpak.sha256 \
                 --repo "${GITHUB_REPOSITORY}" --clobber
               exit 0
             fi
