@@ -6,6 +6,65 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-07-14
+
+A security-focused release: every open finding from an external security
+audit (KEY-001..KEY-020) plus a full branch review is closed here. Thanks to
+the auditors for a thorough, actionable report.
+
+### Security
+- **Operations are bound to the exact device you selected.** Previously,
+  several GUI flows (Molto2 sessions, FIDO PIN dialogs, OATH/OpenPGP
+  confirmations, fingerprint and large-blob operations, the OTP pane) and the
+  CLI `otp`/`molto` command groups could act on the *first matching* key or on
+  a stale selection — with two keys plugged in, a write, delete, or factory
+  reset confirmed for one key could land on the other. Every session, modal,
+  and destructive confirmation now records the device it opened for, verifies
+  it before acting, and is discarded when the selection changes. An armed FIDO
+  reset re-identifies the replugged key by a stable serial and refuses to arm
+  for a key that has none.
+- **Two keys reporting the same serial no longer collapse into one identity.**
+  Name resolution (`--device`, friendly names) fails closed with an ambiguity
+  error instead of guessing, and the GUI warns that naming cannot tell such
+  keys apart (they stay separately selectable).
+- **Hostile or buggy devices can no longer panic or hang keyroost.** The
+  published OATH, PIV, and OpenPGP byte layers return typed errors instead of
+  panicking on device- or caller-supplied lengths; device-driven loops (OTP
+  enumeration pages, fingerprint capture, wrong-length retries, the Windows
+  HID path scan) are bounded by host-owned caps; and Linux hidraw reads are
+  budgeted so a device that goes silent mid-response can't block forever.
+- **Debug traces and terminal output leak less.** CTAP request payloads
+  (friendly names, user entities) and large-blob traffic are redacted in
+  debug traces; all terminal sanitization goes through one classifier
+  covering the full set of spoofing/bidi/zero-width codepoints.
+- **Secret file output is symlink-safe.** `keyroostctl`'s private-file writer
+  creates an exclusively-owned 0600 file and renames it into place, refusing
+  symlinks, non-regular files, and foreign-owned destinations.
+- **The release supply chain is pinned.** The AppImage/Flatpak build inputs
+  (cargo-sources generator, its Python deps, linuxdeploy, the Flatpak builder
+  image) are pinned to immutable commits, content hashes, or digests and
+  verified before execution; a CI policy check rejects any return to mutable
+  refs; both bundles now ship sha256 sidecars and build-provenance
+  attestations like the main archives.
+- **6Cxx wrong-length retry regression fixed:** the retry no longer corrupts
+  body-carrying Token2 OTP commands (it overwrote the last data byte of the
+  encrypted seed with an Le byte).
+- SECURITY.md now states precisely where `unsafe` exists (two Windows-only
+  FFI shim crates); the workspace-wide forbid stands everywhere else.
+
+### Fixed
+- **On-demand HOTP codes on password-protected OATH keys.** The listing
+  consumed the typed password, so "Read code" always sent an empty one and
+  failed; the accepted password is now retained (zeroized) for follow-up
+  reads and dropped on rejection or device switch.
+- **Credential listing survives one malformed RP entry** from quirky
+  authenticators instead of aborting the whole enumeration — and no longer
+  queries a guessed RP hash for such entries.
+- GUI settings and the key registry can no longer resolve to different
+  config directories on Windows (the duplicated resolver that caused the
+  earlier settings-persistence bug is gone).
+- The rename field no longer keeps a 2 Hz repaint loop armed while open.
+
 ## [0.7.4] - 2026-07-06
 
 ### Added
@@ -504,6 +563,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
   (for RSA keygen/parsing) `rsa`/`rand`.
 
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.7.4...HEAD
+[0.7.5]: https://github.com/framefilter/keyroost/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/framefilter/keyroost/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/framefilter/keyroost/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/framefilter/keyroost/compare/v0.7.1...v0.7.2
