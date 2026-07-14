@@ -552,6 +552,26 @@ impl PcScOtpTransport {
         Err(OtpTransportError::TokenNotDetected)
     }
 
+    /// Connect to one explicitly named reader and SELECT the OTP applet. Unlike
+    /// [`open_first`](Self::open_first) this never scans other readers, so a
+    /// caller that resolved a `--device` selection binds to exactly that reader.
+    pub fn open_reader_debug(reader_name: &str, debug: bool) -> Result<Self, OtpTransportError> {
+        let ctx = pcsc::Context::establish(pcsc::Scope::User)?;
+        let cname = std::ffi::CString::new(reader_name).map_err(|_| {
+            OtpTransportError::TransportUnavailable("reader name contained a NUL".into())
+        })?;
+        let card = ctx
+            .connect(&cname, pcsc::ShareMode::Shared, pcsc::Protocols::ANY)
+            .or_else(|_| ctx.connect(&cname, pcsc::ShareMode::Exclusive, pcsc::Protocols::ANY))?;
+        let mut t = PcScOtpTransport {
+            card,
+            debug,
+            current_aid: Vec::new(),
+        };
+        t.select(&t2::OTP_APPLET_AID)?;
+        Ok(t)
+    }
+
     fn select(&mut self, aid: &[u8]) -> Result<(), OtpTransportError> {
         let (_, sw) = self.raw_transmit(&t2::build_select(aid))?;
         OtpError::check(sw)?;
@@ -849,6 +869,28 @@ impl Token2OtpSession {
     /// Force the PC/SC (CCID / NFC) transport (no HID).
     pub fn detect_pcsc_only(debug: bool) -> Result<Self, OtpTransportError> {
         let t = PcScOtpTransport::open_first_debug(debug)?;
+        Ok(Self {
+            transport: Box::new(t),
+            is_pcsc: true,
+        })
+    }
+
+    /// Open the OTP applet on one explicitly resolved USB-HID device path (no
+    /// first-match scan). Probes the applet the same way [`detect_hid_only`] does.
+    pub fn open_hid_path(path: &Path, debug: bool) -> Result<Self, OtpTransportError> {
+        let mut t = HidOtpTransport::open_path(path)?;
+        t.set_debug(debug);
+        let t = probe_hid_owned(t).map_err(|(e, _)| e)?;
+        Ok(Self {
+            transport: Box::new(t),
+            is_pcsc: false,
+        })
+    }
+
+    /// Open the OTP applet on one explicitly resolved PC/SC reader (no
+    /// first-match scan).
+    pub fn open_pcsc_reader(reader_name: &str, debug: bool) -> Result<Self, OtpTransportError> {
+        let t = PcScOtpTransport::open_reader_debug(reader_name, debug)?;
         Ok(Self {
             transport: Box::new(t),
             is_pcsc: true,
