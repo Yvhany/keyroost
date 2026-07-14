@@ -140,5 +140,98 @@ pub fn relaunch_as_admin() -> Result<()> {
     }
 }
 
+/// Parse the UTF-16 `DevicePath` out of a `SP_DEVICE_INTERFACE_DETAIL_DATA_W`
+/// byte buffer as returned by `SetupDiGetDeviceInterfaceDetailW`.
+///
+/// The Win32 struct is `{ DWORD cbSize; WCHAR DevicePath[ANYSIZE_ARRAY]; }`,
+/// so the path begins at byte offset 4 and is a NUL-terminated UTF-16LE
+/// string. `buf` (a `Vec<u8>`) carries only byte alignment and its
+/// terminator is device/SetupApi-controlled, so every 16-bit unit is read
+/// with `u16::from_le_bytes` (no `*const u16` deref) and the scan is bounded
+/// by `buf.len()` — a buffer missing its terminator cannot drive an
+/// out-of-bounds read (KEY-020). Windows is little-endian, matching
+/// `from_le_bytes`.
+///
+/// The only production caller is the `#[cfg(windows)]` `sys` module; on other
+/// hosts the function exists solely so the unit tests below exercise it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn parse_detail_path(buf: &[u8]) -> String {
+    const PATH_OFFSET: usize = 4;
+    let mut units = Vec::new();
+    let mut i = PATH_OFFSET;
+    while i + 2 <= buf.len() {
+        let unit = u16::from_le_bytes([buf[i], buf[i + 1]]);
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+        i += 2;
+    }
+    String::from_utf16_lossy(&units)
+}
+
 #[cfg(windows)]
 mod sys;
+
+#[cfg(test)]
+mod tests {
+    use super::parse_detail_path;
+
+    /// Build a SP_DEVICE_INTERFACE_DETAIL_DATA_W-shaped byte buffer:
+    /// 4-byte cbSize, then UTF-16LE `path`, then (optionally) a NUL unit.
+    fn detail(path: &str, terminated: bool) -> Vec<u8> {
+        let mut b = vec![0x08, 0x00, 0x00, 0x00]; // cbSize placeholder
+        for u in path.encode_utf16() {
+            b.extend_from_slice(&u.to_le_bytes());
+        }
+        if terminated {
+            b.extend_from_slice(&[0x00, 0x00]);
+        }
+        b
+    }
+
+    #[test]
+    fn parses_a_normal_terminated_path() {
+        let p = r"\\?\hid#vid_349e&pid_0026&mi_01#7&abc{guid}";
+        assert_eq!(parse_detail_path(&detail(p, true)), p);
+    }
+
+    #[test]
+    fn parsing_is_independent_of_slice_alignment() {
+        // A Vec<u8> offset by one byte yields an odd-addressed slice; the
+        // parser must not depend on u16 alignment.
+        let p = r"\\?\hid#vid_1050&pid_0407#x";
+        let mut padded = vec![0xAAu8];
+        padded.extend_from_slice(&detail(p, true));
+        assert_eq!(parse_detail_path(&padded[1..]), p);
+    }
+
+    #[test]
+    fn stops_at_buffer_end_when_terminator_is_missing() {
+        // The KEY-020 regression: no NUL in the buffer must NOT over-read;
+        // the scan is bounded by buf.len() and returns what it has.
+        let p = "abcdef";
+        assert_eq!(parse_detail_path(&detail(p, false)), p);
+    }
+
+    #[test]
+    fn tolerates_a_trailing_odd_byte() {
+        // A dangling high byte (len not a whole number of u16 units past the
+        // offset) must not panic; the incomplete unit is dropped.
+        let mut b = detail("hi", false);
+        b.push(0x41); // lone trailing byte
+        assert_eq!(parse_detail_path(&b), "hi");
+    }
+
+    #[test]
+    fn handles_a_long_path() {
+        let p = format!(r"\\?\hid#{}#col01", "a".repeat(600));
+        assert_eq!(parse_detail_path(&detail(&p, true)), p);
+    }
+
+    #[test]
+    fn empty_or_too_short_buffer_is_empty_string() {
+        assert_eq!(parse_detail_path(&[]), "");
+        assert_eq!(parse_detail_path(&[0x08, 0x00, 0x00]), ""); // < offset+2
+    }
+}

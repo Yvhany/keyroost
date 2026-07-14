@@ -147,25 +147,14 @@ fn detect_fido_keys_impl(verbose: bool) -> (Vec<FidoKeyInfo>, Vec<String>) {
                 dbg!("dev {}: SetupDiGetDeviceInterfaceDetailW failed", index);
                 continue;
             }
-            // DevicePath starts at offset 4 into the detail struct. That offset
-            // into a Vec<u8> may be 2-misaligned, so read each UTF-16 unit with
-            // read_unaligned and never form a (necessarily aligned) &[u16].
+            // Parse the device path for our own use (matching/logging) with a
+            // safe, extent-bounded reader that needs no u16 alignment and
+            // cannot over-read a terminator-less buffer (KEY-020).
+            let path = crate::parse_detail_path(&buf);
+            // Raw pointer to the same NUL-terminated UTF-16 path for the Win32
+            // CreateFileW call below. SetupApi guarantees the terminator on
+            // success; CreateFileW reads up to it.
             let path_ptr = buf.as_ptr().add(4) as *const u16;
-            // Read the path into a Rust string (no device open needed). The HID
-            // path looks like: \\?\hid#vid_349e&pid_0026&mi_01&col01#...{guid}
-            let path = {
-                let mut units = Vec::new();
-                let mut i = 0usize;
-                loop {
-                    let unit = std::ptr::read_unaligned(path_ptr.add(i));
-                    if unit == 0 {
-                        break;
-                    }
-                    units.push(unit);
-                    i += 1;
-                }
-                String::from_utf16_lossy(&units)
-            };
             let path_lc = path.to_ascii_lowercase();
             let (path_vid, path_pid) = parse_vid_pid(&path_lc);
 
