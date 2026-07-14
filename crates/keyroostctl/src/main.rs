@@ -3324,17 +3324,31 @@ fn fido_target_hint(path: Option<&Path>) -> String {
 
 /// Find the connected device named `name` and return its PC/SC reader substring.
 /// Pure over an already-enumerated device list so it is unit-testable without
-/// hardware. First-match today; Task 23 upgrades it to fail closed on ambiguity.
+/// hardware. Fails closed when more than one device carries the name (KEY-015).
 fn reader_for_name(
     devices: &[keyroost_resolve::Device],
     name: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let dev = devices
+    let matches: Vec<&keyroost_resolve::Device> = devices
         .iter()
-        .find(|d| d.name.as_deref() == Some(name))
-        .ok_or_else(|| {
-            format!("no connected device is named '{name}' (see `keyroostctl key-name list`)")
-        })?;
+        .filter(|d| d.name.as_deref() == Some(name))
+        .collect();
+    let dev = match matches.as_slice() {
+        [] => {
+            return Err(format!(
+                "no connected device is named '{name}' (see `keyroostctl key-name list`)"
+            )
+            .into());
+        }
+        [one] => *one,
+        many => {
+            return Err(format!(
+                "{} connected devices are named '{name}'; refusing to guess which one",
+                many.len()
+            )
+            .into());
+        }
+    };
     dev.reader.clone().ok_or_else(|| {
         format!("device '{name}' has no smart-card (PC/SC) interface for this command").into()
     })
@@ -7063,6 +7077,28 @@ mod cli_tests {
             "TOKEN2 Molto2 (BBBB) 00 00"
         );
         assert!(reader_for_name(&devices, "nope").is_err());
+    }
+
+    #[test]
+    fn reader_for_name_is_ambiguous_when_two_devices_share_a_name() {
+        use keyroost_resolve::{Caps, Device, DeviceKind};
+        fn dev(name: &str, reader: &str) -> Device {
+            Device {
+                id: format!("reader:{reader}"),
+                name: Some(name.to_string()),
+                vendor: "X".into(),
+                model: "Y".into(),
+                serial: String::new(),
+                transport: String::new(),
+                firmware: String::new(),
+                caps: Caps::default(),
+                kind: DeviceKind::Key,
+                hid_path: None,
+                reader: Some(reader.to_string()),
+            }
+        }
+        let devices = vec![dev("twin", "reader-1"), dev("twin", "reader-2")];
+        assert!(reader_for_name(&devices, "twin").is_err());
     }
 
     #[test]

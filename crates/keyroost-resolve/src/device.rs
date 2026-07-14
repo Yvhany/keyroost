@@ -193,6 +193,20 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
         })
         .collect();
 
+    // Serials duplicated across the live HID set are NOT unique identity: two
+    // keys that advertise the same serial must stay distinct (KEY-015). Track
+    // them so the serial-only merge below is suppressed for them.
+    let dup_serials: std::collections::HashSet<String> = {
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for s in serials.iter().flatten() {
+            *seen.entry(s.as_str()).or_default() += 1;
+        }
+        seen.into_iter()
+            .filter(|(_, n)| *n > 1)
+            .map(|(s, _)| s.to_string())
+            .collect()
+    };
+
     let mut devices: Vec<Device> = Vec::new();
 
     // --- 1. Molto2 tokens — only when there is NO FIDO HID sibling (#21 guard).
@@ -354,7 +368,7 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
         let existing = devices.iter_mut().find(|d| {
             d.kind == DeviceKind::Key
                 && ((reader_name.is_some() && d.reader == reader_name)
-                    || (!serial.is_empty() && d.serial == serial))
+                    || (!serial.is_empty() && !dup_serials.contains(&serial) && d.serial == serial))
         });
         if let Some(dev) = existing {
             dev.caps.insert(Caps::FIDO2);
@@ -401,6 +415,23 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
                 hid_path: Some(hid.path.clone()),
                 reader: reader_name,
             });
+        }
+    }
+
+    // Any id shared by >1 device would collapse them into one selectable
+    // identity; disambiguate using the per-port reader/hid path (KEY-015).
+    let mut id_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for d in &devices {
+        *id_counts.entry(d.id.clone()).or_default() += 1;
+    }
+    for d in devices.iter_mut() {
+        if id_counts.get(&d.id).copied().unwrap_or(0) > 1 {
+            let suffix = d
+                .reader
+                .clone()
+                .or_else(|| d.hid_path.as_ref().map(|p| p.display().to_string()))
+                .unwrap_or_default();
+            d.id = format!("{}#{}", d.id, suffix);
         }
     }
 
@@ -519,6 +550,33 @@ mod tests {
         )];
         let devs = correlate(&hids, &probes, &Keyring::default());
         assert!(devs.iter().all(|d| d.kind != DeviceKind::Token));
+    }
+
+    #[test]
+    fn duplicate_serial_fido_keys_stay_distinct() {
+        // Two pure-FIDO keys that advertise the SAME USB serial must not collapse
+        // into one selectable identity (KEY-015).
+        let hids = [
+            hid(
+                0x1234,
+                0x0001,
+                "/dev/hidraw0",
+                Some("CLONE"),
+                Some(1),
+                Some(2),
+            ),
+            hid(
+                0x1234,
+                0x0001,
+                "/dev/hidraw1",
+                Some("CLONE"),
+                Some(1),
+                Some(3),
+            ),
+        ];
+        let devs = correlate(&hids, &[], &Keyring::default());
+        assert_eq!(devs.len(), 2, "duplicate serials must not merge");
+        assert_ne!(devs[0].id, devs[1].id, "ids must be distinct");
     }
 
     #[test]

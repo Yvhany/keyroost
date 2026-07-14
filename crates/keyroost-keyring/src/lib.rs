@@ -130,8 +130,19 @@ impl From<io::Error> for KeyringError {
 /// Errors resolving a `--device` name to a connected device.
 #[derive(Debug)]
 pub enum ResolveError {
-    UnknownName { name: String, known: Vec<String> },
-    NotConnected { name: String, serial: String },
+    UnknownName {
+        name: String,
+        known: Vec<String>,
+    },
+    NotConnected {
+        name: String,
+        serial: String,
+    },
+    Ambiguous {
+        name: String,
+        serial: String,
+        count: usize,
+    },
 }
 
 impl fmt::Display for ResolveError {
@@ -153,6 +164,16 @@ impl fmt::Display for ResolveError {
             ResolveError::NotConnected { name, serial } => {
                 write!(f, "key '{}' (serial {}) is not connected", name, serial)
             }
+            ResolveError::Ambiguous {
+                name,
+                serial,
+                count,
+            } => write!(
+                f,
+                "name '{}' matches {} connected devices with serial {}; \
+                 refusing to guess which one",
+                name, count, serial
+            ),
         }
     }
 }
@@ -422,6 +443,8 @@ impl Keyring {
     }
 
     /// Resolve a `--device` name to a connected device by matching serials.
+    /// Fails closed when more than one live device advertises the entry's serial
+    /// (KEY-015): a cloned/duplicate serial must never silently pick the first.
     pub fn resolve<'a>(
         &self,
         name: &str,
@@ -433,13 +456,22 @@ impl Keyring {
                 name: name.to_string(),
                 known: self.keys.iter().map(|k| k.name.clone()).collect(),
             })?;
-        connected
+        let matches: Vec<&ConnectedKey> = connected
             .iter()
-            .find(|d| d.serial.as_deref() == Some(entry.serial.as_str()))
-            .ok_or_else(|| ResolveError::NotConnected {
+            .filter(|d| d.serial.as_deref() == Some(entry.serial.as_str()))
+            .collect();
+        match matches.as_slice() {
+            [] => Err(ResolveError::NotConnected {
                 name: name.to_string(),
                 serial: entry.serial.clone(),
-            })
+            }),
+            [one] => Ok(one),
+            many => Err(ResolveError::Ambiguous {
+                name: name.to_string(),
+                serial: entry.serial.clone(),
+                count: many.len(),
+            }),
+        }
     }
 }
 
@@ -545,6 +577,33 @@ mod tests {
             k.resolve("solo", &[]),
             Err(ResolveError::NotConnected { .. })
         ));
+    }
+
+    #[test]
+    fn resolve_fails_closed_on_duplicate_live_serials() {
+        let mut kr = Keyring::default();
+        kr.keys.push(entry("work", "DUP123"));
+
+        let connected = vec![
+            ConnectedKey {
+                path: "/dev/hidraw0".into(),
+                serial: Some("DUP123".into()),
+                label: "Key A".into(),
+            },
+            ConnectedKey {
+                path: "/dev/hidraw1".into(),
+                serial: Some("DUP123".into()),
+                label: "Key B".into(),
+            },
+        ];
+
+        match kr.resolve("work", &connected) {
+            Err(ResolveError::Ambiguous { name, count, .. }) => {
+                assert_eq!(name, "work");
+                assert_eq!(count, 2);
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
     }
 
     #[test]
