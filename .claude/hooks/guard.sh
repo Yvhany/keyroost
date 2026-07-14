@@ -93,7 +93,11 @@ else
     scan="$arg"
 fi
 
-printf '%s' "$scan" | grep -Eiq '(\.env([^[:alnum:]]|$)|\.pem([^[:alnum:]]|$)|id_rsa|id_ed25519|/\.ssh/|credentials|\.nmconnection|wpa_supplicant|(^|[^[:alnum:]_])psk=)' \
+# `credentials` is matched only as a path/filename component ("/credentials",
+# ".git-credentials", "credentials.json"), not as a bare word: prose in commit
+# messages and code identifiers (list_credentials, "the credentials") must not
+# trip a rule that exists to stop file reads like ~/.aws/credentials.
+printf '%s' "$scan" | grep -Eiq '(\.env([^[:alnum:]]|$)|\.pem([^[:alnum:]]|$)|id_rsa|id_ed25519|/\.ssh/|[/.-]credentials([^[:alnum:]]|$)|credentials\.[[:alnum:]]|\.nmconnection|wpa_supplicant|(^|[^[:alnum:]_])psk=)' \
     && block 'this touches a file that commonly holds secrets (keys, .env, SSH, WiFi/NetworkManager configs).'
 
 exit 0
