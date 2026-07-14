@@ -9,6 +9,7 @@
 //! Kept in its own file to avoid growing `main.rs`; the `impl App` blocks here
 //! extend the same `App` type via Rust's multi-file inherent-impl support.
 
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use keyroost_transport::{OtpTransportError, Token2OtpSession};
@@ -33,16 +34,69 @@ impl OtpTransportSel {
             OtpTransportSel::Ccid => "CCID/NFC",
         }
     }
+}
 
-    fn open(self) -> Result<Token2OtpSession, OtpTransportError> {
-        // Honor KEYROOST_OTP_DEBUG so a stuck/empty list over NFC can be traced
-        // from the GUI (the CLI has --debug; the GUI had no switch). Matches the
-        // KEYROOST_CTAP_DEBUG convention.
+/// The concrete endpoint the OTP pane opens, resolved from the user's transport
+/// choice and the *selected* device's actual interfaces. Binding to a specific
+/// HID path / reader name (never "first match") keeps every OTP op on the key
+/// the user picked when several are plugged in. GUI-local; see the assembler
+/// note if Section E exposes an identical `keyroost_transport::OtpTarget`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OtpTarget {
+    HidPath(PathBuf),
+    Reader(String),
+}
+
+impl OtpTarget {
+    /// Open a Token2 OTP session bound to exactly this endpoint.
+    fn open(&self) -> Result<Token2OtpSession, OtpTransportError> {
+        // Honor KEYROOST_OTP_DEBUG so a stuck/empty list can be traced from the
+        // GUI (matches the KEYROOST_CTAP_DEBUG convention; the CLI has --debug).
         let debug = std::env::var_os("KEYROOST_OTP_DEBUG").is_some();
         match self {
-            OtpTransportSel::Auto => Token2OtpSession::detect_debug(debug),
-            OtpTransportSel::Hid => Token2OtpSession::detect_hid_only(debug),
-            OtpTransportSel::Ccid => Token2OtpSession::detect_pcsc_only(debug),
+            OtpTarget::HidPath(p) => Token2OtpSession::open_hid_path(p, debug),
+            OtpTarget::Reader(r) => Token2OtpSession::open_pcsc_reader(r, debug),
+        }
+    }
+}
+
+/// Decide which endpoint to open for `sel`, given the selected device's resolved
+/// USB-HID path and PC/SC reader name. Fails closed (`Err`) when the choice is
+/// unsatisfiable — an explicit HID/CCID pick with no matching interface, or an
+/// `Auto` pick on a device that resolved to neither — so the pane surfaces an
+/// error instead of silently opening the first key on the bus. Pure + testable.
+fn otp_target_for(
+    sel: OtpTransportSel,
+    hid_path: Option<&Path>,
+    reader: Option<&str>,
+) -> Result<OtpTarget, String> {
+    match sel {
+        OtpTransportSel::Hid => hid_path
+            .map(|p| OtpTarget::HidPath(p.to_path_buf()))
+            .ok_or_else(|| {
+                "the selected key has no USB-HID interface; switch the transport to CCID/NFC"
+                    .to_string()
+            }),
+        OtpTransportSel::Ccid => {
+            reader
+                .map(|r| OtpTarget::Reader(r.to_string()))
+                .ok_or_else(|| {
+                    "the selected key has no PC/SC reader; switch the transport to USB-HID"
+                        .to_string()
+                })
+        }
+        // Auto prefers USB-HID (the old detect_debug probe order tried HID
+        // first), then falls back to the reader. This subsumes the old
+        // reader-only special case in load_otp_entries: a key with only a
+        // reader now naturally resolves to CCID/NFC.
+        OtpTransportSel::Auto => {
+            if let Some(p) = hid_path {
+                Ok(OtpTarget::HidPath(p.to_path_buf()))
+            } else if let Some(r) = reader {
+                Ok(OtpTarget::Reader(r.to_string()))
+            } else {
+                Err("the selected key exposes no OTP-capable interface".to_string())
+            }
         }
     }
 }
@@ -253,28 +307,36 @@ fn unix_now() -> u64 {
 }
 
 impl App {
+    /// Resolve the OTP endpoint for the current selection + transport choice.
+    /// `Err` when nothing is selected or the selection can't satisfy the pick.
+    fn otp_target(&self) -> Result<OtpTarget, String> {
+        let dev = self
+            .selected_device()
+            .ok_or_else(|| "no key selected".to_string())?;
+        otp_target_for(
+            self.otp.transport,
+            dev.hid_path.as_deref(),
+            dev.reader.as_deref(),
+        )
+    }
+
     /// List entries on the selected key over the chosen transport.
     pub(crate) fn load_otp_entries(&mut self) {
         self.otp.error = None;
-        // On a reader-attached key (no USB-HID interface), force the CCID/NFC
-        // transport. The "Auto" path probes USB-HID first, which is pointless
-        // here and — on Windows, where the FIDO HID interface is access-
-        // restricted — can disrupt the read and yield an empty list, even though
-        // the OTP applet is reachable over the reader. If the user explicitly
-        // picked a transport, honour it.
-        let reader_only = self
-            .selected_device()
-            .map(|d| d.hid_path.is_none() && d.reader.is_some())
-            .unwrap_or(false);
-        let sel = if reader_only && self.otp.transport == OtpTransportSel::Auto {
-            OtpTransportSel::Ccid
-        } else {
-            self.otp.transport
+        // Bind I/O to the *selected* device (KEY-003). Auto prefers this key's
+        // USB-HID interface and falls back to its reader; an unresolved or
+        // ambiguous selection fails closed here rather than opening another key.
+        let target = match self.otp_target() {
+            Ok(t) => t,
+            Err(e) => {
+                self.otp.error = Some(e);
+                self.otp.loaded = true; // show the error, not a stuck "Reading…"
+                return;
+            }
         };
         if std::env::var_os("KEYROOST_OTP_DEBUG").is_some() {
             eprintln!(
-                "[otp gui] reader_only={reader_only} chosen_transport={} (user_sel={})",
-                sel.label(),
+                "[otp gui] target={target:?} (user_sel={})",
                 self.otp.transport.label()
             );
         }
@@ -282,7 +344,7 @@ impl App {
         self.spawn_job("Reading OTP entries\u{2026}", move || {
             let result =
                 (|| -> Result<OtpLoad, OtpTransportError> {
-                    let mut session = sel.open()?;
+                    let mut session = target.open()?;
                     let active = if session.is_pcsc() {
                         "CCID/NFC"
                     } else {
@@ -437,14 +499,20 @@ impl App {
         let digits = self.otp.add.digits;
         let period = self.otp.add.period;
         let touch = self.otp.add.require_touch;
-        let sel = self.otp.transport;
+        let target = match self.otp_target() {
+            Ok(t) => t,
+            Err(e) => {
+                self.otp.error = Some(e);
+                return;
+            }
+        };
         let for_device = self.selected_device.clone();
 
         self.spawn_job("Adding OTP entry\u{2026}", move || {
             let result = (|| -> Result<(), String> {
                 let seed = keyroost_token2otp::decode_base32_seed(secret.trim())
                     .map_err(|m| format!("invalid Base32 secret: {m}"))?;
-                let mut session = sel.open().map_err(|e| e.to_string())?;
+                let mut session = target.open().map_err(|e| e.to_string())?;
                 let entry = keyroost_token2otp::WriteEntry {
                     otp_type: if totp {
                         keyroost_token2otp::OtpType::Totp
@@ -506,14 +574,20 @@ impl App {
         let send_enter = self.otp.button_hotp.send_enter;
         let long_touch = self.otp.button_hotp.long_touch;
         let numpad = self.otp.button_hotp.numpad;
-        let sel = self.otp.transport;
+        let target = match self.otp_target() {
+            Ok(t) => t,
+            Err(e) => {
+                self.otp.error = Some(e);
+                return;
+            }
+        };
         let for_device = self.selected_device.clone();
 
         self.spawn_job("Setting touch HOTP\u{2026}", move || {
             let result = (|| -> Result<(), String> {
                 let seed = keyroost_token2otp::decode_base32_seed(secret.trim())
                     .map_err(|m| format!("invalid Base32 secret: {m}"))?;
-                let mut session = sel.open().map_err(|e| e.to_string())?;
+                let mut session = target.open().map_err(|e| e.to_string())?;
                 session
                     .set_button_hotp(digits, &seed, send_enter, long_touch, numpad)
                     .map_err(|e| e.to_string())
@@ -568,11 +642,17 @@ impl App {
         if !next.ccid {
             disable |= DEV_CCID;
         }
-        let sel = self.otp.transport;
+        let target = match self.otp_target() {
+            Ok(t) => t,
+            Err(e) => {
+                self.otp.error = Some(e);
+                return;
+            }
+        };
         let for_device = self.selected_device.clone();
         self.spawn_job("Updating interfaces\u{2026}", move || {
             let result = (|| -> Result<(), String> {
-                let mut session = sel.open().map_err(|e| e.to_string())?;
+                let mut session = target.open().map_err(|e| e.to_string())?;
                 session.set_device_type(disable).map_err(|e| e.to_string())
             })();
             Box::new(move |app: &mut App| {
@@ -597,11 +677,17 @@ impl App {
     /// Clear the HOTP-on-touch keystroke slot.
     pub(crate) fn delete_button_hotp_slot(&mut self) {
         self.otp.error = None;
-        let sel = self.otp.transport;
+        let target = match self.otp_target() {
+            Ok(t) => t,
+            Err(e) => {
+                self.otp.error = Some(e);
+                return;
+            }
+        };
         let for_device = self.selected_device.clone();
         self.spawn_job("Clearing touch HOTP\u{2026}", move || {
             let result = (|| -> Result<(), String> {
-                let mut session = sel.open().map_err(|e| e.to_string())?;
+                let mut session = target.open().map_err(|e| e.to_string())?;
                 session.delete_button_hotp().map_err(|e| e.to_string())
             })();
             Box::new(move |app: &mut App| {
@@ -622,11 +708,17 @@ impl App {
     /// Delete the entry identified by `(app, account)`.
     pub(crate) fn delete_otp_entry(&mut self, app_name: String, account_name: String) {
         self.otp.error = None;
-        let sel = self.otp.transport;
+        let target = match self.otp_target() {
+            Ok(t) => t,
+            Err(e) => {
+                self.otp.error = Some(e);
+                return;
+            }
+        };
         let for_device = self.selected_device.clone();
         self.spawn_job("Deleting OTP entry\u{2026}", move || {
             let result = (|| -> Result<(), OtpTransportError> {
-                let mut session = sel.open()?;
+                let mut session = target.open()?;
                 session.delete_entry(&app_name, &account_name)
             })();
             Box::new(move |app: &mut App| {
@@ -650,12 +742,18 @@ impl App {
     /// shown in place of "touch to view" until the next list reload.
     pub(crate) fn read_touch_otp_entry(&mut self, app_name: String, account_name: String) {
         self.otp.error = None;
-        let sel = self.otp.transport;
+        let target = match self.otp_target() {
+            Ok(t) => t,
+            Err(e) => {
+                self.otp.error = Some(e);
+                return;
+            }
+        };
         let for_device = self.selected_device.clone();
         let key = (app_name.clone(), account_name.clone());
         self.spawn_job("Reading code \u{2014} touch your key\u{2026}", move || {
             let result = (|| -> Result<Option<String>, String> {
-                let mut session = sel.open().map_err(|e| e.to_string())?;
+                let mut session = target.open().map_err(|e| e.to_string())?;
                 let now = unix_now();
                 let entry = session
                     .read_entry(now, &app_name, &account_name)
@@ -688,11 +786,17 @@ impl App {
         numpad: bool,
     ) {
         self.otp.error = None;
-        let sel = self.otp.transport;
+        let target = match self.otp_target() {
+            Ok(t) => t,
+            Err(e) => {
+                self.otp.error = Some(e);
+                return;
+            }
+        };
         let for_device = self.selected_device.clone();
         self.spawn_job("Updating touch HOTP options\u{2026}", move || {
             let result = (|| -> Result<(), String> {
-                let mut session = sel.open().map_err(|e| e.to_string())?;
+                let mut session = target.open().map_err(|e| e.to_string())?;
                 session
                     .set_button_hotp_options(send_enter, long_touch, numpad)
                     .map_err(|e| e.to_string())
@@ -719,13 +823,19 @@ impl App {
     /// Erase every entry on the key.
     pub(crate) fn erase_all_otp(&mut self) {
         self.otp.error = None;
-        let sel = self.otp.transport;
+        let target = match self.otp_target() {
+            Ok(t) => t,
+            Err(e) => {
+                self.otp.error = Some(e);
+                return;
+            }
+        };
         let for_device = self.selected_device.clone();
         self.spawn_job(
             "Erasing all OTP entries \u{2014} touch your key\u{2026}",
             move || {
                 let result = (|| -> Result<(), OtpTransportError> {
-                    let mut session = sel.open()?;
+                    let mut session = target.open()?;
                     session.erase_all()
                 })();
                 Box::new(move |app: &mut App| {
@@ -1468,5 +1578,60 @@ fn otp_algo_str(a: keyroost_token2otp::Algorithm) -> &'static str {
     match a {
         keyroost_token2otp::Algorithm::Sha1 => "SHA1",
         keyroost_token2otp::Algorithm::Sha256 => "SHA256",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn auto_prefers_hid_when_both_present() {
+        let t = otp_target_for(
+            OtpTransportSel::Auto,
+            Some(Path::new("/dev/hidraw3")),
+            Some("Acme CCID 00"),
+        );
+        assert_eq!(t, Ok(OtpTarget::HidPath(PathBuf::from("/dev/hidraw3"))));
+    }
+
+    #[test]
+    fn auto_falls_back_to_reader_when_no_hid() {
+        let t = otp_target_for(OtpTransportSel::Auto, None, Some("Acme CCID 00"));
+        assert_eq!(t, Ok(OtpTarget::Reader("Acme CCID 00".into())));
+    }
+
+    #[test]
+    fn auto_errors_when_no_interface() {
+        assert!(otp_target_for(OtpTransportSel::Auto, None, None).is_err());
+    }
+
+    #[test]
+    fn hid_requires_a_hid_path() {
+        assert_eq!(
+            otp_target_for(
+                OtpTransportSel::Hid,
+                Some(Path::new("/dev/hidraw3")),
+                Some("r")
+            ),
+            Ok(OtpTarget::HidPath(PathBuf::from("/dev/hidraw3")))
+        );
+        assert!(otp_target_for(OtpTransportSel::Hid, None, Some("r")).is_err());
+    }
+
+    #[test]
+    fn ccid_requires_a_reader() {
+        assert_eq!(
+            otp_target_for(
+                OtpTransportSel::Ccid,
+                Some(Path::new("/dev/hidraw3")),
+                Some("r")
+            ),
+            Ok(OtpTarget::Reader("r".into()))
+        );
+        assert!(
+            otp_target_for(OtpTransportSel::Ccid, Some(Path::new("/dev/hidraw3")), None).is_err()
+        );
     }
 }
