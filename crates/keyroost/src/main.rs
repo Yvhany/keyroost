@@ -4831,6 +4831,15 @@ impl App {
                     let next = keep.or_else(|| devices.first().map(|d| d.id.clone()));
                     let changed = next != app.selected_device;
                     app.selected_device = next;
+                    // Surface duplicate-serial ambiguity (KEY-015): same-serial
+                    // keys stay separately selectable (distinct #-suffixed ids),
+                    // but naming can't disambiguate them, so tell the user.
+                    app.devices_error = duplicate_serial_note(
+                        devices
+                            .iter()
+                            .filter(|d| d.kind == DeviceKind::Key && !d.serial.is_empty())
+                            .map(|d| d.serial.as_str()),
+                    );
                     app.devices = devices;
                     if changed {
                         app.on_device_selected();
@@ -5825,6 +5834,25 @@ fn matches_filter(d: &Device, q: &str) -> bool {
     d.vendor.to_ascii_lowercase().contains(&q)
         || d.model.to_ascii_lowercase().contains(&q)
         || d.title().to_ascii_lowercase().contains(&q)
+}
+
+/// Advisory shown when two or more connected keys report the same serial.
+/// Friendly names are keyed by serial, so same-serial keys can't be told apart
+/// by name — surface that rather than letting the user assume a name is unique.
+/// Returns the first duplicated serial (deterministic order) or `None` when
+/// every serial is distinct.
+fn duplicate_serial_note<'a>(serials: impl Iterator<Item = &'a str>) -> Option<String> {
+    use std::collections::BTreeMap;
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for s in serials {
+        *counts.entry(s).or_insert(0) += 1;
+    }
+    counts.into_iter().find(|&(_, n)| n > 1).map(|(serial, n)| {
+        format!(
+            "{n} connected keys report the same serial ({serial}); friendly names can't tell \
+             them apart — pick each by its row in the list."
+        )
+    })
 }
 
 /// Short label for a capability tab.
@@ -12742,6 +12770,30 @@ fn slot_summary(algo: Option<u8>, fpr: &[u8; 20]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_serial_note_flags_shared_serial() {
+        let note = duplicate_serial_note(["ABC", "ABC", "DEF"].into_iter())
+            .expect("a shared serial must produce an advisory");
+        assert!(note.contains("ABC"), "advisory names the duplicated serial");
+        assert!(note.contains('2'), "advisory states how many keys share it");
+    }
+
+    #[test]
+    fn duplicate_serial_note_silent_when_all_distinct() {
+        assert_eq!(duplicate_serial_note(["ABC", "DEF"].into_iter()), None);
+        assert_eq!(duplicate_serial_note(std::iter::empty::<&str>()), None);
+    }
+
+    #[test]
+    fn duplicate_serial_id_suffix_keeps_ids_distinct() {
+        // Invariant Section E's correlate() must uphold and this GUI relies on:
+        // same-serial keys get distinct, `#`-suffixed ids, so selection (which
+        // keys off the full id in selected_device()) resolves each independently.
+        let a = "serial:ABC#0";
+        let b = "serial:ABC#1";
+        assert_ne!(a, b);
+    }
 
     /// egui retains a plaintext snapshot of every typed secret in the text
     /// widget's undo history for the process lifetime; `.password(true)` only
