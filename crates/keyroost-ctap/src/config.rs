@@ -124,7 +124,7 @@ impl<'a, T: CtapTransport> Configurator<'a, T> {
 
     /// Flag the authenticator so the next interaction forces a PIN change,
     /// without otherwise altering the minimum length. Convenience wrapper over
-    /// [`set_min_pin_length`].
+    /// [`Self::set_min_pin_length`].
     pub fn force_pin_change(&mut self) -> Result<(), CtapError> {
         self.set_min_pin_length(None, &[], true)
     }

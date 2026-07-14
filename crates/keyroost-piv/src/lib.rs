@@ -1,7 +1,7 @@
 //! PIV (Personal Identity Verification — NIST SP 800-73-4 / FIPS 201) byte layer.
 //!
 //! A pure, I/O-free APDU builder + parser layer for the PIV smartcard
-//! application, the same shape as [`keyroost_oath`] and [`keyroost_openpgp`]: it
+//! application, the same shape as `keyroost-oath` and `keyroost-openpgp`: it
 //! turns intentions into APDU byte vectors and response bytes into typed values,
 //! and performs **no card I/O** (that lives in `keyroost-transport`'s
 //! `PivSession`). PIV is a CCID/APDU applet on YubiKeys (and other PIV cards),

@@ -167,7 +167,8 @@ impl std::error::Error for ResolveError {}
 /// * empty (or whitespace-only) names — there must be something after trimming;
 /// * names longer than 64 characters;
 /// * names containing control / zero-width / bidi-override characters (the
-///   spoofing chars [`is_spoofing_char`] guards against — they enable display
+///   spoofing chars the internal `is_spoofing_char` check guards against —
+///   they enable display
 ///   spoofing in a saved name).
 pub fn validate_name(name: &str) -> Result<(), KeyringError> {
     // A friendly name is a human-facing label, so allow normal text — letters

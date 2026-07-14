@@ -208,7 +208,7 @@ pub fn parse_info(data: &[u8]) -> Result<(String, u32), InfoError> {
 /// Parse a [`read_public_data`] response (status word already stripped).
 ///
 /// Expected envelope, hardware-captured: `95 1F 70 1D` followed by exactly
-/// 29 body bytes — flag, title[16] (plaintext, zero-padded), two u32 BE
+/// 29 body bytes — flag, title\[16\] (plaintext, zero-padded), two u32 BE
 /// time fields, algorithm, time step, digit count, seed-present.
 pub fn parse_public_data(resp: &[u8]) -> Result<ProfilePublicData, PublicDataError> {
     if resp.len() < 4 {

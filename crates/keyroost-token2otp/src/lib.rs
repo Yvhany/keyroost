@@ -3,8 +3,8 @@
 //! key stores, *not* CTAP/FIDO2 (that is the standard FIDO interface, handled by
 //! `keyroost-ctap`).
 //!
-//! This crate is hardware-free in the same spirit as [`keyroost_oath`] and
-//! [`keyroost_proto`]: it builds APDUs, parses responses, and performs the
+//! This crate is hardware-free in the same spirit as `keyroost-oath` and
+//! `keyroost-proto`: it builds APDUs, parses responses, and performs the
 //! ECDH+AES payload encryption that seed-bearing commands require. The actual
 //! USB-HID / PC/SC transmission lives in `keyroost-transport`.
 //!
@@ -36,7 +36,7 @@ use zeroize::Zeroizing;
 
 /// USB Vendor ID for the Token2 T2F2 / PIN+ FIDO2 key (decimal 13470).
 ///
-/// Distinct from [`keyroost_proto::USB_VID`]'s Molto2 PID — same vendor, but the
+/// Distinct from `keyroost_proto::USB_VID`'s Molto2 PID — same vendor, but the
 /// FIDO key and the Molto2 TOTP token are different products. Match on VID plus
 /// the manufacturer/product strings per spec §2.1.
 pub const USB_VID: u16 = 0x349E;
@@ -65,7 +65,7 @@ pub mod cmd {
     /// `READ_CONFIG` — host sends 1 byte (read length); device returns info, §1.11.
     pub const READ_CONFIG: [u8; 4] = [0x80, 0xC5, 0x02, 0x00];
     /// `SET_DEVICE_TYPE` — host sends a 1-byte disable bitmask, §1.6. **Bricking
-    /// risk** — see [`SetDeviceTypeError`].
+    /// risk** — see [`crate::SetDeviceTypeError`].
     pub const SET_DEVICE_TYPE: [u8; 4] = [0x80, 0xC5, 0x02, 0x01];
     /// `CFG_HOTP_ENTER` — 1 byte, §1.8.
     pub const CFG_HOTP_ENTER: [u8; 4] = [0x80, 0xC5, 0x02, 0x02];

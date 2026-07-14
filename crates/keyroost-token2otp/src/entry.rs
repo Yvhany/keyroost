@@ -347,7 +347,7 @@ impl<'a> Cursor<'a> {
 }
 
 /// A serialized cleartext payload that scrubs itself on drop because it may
-/// carry a raw OTP seed (spec §6.3). The crypto layer consumes [`as_bytes`].
+/// carry a raw OTP seed (spec §6.3). The crypto layer consumes [`Self::as_bytes`].
 pub struct ClearText(Vec<u8>);
 
 impl ClearText {

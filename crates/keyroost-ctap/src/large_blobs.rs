@@ -34,7 +34,7 @@
 //! # Writing
 //!
 //! `set` is chunked by `maxFragmentLength = maxMsgSize - 64`. Every fragment
-//! carries a `pinUvAuthParam` computed specially (see [`write_auth_param`]):
+//! carries a `pinUvAuthParam` computed specially (see `write_auth_param`):
 //!
 //! ```text
 //! authenticate( token, 0xff*32 || 0x0c 0x00 || uint32LE(offset) || SHA-256(fragment) )
@@ -207,7 +207,7 @@ pub struct LargeBlobArray {
 
 impl LargeBlobArray {
     /// Re-serialize the current entries and append a freshly-computed checksum,
-    /// yielding bytes ready to hand to [`write`].
+    /// yielding bytes ready to hand to [`write()`].
     pub fn serialize_with_checksum(&self) -> Vec<u8> {
         let array = encode_entries(&self.entries);
         let mut out = array.clone();

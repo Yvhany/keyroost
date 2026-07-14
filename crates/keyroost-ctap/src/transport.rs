@@ -6,7 +6,7 @@
 //! exchange went only over CTAP-HID (USB). [`CtapTransport`] lifts it into a
 //! trait so the same command code can run over any link that can carry a CTAP
 //! message — in particular PC/SC, which is how both **NFC** and **contact**
-//! smart-card readers present a key (see [`crate::pcsc`]).
+//! smart-card readers present a key (see `ctap_pcsc` in `keyroost-transport`).
 //!
 //! The trait is deliberately tiny: one method, mirroring
 //! `CtapHidDevice::transact`. Backends own all the link-specific framing —

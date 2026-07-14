@@ -26,7 +26,7 @@ const MAX_PIXELS: u64 = 16_000_000;
 pub enum QrError {
     /// Not a PNG or JPEG (by magic bytes).
     UnsupportedImage,
-    /// The image decodes but exceeds [`MAX_PIXELS`].
+    /// The image decodes but exceeds the internal `MAX_PIXELS` cap.
     ImageTooLarge { width: u32, height: u32 },
     /// PNG/JPEG decoding failed.
     ImageDecode(String),
@@ -89,8 +89,8 @@ pub fn texts_from_image(bytes: &[u8]) -> Result<zeroize::Zeroizing<Vec<String>>,
 /// Decode every QR code from a raw RGBA8 pixel buffer — e.g. a live screen
 /// capture that arrives already decoded, so PNG/JPEG decoding is skipped.
 /// `rgba` must be exactly `width * height * 4` bytes. Same wipe-on-drop output
-/// contract as [`texts_from_image`]; [`MAX_PIXELS`] is enforced before the luma
-/// allocation.
+/// contract as [`texts_from_image`]; the internal `MAX_PIXELS` cap is enforced
+/// before the luma allocation.
 pub fn texts_from_rgba(
     width: u32,
     height: u32,

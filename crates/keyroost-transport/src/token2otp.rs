@@ -1010,7 +1010,7 @@ impl Token2OtpSession {
     /// Update the HOTP-on-button keystroke options (send-Enter, long-touch,
     /// numpad) *without* touching the configured seed (spec §1.8–1.10). Sends
     /// only the three `CFG_HOTP_*` config bytes, so the existing seed slot is
-    /// left intact — unlike [`set_button_hotp`], which rewrites the seed.
+    /// left intact — unlike [`Self::set_button_hotp`], which rewrites the seed.
     ///
     /// Use this to change typing behaviour for an already-provisioned slot. It
     /// has no effect if no seed is configured (the device keeps the config bytes
@@ -1037,7 +1037,7 @@ impl Token2OtpSession {
     /// **Brick risk.** The firmware does not refuse a mask that disables every
     /// interface, which would leave the key permanently unreachable. The byte
     /// layer's [`t2::set_device_type`] refuses such a mask client-side
-    /// ([`SetDeviceTypeError::WouldBrick`]); this method surfaces that as an
+    /// ([`t2::SetDeviceTypeError::WouldBrick`]); this method surfaces that as an
     /// error and never transmits a bricking APDU. Callers should additionally
     /// confirm the change with the user before calling.
     pub fn set_device_type(&mut self, disable_mask: u8) -> Result<(), OtpTransportError> {

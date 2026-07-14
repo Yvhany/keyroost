@@ -1,6 +1,6 @@
 //! Minimal `otpauth://` URI parser.
 //!
-//! Format (RFC-style spec at https://github.com/google/google-authenticator/wiki/Key-Uri-Format):
+//! Format (RFC-style spec at <https://github.com/google/google-authenticator/wiki/Key-Uri-Format>):
 //!
 //!   otpauth://TYPE/LABEL?secret=BASE32&issuer=ISSUER&algorithm=ALGO&digits=N&period=N
 //!

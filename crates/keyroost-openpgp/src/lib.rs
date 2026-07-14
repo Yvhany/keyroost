@@ -636,7 +636,7 @@ fn mpi(bytes: &[u8]) -> Vec<u8> {
 ///
 /// The fingerprint is `SHA1(0x99 || len16 || body)`, where `body` is the
 /// public-key packet body: `04` (version) || `creation_time` (4 big-endian
-/// bytes) || `01` (RSA algorithm id) || [MPI](modulus) || [MPI](exponent), and
+/// bytes) || `01` (RSA algorithm id) || MPI(`modulus`) || MPI(`exponent`), and
 /// `len16` is the 2-byte big-endian length of `body`. The `creation_time` must
 /// equal the value later written with [`put_generation_time`], or the card and
 /// `gpg` will compute different fingerprints for the same key.
@@ -942,7 +942,8 @@ pub fn rsa_exponent_fits(e: &[u8], e_bits: u16) -> bool {
 /// here is *empty* (length `0x00`). Which components are emitted depends on
 /// `format`: the standard triple `e`, `p`, `q`, optionally the CRT components
 /// `u`, `dp`, `dq` and/or the modulus `n` (see [`RsaImportFormat`]). `e` is
-/// right-justified to `(e_bits + 7) / 8` bytes (see [`pad_exponent`]); the
+/// right-justified to `(e_bits + 7) / 8` bytes (see the internal
+/// `pad_exponent` helper); the
 /// other fields keep their minimal big-endian length, and `7F48` declares each
 /// length so the card can split `5F48` correctly.
 pub fn extended_header_list(
@@ -1031,7 +1032,8 @@ fn build_apdu_extended(cla: u8, ins: u8, p1: u8, p2: u8, data: &[u8]) -> Vec<u8>
 ///
 /// P1-P2 = `0x3FFF` selects the Extended Header List data object (OpenPGP Card
 /// spec v3.4, §4.4.3.12). The body is always emitted as an extended-length
-/// APDU (see [`build_apdu_extended`]) — even small synthetic keys use the
+/// APDU (see the internal `build_apdu_extended` helper) — even small synthetic
+/// keys use the
 /// extended framing, matching the realistic 2048/4096-bit case.
 ///
 /// The caller must have a verified PW3 (admin) session for the card to accept

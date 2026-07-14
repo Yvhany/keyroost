@@ -553,7 +553,7 @@ fn generate_nonce() -> [u8; 8] {
 
 impl crate::transport::CtapTransport for CtapHidDevice {
     /// Delegate to the inherent HID `transact`, mapping its transport error into
-    /// the shared [`CtapError`]. This is what lets HID and PC/SC backends be used
+    /// the shared [`crate::cmd::CtapError`]. This is what lets HID and PC/SC backends be used
     /// interchangeably by the command layer.
     fn transact(&mut self, cmd: u8, payload: &[u8]) -> Result<Vec<u8>, crate::cmd::CtapError> {
         CtapHidDevice::transact(self, cmd, payload).map_err(crate::cmd::CtapError::from)

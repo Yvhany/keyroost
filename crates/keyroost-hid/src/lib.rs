@@ -243,7 +243,8 @@ pub const HIDRAW_READ_BUDGET: std::time::Duration = std::time::Duration::from_mi
 const NONBLOCK_POLL_SLEEP: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// One bounded input-report read against an `O_NONBLOCK` hidraw `File` — the
-/// Linux counterpart of [`read_report_bounded`] (audit KEY-011: the deadline
+/// Linux counterpart of the hidapi-backend `read_report_bounded` (audit
+/// KEY-011: the deadline
 /// must bound device *silence*, not just the frame count).
 ///
 /// Same contract as the hidapi helper: `Ok(n)` when a report of `n` bytes
