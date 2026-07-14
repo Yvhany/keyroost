@@ -2307,6 +2307,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     unreachable!("every subcommand is handled above");
 }
 
+/// Open a Molto2 session, honoring the global `--device` selector: when set, open
+/// the named device's reader (failing closed if it resolves to none), otherwise
+/// fall back to the first Molto2 reader found. Every `run_molto` path routes
+/// through here so no Molto operation can silently hit an unselected token.
+fn open_molto_session() -> Result<Session, Box<dyn std::error::Error>> {
+    match reader_from_name()? {
+        Some(reader) => Ok(Session::open_named(&reader)?),
+        None => Ok(Session::open()?),
+    }
+}
+
 /// Dispatch the Token2 Molto2 / Molto2v2 subcommands. The customer key comes
 /// from the Molto2-scoped `--key*` flags (`KeyArgs`), not a global flag.
 fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -2345,7 +2356,7 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
 
     // Info is read-only and needs no auth — mirrors the bare-invocation path.
     if let MoltoCmd::Info = cmd {
-        let mut session = Session::open()?;
+        let mut session = open_molto_session()?;
         session.set_debug(debug);
         let info = session.read_info()?;
         if json_output() {
@@ -2363,7 +2374,7 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
     // Slots is read-only and needs no auth — the public block answers any
     // card holder (that's also why the output warns about title privacy).
     if let MoltoCmd::Slots { all } = cmd {
-        let mut session = Session::open()?;
+        let mut session = open_molto_session()?;
         session.set_debug(debug);
         let info = session.read_info()?;
         let mut slots = Vec::with_capacity(100);
@@ -2430,7 +2441,7 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
         title: None,
     } = cmd
     {
-        let mut session = Session::open()?;
+        let mut session = open_molto_session()?;
         session.set_debug(debug);
         let block = session.read_public_data(*profile)?;
         match &block.title {
@@ -2447,7 +2458,7 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
     // Delete needs no auth (hardware-verified) — gate on --yes, and show
     // what's in the slot before touching it.
     if let MoltoCmd::Delete { profile, yes } = cmd {
-        let mut session = Session::open()?;
+        let mut session = open_molto_session()?;
         session.set_debug(debug);
         let info = session.read_info()?;
         print_info(&info);
@@ -2486,7 +2497,7 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
     // (read-only) device info before the --yes gate so even the refusal names
     // exactly which device would be wiped.
     if let MoltoCmd::Reset { yes } = cmd {
-        let mut session = Session::open()?;
+        let mut session = open_molto_session()?;
         session.set_debug(debug);
         let info = session.read_info()?;
         print_info(&info);
@@ -2517,7 +2528,7 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
                 "refusing to probe without --yes (see `keyroostctl molto probe --help`)".into(),
             );
         }
-        let mut session = Session::open()?;
+        let mut session = open_molto_session()?;
         session.set_debug(debug);
         let info = session.read_info()?;
         print_info(&info);
@@ -2554,7 +2565,7 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
              Rotate it first: keyroostctl molto customer-key (see --help)."
         );
     }
-    let mut session = Session::open()?;
+    let mut session = open_molto_session()?;
     session.set_debug(debug);
     let info = session.read_info()?;
     print_info(&info);
@@ -3311,6 +3322,24 @@ fn fido_target_hint(path: Option<&Path>) -> String {
     }
 }
 
+/// Find the connected device named `name` and return its PC/SC reader substring.
+/// Pure over an already-enumerated device list so it is unit-testable without
+/// hardware. First-match today; Task 23 upgrades it to fail closed on ambiguity.
+fn reader_for_name(
+    devices: &[keyroost_resolve::Device],
+    name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let dev = devices
+        .iter()
+        .find(|d| d.name.as_deref() == Some(name))
+        .ok_or_else(|| {
+            format!("no connected device is named '{name}' (see `keyroostctl key-name list`)")
+        })?;
+    dev.reader.clone().ok_or_else(|| {
+        format!("device '{name}' has no smart-card (PC/SC) interface for this command").into()
+    })
+}
+
 /// Resolve the global `--device` (if set) to a PC/SC reader name via the shared
 /// device model, so `--device` targets smart-card / Molto2 groups the same way
 /// `--reader` does. Returns the reader substring to match, or None when no
@@ -3320,19 +3349,7 @@ fn reader_from_name() -> Result<Option<String>, Box<dyn std::error::Error>> {
         return Ok(None);
     };
     let devices = keyroost_resolve::enumerate()?;
-    let dev = devices
-        .iter()
-        .find(|d| d.name.as_deref() == Some(name.as_str()))
-        .ok_or_else(|| {
-            format!("no connected device is named '{name}' (see `keyroostctl key-name list`)")
-        })?;
-    match &dev.reader {
-        Some(r) => Ok(Some(r.clone())),
-        None => Err(format!(
-            "device '{name}' has no smart-card (PC/SC) interface for this command"
-        )
-        .into()),
-    }
+    Ok(Some(reader_for_name(&devices, &name)?))
 }
 
 fn resolve_fido_path(explicit: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -7012,6 +7029,40 @@ mod cli_tests {
         // Transport a device can't satisfy -> error (no HID interface for --transport hid).
         let ccid_only = vec![otp_dev("nfc", None, Some("ACS reader 00"))];
         assert!(resolve_otp_target(&ccid_only, Some("nfc"), OtpTransportArg::Hid).is_err());
+    }
+
+    #[test]
+    fn reader_for_name_targets_the_named_molto() {
+        use keyroost_resolve::{Caps, Device, DeviceKind};
+
+        fn molto(name: &str, reader: &str) -> Device {
+            let mut caps = Caps::default();
+            caps.insert(Caps::TOTP);
+            Device {
+                id: format!("molto:{reader}"),
+                name: Some(name.to_string()),
+                vendor: "Token2".into(),
+                model: "Molto2".into(),
+                serial: name.to_string(),
+                transport: "USB · PC/SC".into(),
+                firmware: String::new(),
+                caps,
+                kind: DeviceKind::Token,
+                hid_path: None,
+                reader: Some(reader.to_string()),
+            }
+        }
+
+        let devices = vec![
+            molto("deskA", "TOKEN2 Molto2 (AAAA) 00 00"),
+            molto("deskB", "TOKEN2 Molto2 (BBBB) 00 00"),
+        ];
+
+        assert_eq!(
+            reader_for_name(&devices, "deskB").unwrap(),
+            "TOKEN2 Molto2 (BBBB) 00 00"
+        );
+        assert!(reader_for_name(&devices, "nope").is_err());
     }
 
     #[test]
