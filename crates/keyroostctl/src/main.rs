@@ -4991,26 +4991,105 @@ fn read_mgmt_key(
     Ok(zeroize::Zeroizing::new(hex_decode(hex.trim())?))
 }
 
-/// Write `data` to `path` with owner-only permissions (0600) on Unix, so
-/// secret output (decrypted plaintext, signatures) isn't left group/world
-/// readable. Sets the mode even if the file already existed (mode passed to
-/// `OpenOptions` only applies at creation, so re-assert it after open).
+/// Write `data` to `path` with owner-only permissions (0600) on Unix, failing
+/// closed against local path attacks (KEY-014). A local attacker who pre-plants
+/// a symlink or a file they own at a predictable secret-output path must not be
+/// able to capture the plaintext or have keyroost clobber an arbitrary file.
+///
+/// Strategy (Unix): reject a pre-existing symlink or non-regular / foreign-owned
+/// destination outright, then write the secret only into a fresh `create_new`
+/// temp file we exclusively own (0600 enforced as fatal) and atomically rename
+/// it over the destination. Because bytes never touch the caller-supplied path
+/// directly, no write can be redirected through an attacker's link.
+#[cfg(unix)]
+fn write_private_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Write};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let fname = path
+        .file_name()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "output path has no file name"))?;
+
+    // 1) Create the temp file first. create_new = O_CREAT|O_EXCL, which refuses
+    //    to follow a symlink at the final component and fails if the path already
+    //    exists — so this file is unambiguously fresh and owned by our euid.
+    let tmp = parent.join(format!(
+        ".{}.keyroost-tmp-{}",
+        fname.to_string_lossy(),
+        std::process::id()
+    ));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true).mode(0o600);
+    let mut f = opts.open(&tmp)?;
+    // Our euid, established from a file we just created (owned by us by definition).
+    let our_uid = f.metadata()?.uid();
+
+    // 2) Vet the real destination via lstat (no symlink follow). Fail closed on a
+    //    symlink, a non-regular file, or a file owned by someone else.
+    let vet = |e: Error| {
+        let _ = std::fs::remove_file(&tmp);
+        e
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                return Err(vet(Error::new(
+                    ErrorKind::AlreadyExists,
+                    "refusing to write secret output through a symlink",
+                )));
+            }
+            if !ft.is_file() {
+                return Err(vet(Error::new(
+                    ErrorKind::AlreadyExists,
+                    "refusing to write secret output to a non-regular file",
+                )));
+            }
+            if meta.uid() != our_uid {
+                return Err(vet(Error::new(
+                    ErrorKind::PermissionDenied,
+                    "refusing to overwrite a secret-output file owned by another user",
+                )));
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {} // fresh output is fine
+        Err(e) => return Err(vet(e)),
+    }
+
+    // 3) Write the secret into the temp, enforcing 0600 as FATAL before any
+    //    bytes: never fall through to writing under looser permissions.
+    if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        return Err(vet(e));
+    }
+    if let Err(e) = f.write_all(data).and_then(|_| f.sync_all()) {
+        return Err(vet(e));
+    }
+    drop(f);
+
+    // 4) Atomically replace the destination. rename() operates on the link/name
+    //    itself, so even a symlink swapped in after step 2 is replaced rather
+    //    than written through.
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        return Err(vet(e));
+    }
+    Ok(())
+}
+
+/// Non-Unix fallback: create/overwrite with owner-intent semantics. Windows ACL
+/// hardening is out of scope for this helper.
+#[cfg(not(unix))]
 fn write_private_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Re-assert 0600 in case the file pre-existed with looser perms.
-        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
-    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
     f.write_all(data)?;
     Ok(())
 }
@@ -6991,6 +7070,34 @@ mod cli_tests {
         assert_eq!(mode & 0o777, 0o600, "re-write should tighten to 0600");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_file_rejects_symlink_destination() {
+        use std::os::unix::fs::symlink;
+
+        let mut base = std::env::temp_dir();
+        base.push(format!("keyroost_symtest_{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let victim = base.join("victim");
+        let link = base.join("link");
+        // Attacker pre-plants a symlink where keyroost will write secret output.
+        symlink(&victim, &link).unwrap();
+
+        let err = write_private_file(&link, b"top secret plaintext").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+        // No bytes may have been written through the link to the victim target.
+        assert!(!victim.exists(), "secret bytes leaked through the symlink");
+        // The link itself is left untouched (still a symlink).
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
