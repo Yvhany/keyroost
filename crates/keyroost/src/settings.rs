@@ -85,57 +85,13 @@ impl From<ModeSetting> for Mode {
     }
 }
 
-/// Default config path. On Windows: `%APPDATA%\keyroost\settings.json` (else
-/// `%USERPROFILE%\.config\keyroost\settings.json`). Otherwise:
-/// `$XDG_CONFIG_HOME/keyroost/settings.json`, else
-/// `$HOME/.config/keyroost/settings.json`.
-///
-/// Mirrors [`keyroost_keyring::config_path`] (plain `std::env`, no path crate)
-/// including its Windows branch — without it, a stock Windows install (no HOME)
-/// returned `None` and the GUI silently never persisted its settings, and
-/// settings.json landed in a different place than keys.json.
+/// Default config path for the GUI's `settings.json`. Delegates the directory
+/// rule to [`keyroost_keyring::config_dir`] so the settings file always lands
+/// next to `keys.json` — a stock Windows install (no `HOME`) still resolves via
+/// `%APPDATA%`, and the two files can never drift apart again (the bug this
+/// replaces: a hand-copied resolver here diverged from the keyring's).
 pub fn config_path() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        if let Some(appdata) = std::env::var_os("APPDATA") {
-            if !appdata.is_empty() {
-                return Some(
-                    PathBuf::from(appdata)
-                        .join("keyroost")
-                        .join("settings.json"),
-                );
-            }
-        }
-        if let Some(profile) = std::env::var_os("USERPROFILE") {
-            if !profile.is_empty() {
-                return Some(
-                    PathBuf::from(profile)
-                        .join(".config")
-                        .join("keyroost")
-                        .join("settings.json"),
-                );
-            }
-        }
-        None
-    }
-    #[cfg(not(windows))]
-    {
-        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-            if !xdg.is_empty() {
-                return Some(PathBuf::from(xdg).join("keyroost").join("settings.json"));
-            }
-        }
-        let home = std::env::var_os("HOME")?;
-        if home.is_empty() {
-            return None;
-        }
-        Some(
-            PathBuf::from(home)
-                .join(".config")
-                .join("keyroost")
-                .join("settings.json"),
-        )
-    }
+    keyroost_keyring::config_dir().map(|d| d.join("settings.json"))
 }
 
 impl Settings {
@@ -322,5 +278,39 @@ mod tests {
         // No temp file left behind.
         assert!(!path.with_extension("json.tmp").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn settings_path_is_config_dir_plus_settings_json() {
+        // The GUI settings file must live in the SAME directory keyroost-keyring
+        // resolves for keys.json — proven by delegation, no env mutation.
+        match keyroost_keyring::config_dir() {
+            Some(dir) => assert_eq!(config_path(), Some(dir.join("settings.json"))),
+            None => assert_eq!(config_path(), None),
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn config_path_follows_xdg_config_home() {
+        // NOTE: this test MUTATES process env. It must not run concurrently with
+        // any other env-mutating test in this crate; it is currently the only
+        // one. The GUI crate is edition 2021, where `std::env::set_var` is safe
+        // (not `unsafe`), so no `unsafe` block is needed.
+        let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", "/tmp/keyroost-xdg-cfg");
+        let got = config_path();
+        match saved_xdg {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        assert_eq!(
+            got,
+            Some(
+                PathBuf::from("/tmp/keyroost-xdg-cfg")
+                    .join("keyroost")
+                    .join("settings.json")
+            )
+        );
     }
 }

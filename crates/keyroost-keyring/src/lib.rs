@@ -244,29 +244,24 @@ fn strip_control_chars(s: &mut String) {
     }
 }
 
-/// Default config path for `keys.json`.
+/// Default config *directory* for keyroost's per-user state (`keys.json`,
+/// and the GUI's `settings.json`). Both files must live in the same place, so
+/// the directory rule lives here once.
 ///
-/// * Windows: `%APPDATA%\keyroost\keys.json` (falling back to
-///   `%USERPROFILE%\.config\keyroost\keys.json`).
-/// * Otherwise: `$XDG_CONFIG_HOME/keyroost/keys.json`, else
-///   `$HOME/.config/keyroost/keys.json`.
-pub fn config_path() -> Option<PathBuf> {
+/// * Windows: `%APPDATA%\keyroost` (falling back to `%USERPROFILE%\.config\keyroost`).
+/// * Otherwise: `$XDG_CONFIG_HOME/keyroost`, else `$HOME/.config/keyroost`.
+pub fn config_dir() -> Option<std::path::PathBuf> {
     // Windows has no HOME/XDG by default; use the standard roaming AppData dir.
     #[cfg(windows)]
     {
         if let Some(appdata) = std::env::var_os("APPDATA") {
             if !appdata.is_empty() {
-                return Some(PathBuf::from(appdata).join("keyroost").join("keys.json"));
+                return Some(PathBuf::from(appdata).join("keyroost"));
             }
         }
         if let Some(profile) = std::env::var_os("USERPROFILE") {
             if !profile.is_empty() {
-                return Some(
-                    PathBuf::from(profile)
-                        .join(".config")
-                        .join("keyroost")
-                        .join("keys.json"),
-                );
+                return Some(PathBuf::from(profile).join(".config").join("keyroost"));
             }
         }
         None
@@ -275,20 +270,20 @@ pub fn config_path() -> Option<PathBuf> {
     {
         if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
             if !xdg.is_empty() {
-                return Some(PathBuf::from(xdg).join("keyroost").join("keys.json"));
+                return Some(PathBuf::from(xdg).join("keyroost"));
             }
         }
         let home = std::env::var_os("HOME")?;
         if home.is_empty() {
             return None;
         }
-        Some(
-            PathBuf::from(home)
-                .join(".config")
-                .join("keyroost")
-                .join("keys.json"),
-        )
+        Some(PathBuf::from(home).join(".config").join("keyroost"))
     }
+}
+
+/// Default config path for `keys.json`. See [`config_dir`] for the directory rule.
+pub fn config_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("keys.json"))
 }
 
 impl Keyring {
