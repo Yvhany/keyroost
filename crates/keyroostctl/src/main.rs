@@ -5821,23 +5821,6 @@ fn large_blob_bad_index(index: usize, len: usize) -> Box<dyn std::error::Error> 
     }
 }
 
-/// True for characters that can visually reorder or hide terminal output even
-/// though they are not Unicode *control* characters (category Cf, which
-/// `char::is_control()` — Cc only — does not cover): the bidirectional
-/// embedding/override/isolate controls (the Trojan-Source class,
-/// CVE-2021-42574) and zero-width characters that can disguise a spoofed
-/// serial or credential name.
-fn is_render_hostile(c: char) -> bool {
-    matches!(
-        c,
-        '\u{061C}'                  // arabic letter mark (bidi)
-        | '\u{200B}'..='\u{200F}'   // zero-widths, ZWJ/ZWNJ, LRM/RLM
-        | '\u{202A}'..='\u{202E}'   // LRE/RLE/PDF/LRO/RLO
-        | '\u{2066}'..='\u{2069}'   // LRI/RLI/FSI/PDI
-        | '\u{FEFF}'                // zero-width no-break space / BOM
-    )
-}
-
 /// Flatten control characters out of any attacker-supplied string before it
 /// reaches the terminal, so a hostile value cannot inject ANSI/terminal escape
 /// sequences. Applies to every device- or file-derived string printed by the
@@ -5886,19 +5869,11 @@ fn molto_algo_label(algo: u8) -> String {
     }
 }
 
-/// A short, single-line preview of a note's text for the `list` view.
+/// A short, single-line preview of a note's text for the `list` view. Uses the
+/// shared terminal sanitizer so a future policy change reaches this site too.
 fn preview_note(text: &str) -> String {
     const MAX: usize = 48;
-    let one_line: String = text
-        .chars()
-        .map(|c| {
-            if c.is_control() || is_render_hostile(c) {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect();
+    let one_line = sanitize_terminal(text);
     let trimmed = one_line.trim();
     let mut out: String = trimmed.chars().take(MAX).collect();
     if trimmed.chars().count() > MAX {
@@ -6952,7 +6927,9 @@ mod cli_tests {
         // (Trojan-Source class), and zero-widths can hide a lookalike name.
         let dirty = "ser\u{202E}321\u{2066}x\u{200B}y\u{061C}z\u{FEFF}";
         for clean in [sanitize_terminal(dirty), sanitize_multiline(dirty)] {
-            assert!(!clean.chars().any(is_render_hostile), "bidi/ZW flattened");
+            for hostile in ['\u{202E}', '\u{2066}', '\u{200B}', '\u{061C}', '\u{FEFF}'] {
+                assert!(!clean.contains(hostile), "bidi/ZW flattened");
+            }
             assert!(!clean.chars().any(|c| c.is_control()));
             assert_eq!(clean.chars().count(), dirty.chars().count());
         }
@@ -7628,6 +7605,18 @@ mod cli_tests {
         let p = preview_note(&long);
         assert!(p.ends_with('…'));
         assert_eq!(p.chars().count(), 49); // 48 chars + ellipsis
+    }
+
+    #[test]
+    fn preview_note_renders_hostile_content_inert() {
+        // ESC + an OSC-style sequence and a soft hyphen must all be neutralized
+        // through the shared sanitize path.
+        let note = "hello\u{1b}]0;pwn\u{07}\u{00AD}world";
+        let p = preview_note(note);
+        assert!(!p.contains('\u{1b}'));
+        assert!(!p.contains('\u{07}'));
+        assert!(!p.contains('\u{00AD}'));
+        assert!(p.contains("hello"));
     }
 
     #[test]
