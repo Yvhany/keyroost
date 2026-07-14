@@ -54,8 +54,13 @@ What keyroost does **not** defend against:
   socket or speaks HTTP; there is no telemetry, no update check, no
   "cloud". A release that broke this would be a security bug — report it
   as one.
-- **No `unsafe` code.** `unsafe_code = "forbid"` is enforced
-  workspace-wide.
+- **`unsafe` only in two scoped FFI shims.** `unsafe_code = "forbid"` is
+  the workspace-wide default; the sole exceptions are the Windows-only
+  `keyroost-winwebauthn` (HID enumeration / shell launch) and
+  `keyroost-screengrab` (GDI screen capture) crates, which set
+  `unsafe_code = "allow"` to confine their thin `windows-sys` FFI. Both
+  are inert on non-Windows targets. No `unsafe` appears in any
+  cross-platform crate.
 - **Vendored protocol code, minimal dependencies.** SM4, SHA-1/256, HMAC,
   base32/hex, APDU/TLV/CBOR parsing are all in-tree. External
   dependencies are limited to a short, documented list (pcsc, clap,
