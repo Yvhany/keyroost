@@ -5843,13 +5843,13 @@ fn is_render_hostile(c: char) -> bool {
 /// sequences. Applies to every device- or file-derived string printed by the
 /// CLI: certificate fields, USB descriptor strings (vendor/model/serial),
 /// PC/SC reader names, OATH/FIDO credential names, slot titles, and friendly
-/// names. Control chars (which include ESC `0x1b`) and bidi/zero-width
-/// format chars (see [`is_render_hostile`]) become spaces; character count is
+/// names. Control, zero-width, and bidi format chars (see
+/// [`keyroost_keyring::is_spoofing_char`]) become spaces; character count is
 /// preserved so column alignment is unaffected.
 pub(crate) fn sanitize_terminal(s: &str) -> String {
     s.chars()
         .map(|c| {
-            if c.is_control() || is_render_hostile(c) {
+            if keyroost_keyring::is_spoofing_char(c) {
                 ' '
             } else {
                 c
@@ -5867,7 +5867,7 @@ pub(crate) fn sanitize_multiline(s: &str) -> String {
         .map(|c| {
             if c == '\n' || c == '\t' {
                 c
-            } else if c.is_control() || is_render_hostile(c) {
+            } else if keyroost_keyring::is_spoofing_char(c) {
                 ' '
             } else {
                 c
@@ -6913,6 +6913,36 @@ mod cli_tests {
         assert!(clean.contains('\t'), "tab preserved");
         assert!(!clean.contains('\x1b'), "ESC flattened");
         assert!(!clean.contains('\r'), "other control (CR) flattened");
+    }
+
+    #[test]
+    fn sanitize_terminal_neutralizes_all_hostile_chars() {
+        for c in [
+            '\u{001B}',
+            '\u{061C}',
+            '\u{200B}',
+            '\u{202E}',
+            '\u{2069}',
+            '\u{FEFF}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{2060}',
+            '\u{00AD}',
+            '\u{180E}',
+            '\u{E007F}',
+        ] {
+            let s = sanitize_terminal(&format!("x{c}y"));
+            assert!(
+                !s.chars().any(|ch| ch == c),
+                "U+{:04X} survived sanitize_terminal",
+                c as u32
+            );
+            assert_eq!(s.chars().count(), 3, "length must be preserved");
+        }
+        // A line separator must not survive into a single listing line.
+        let line = sanitize_terminal("app:acct\u{2028}injected");
+        assert!(!line.contains('\u{2028}'));
+        assert!(!line.contains('\n'));
     }
 
     #[test]

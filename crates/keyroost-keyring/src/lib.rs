@@ -188,8 +188,7 @@ impl std::error::Error for ResolveError {}
 /// * empty (or whitespace-only) names — there must be something after trimming;
 /// * names longer than 64 characters;
 /// * names containing control / zero-width / bidi-override characters (the
-///   spoofing chars the internal `is_spoofing_char` check guards against —
-///   they enable display
+///   spoofing chars [`is_spoofing_char`] guards against — they enable display
 ///   spoofing in a saved name).
 pub fn validate_name(name: &str) -> Result<(), KeyringError> {
     // A friendly name is a human-facing label, so allow normal text — letters
@@ -213,19 +212,23 @@ pub fn validate_name(name: &str) -> Result<(), KeyringError> {
 }
 
 /// Control, zero-width, and bidi-override characters that enable display
-/// spoofing in a saved name. Shared by validation and sanitization.
-fn is_spoofing_char(c: char) -> bool {
-    c.is_control()
+/// spoofing in a saved name or any device/credential string. The single source
+/// of truth for terminal-hostile classification, shared by this crate's name
+/// validation/sanitization and the CLI's `sanitize_terminal`/`sanitize_multiline`.
+pub fn is_spoofing_char(c: char) -> bool {
+    c.is_control() // Cc (includes ESC 0x1b, NUL, and all C0/C1 controls)
         || matches!(c,
-            '\u{200B}'..='\u{200F}' // zero-width space/joiners, LRM/RLM
-            | '\u{202A}'..='\u{202E}' // bidi embeddings + LRO/RLO
+            '\u{00AD}' // soft hyphen
+            | '\u{061C}' // Arabic letter mark
+            | '\u{180E}' // Mongolian vowel separator (zero-width)
+            | '\u{200B}'..='\u{200F}' // zero-width space/joiners, LRM/RLM
             | '\u{2028}' // line separator (Zl)
             | '\u{2029}' // paragraph separator (Zp)
+            | '\u{202A}'..='\u{202E}' // bidi embeddings + LRO/RLO
             | '\u{2060}'..='\u{2064}' // word joiner + invisible format chars
             | '\u{2066}'..='\u{2069}' // bidi isolates
             | '\u{FEFF}' // BOM / ZWNBSP
-            | '\u{00AD}' // soft hyphen
-            | '\u{061C}' // Arabic letter mark
+            | '\u{E0000}'..='\u{E007F}' // Unicode TAG block (incl. deprecated lang tags)
         )
 }
 
@@ -519,6 +522,37 @@ mod tests {
         let mut s = "line\u{2028}sep\u{2060}word".to_string();
         strip_control_chars(&mut s);
         assert_eq!(s, "linesepword");
+    }
+
+    #[test]
+    fn spoofing_char_covers_the_full_hostile_set() {
+        // Cc control (ESC), the bidi/zero-width set, and the two gaps the CLI missed:
+        // line/paragraph separators, invisible math/format chars, soft hyphen, plus
+        // the Mongolian vowel separator and the whole TAG block.
+        for c in [
+            '\u{001B}', // ESC (Cc)
+            '\u{061C}',
+            '\u{200B}',
+            '\u{200F}',
+            '\u{202A}',
+            '\u{202E}',
+            '\u{2066}',
+            '\u{2069}',
+            '\u{FEFF}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{2060}',
+            '\u{2064}',
+            '\u{00AD}',
+            '\u{180E}', // Mongolian vowel separator
+            '\u{E0000}',
+            '\u{E0020}',
+            '\u{E007F}', // TAG block bounds + a tag char
+        ] {
+            assert!(is_spoofing_char(c), "U+{:04X} must be hostile", c as u32);
+        }
+        assert!(!is_spoofing_char('a'));
+        assert!(!is_spoofing_char('世'));
     }
 
     #[test]
