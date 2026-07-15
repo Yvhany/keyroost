@@ -23,9 +23,8 @@ Captured here so they don't get lost. Unchecked = not started.
     a green check can mask a no-op. Confirm concretely: crates.io shows the new
     version, the Homebrew tap formula bumped, and a winget PR was opened. winget
     needs the `WINGET_TOKEN` secret (classic PAT, `public_repo` scope, held by
-    the maintainer — it **silently skips again when the PAT expires**); AUR is
-    externally blocked (registry not accepting submissions during the
-    supply-chain incident) — skip by design, revisit when it reopens;
+    the maintainer — it **silently skips again when the PAT expires**); AUR
+    (`keyroost-bin`) went live with v0.7.5 — confirm the package version bumped;
   - **signed binaries (manual, Token2)**: Token2 signs the Windows + macOS
     builds on their DigiCert hardware token, which **cannot be automated** in
     CI (physical token access required; see #77). So after the release is cut,
@@ -38,6 +37,73 @@ Captured here so they don't get lost. Unchecked = not started.
   - announcement/notes if any.
 - [ ] Decide where it lives (likely `packaging/RELEASING.md`) and whether any
       steps can become a workflow-dispatch dry-run instead of prose.
+
+## Windows signing + winget flow (Token2 signed assets)
+
+The v0.7.5 winget PR ([microsoft/winget-pkgs#402508](https://github.com/microsoft/winget-pkgs/pull/402508))
+hit `Validation-Defender-Error` on the unsigned CI zip; a false-positive
+report was filed with Microsoft (WDSI, developer queue). Working theory:
+Token2's *signed* keyroost builds circulate widely, so Defender's
+"unsigned variant of normally-signed software" heuristic trips on the CI
+zip — which means this recurs every release until winget points at signed
+binaries. Decision: keep signing with Token2 (no own signing identity for
+now — Azure Artifact Signing / Certum would put the maintainer's legal
+name in the cert CN; SignPath OSS rejected the project as too new,
+re-apply in 6–12 months).
+
+- [ ] **Signed-asset convention:** when Token2 returns signed builds,
+      attach them as NEW assets (`keyroost-vX.Y.Z-windows-x86_64-signed.zip`
+      + `.sha256` sidecar). **Never replace** the CI-built assets — that
+      would invalidate `SHA256SUMS`, the provenance attestations, and any
+      open winget PR's hash. The two variants have complementary trust
+      chains (CI provenance vs Authenticode); label them in release notes.
+- [ ] **Rework the `publish.yml` winget job:** prefer the `-signed.zip`
+      asset when present; when absent, **skip cleanly instead of submitting
+      the unsigned zip** (no more racing Defender at release time). Add a
+      `workflow_dispatch` path so the winget leg runs on demand after the
+      signed asset lands. New rhythm: tag → fanout (minus winget) → Token2
+      signs at their pace → attach signed asset → dispatch winget.
+- [ ] **Manual fallback from Linux:** `komac update Framefilter.Keyroost
+      --version <V> --urls <signed-asset-url> --submit` (komac is the
+      Rust winget-manifest tool; wingetcreate is Windows-only).
+- [ ] **v0.7.5 specifically:** if the Defender false-positive clears before
+      Token2 delivers, the existing PR may pass re-validation as-is (unsigned
+      zip serves 0.7.5; switch to signed assets from the next release).
+      Otherwise close #402508 and resubmit against the signed asset. Do NOT
+      host Token2's signed **v0.7.4** on the release page — it predates the
+      v0.7.5 security fixes; ask them to sign v0.7.5 instead.
+
+## Hardware verification pass for the v0.7.5 security work
+
+The v0.7.5 remediation shipped with all automated gates green, but the
+plan's manual two-key hardware steps were deliberately deferred (no keys
+in-session). Run these with the disposable test keys before building
+anything big on top:
+
+- [ ] **Wrong-device bindings (GUI, Tasks 15–18):** with two keys plugged
+      in, switch the selection mid-operation and confirm the stale
+      completion is discarded for: Molto2 session open/write, the FIDO
+      advanced dialog (typed PIN must die with the dialog), OATH delete
+      confirmation, OpenPGP reset modal, fingerprint enroll, large-blob ops.
+- [ ] **Armed FIDO reset (Task 19):** arm reset for key A, replug key A →
+      fires; arm for key A, insert same-model key B during the window → must
+      NOT fire; a serial-less key must refuse to arm (points at the CLI flow).
+- [ ] **OATH password carry (Task 17):** on a password-protected key,
+      unlock + list, then "Read code" on an HOTP credential — must succeed
+      without retyping; switch devices and confirm the retained password is
+      dropped.
+- [ ] **CLI targeting (Tasks 21–23):** with two OTP-capable keys,
+      `keyroostctl --device <name> otp list` / `molto info` hit the named
+      key only; ambiguous/duplicate-serial setups fail closed with the
+      ambiguity error.
+- [ ] **GUI OTP pane binding (Task 31):** two OTP-capable keys, confirm
+      list/add/delete operate on the selected key only, and the fail-closed
+      error shows when the transport pick can't be satisfied.
+- [ ] **Duplicate-serial advisory (Task 32):** if two same-serial keys are
+      available, confirm the sidebar advisory appears and both keys stay
+      separately selectable.
+- [ ] **Linux hidraw bounded reads (Task 8):** unplug a key mid-`fido info`
+      — the command must error out within the read budget, not hang.
 
 ## PC/SC: load libpcsclite at runtime, degrade gracefully (the real #47 fix)
 
