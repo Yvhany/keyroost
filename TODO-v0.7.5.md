@@ -66,12 +66,19 @@ re-apply in 6–12 months).
 - [ ] **Manual fallback from Linux:** `komac update Framefilter.Keyroost
       --version <V> --urls <signed-asset-url> --submit` (komac is the
       Rust winget-manifest tool; wingetcreate is Windows-only).
-- [ ] **v0.7.5 specifically:** if the Defender false-positive clears before
-      Token2 delivers, the existing PR may pass re-validation as-is (unsigned
-      zip serves 0.7.5; switch to signed assets from the next release).
-      Otherwise close #402508 and resubmit against the signed asset. Do NOT
-      host Token2's signed **v0.7.4** on the release page — it predates the
-      v0.7.5 security fixes; ask them to sign v0.7.5 instead.
+- [ ] **v0.7.5 specifically (decided path):** skipping the Microsoft
+      false-positive submission. Wait for Token2 to sign v0.7.5, attach the
+      signed asset per the convention above, close #402508 (it will
+      otherwise lapse under `Needs-Author-Feedback`), and resubmit via
+      komac against the signed asset. Do NOT host Token2's signed
+      **v0.7.4** on the release page — it predates the v0.7.5 security
+      fixes; ask them to sign v0.7.5 instead.
+- [ ] **README + pages once signed v0.7.5 lands:** update the Windows
+      install instructions (winget + direct download) to point at the
+      signed asset, and add a short explanation that Windows releases
+      trail the other platforms because Windows builds are code-signed
+      out-of-band on the vendor's hardware token (Defender flags unsigned
+      builds — see #402508). Set expectations rather than apologize.
 
 ## Hardware verification pass for the v0.7.5 security work
 
