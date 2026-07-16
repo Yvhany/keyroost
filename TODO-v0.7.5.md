@@ -81,6 +81,25 @@ re-apply in 6–12 months).
       re-validation, so the delay affects the signed download, not winget
       availability.
 
+## Embed the Windows app icon in the GUI build
+
+Token2's signed v0.7.5 `keyroost.exe` carries an app icon they injected
+during signing (an added `.rsrc` ICON/GROUP_ICON section); our CI GUI
+binary ships with none. Nice addition — we should own it so it's in
+**every** `keyroost.exe` (CI, `cargo install`, and future signed builds
+become our-exact-bytes + signature with nothing injected).
+
+- [ ] Add a `winresource` (or `winres`) build-dependency to the `keyroost`
+      crate, gated to Windows targets, compiling a `.ico` into the binary
+      via `build.rs`. Icon source already exists (`packaging/icons/`, and
+      `Keyroost icon design.zip`); produce a multi-resolution `.ico`.
+- [ ] Optionally embed `VS_VERSION_INFO` (product name, version, company)
+      at the same time — the CI GUI exe currently has none.
+- [ ] Verify on a Windows build that the icon shows in Explorer/taskbar;
+      confirm the Linux/macOS builds are unaffected (build-dep is
+      cfg-gated). Once landed, future signed GUI binaries should be
+      byte-identical to CI + signature (no injected `.rsrc`).
+
 ## Hardware verification pass for the v0.7.5 security work
 
 The v0.7.5 remediation shipped with all automated gates green, but the
