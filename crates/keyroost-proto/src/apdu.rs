@@ -123,6 +123,42 @@ pub fn build_apdu_get(cla: u8, ins: u8, p1: u8, p2: u8, le: u8) -> Vec<u8> {
     vec![cla, ins, p1, p2, le]
 }
 
+/// Build the APDU to resend after a `6C xx` ("wrong Le") status word.
+///
+/// ISO 7816-4: `6C xx` tells the host to reissue the *same* command with
+/// `Le = xx`. Where that Le goes depends on the case of the original APDU:
+///
+/// * case 1 (bare 4-byte header): **append** Le → case 2;
+/// * case 2 (header + Le): **replace** the trailing Le byte — appending
+///   would produce the malformed `… Le_old Le_new`;
+/// * case 3 (header + Lc + data, no Le): **append** Le → case 4. The last
+///   byte here is *data* and must never be overwritten;
+/// * case 4 (header + Lc + data + Le): **replace** the trailing Le byte.
+///
+/// Classification is by structure, not length: only an APDU that provably
+/// ends in Le gets its last byte replaced. An extended-form APDU
+/// (`Lc = 00 hi lo`) never matches the case-4 length check and safely falls
+/// through to append.
+pub fn resend_with_le(original: &[u8], le: u8) -> Vec<u8> {
+    let mut out = original.to_vec();
+    let ends_in_le = match out.len() {
+        0..=4 => false, // case 1 (or truncated): nothing to replace
+        5 => true,      // case 2: the 5th byte is Le
+        n => {
+            // Short-form body APDU: header + Lc + `Lc` data bytes (case 3),
+            // or the same plus one trailing Le (case 4).
+            let lc = out[4] as usize;
+            n == 5 + lc + 1
+        }
+    };
+    if ends_in_le {
+        *out.last_mut().unwrap() = le;
+    } else {
+        out.push(le);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +192,30 @@ mod tests {
     fn build_apdu_layout() {
         let apdu = build_apdu(0x84, 0xC5, 0x01, 0x02, &[0xde, 0xad]);
         assert_eq!(apdu, [0x84, 0xC5, 0x01, 0x02, 0x02, 0xde, 0xad]);
+    }
+
+    #[test]
+    fn resend_with_le_covers_all_four_short_cases() {
+        // Case 1 (bare header): append Le → case 2.
+        assert_eq!(
+            resend_with_le(&[0x80, 0xC5, 0x05, 0x02], 0x00),
+            vec![0x80, 0xC5, 0x05, 0x02, 0x00]
+        );
+        // Case 2 (header + Le): replace the trailing Le.
+        assert_eq!(
+            resend_with_le(&[0x00, 0xC0, 0x00, 0x00, 0x20], 0x08),
+            vec![0x00, 0xC0, 0x00, 0x00, 0x08]
+        );
+        // Case 3 (header + Lc + data): append; the last data byte survives.
+        let apdu = build_apdu(0x80, 0xC5, 0x05, 0x02, &[0xAA; 16]);
+        let mut expected = apdu.clone();
+        expected.push(0x2A);
+        assert_eq!(resend_with_le(&apdu, 0x2A), expected);
+        // Case 4 (header + Lc + data + Le): replace the trailing Le.
+        assert_eq!(
+            resend_with_le(&[0x80, 0xC5, 0x05, 0x00, 0x02, 0x03, 0x07, 0x10], 0x40),
+            vec![0x80, 0xC5, 0x05, 0x00, 0x02, 0x03, 0x07, 0x40]
+        );
     }
 
     #[test]

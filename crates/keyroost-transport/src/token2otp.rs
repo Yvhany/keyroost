@@ -219,45 +219,10 @@ fn trace_bytes(debug: bool, label: &str, bytes: &[u8], sensitive: bool) {
     }
 }
 
-/// Build the APDU to resend after a `6C xx` ("wrong Le") status word.
-///
-/// ISO 7816-4: `6C xx` tells the host to reissue the *same* command with
-/// `Le = xx`. Where that Le goes depends on the case of the original APDU:
-///
-/// * case 1 (bare 4-byte header, e.g. ERASE_ALL): **append** Le → case 2;
-/// * case 2 (header + Le, e.g. GET_ECDH_PUBKEY / READ_CONFIG / GET RESPONSE):
-///   **replace** the trailing Le byte — appending would produce the malformed
-///   `… Le_old Le_new`;
-/// * case 3 (header + Lc + data, e.g. WRITE_SEED / ENUM_CODES / SELECT —
-///   `keyroost_token2otp::build_apdu` appends no Le): **append** Le → case 4.
-///   The last byte here is *data* (seed ciphertext, an account-name byte) and
-///   must never be overwritten;
-/// * case 4 (header + Lc + data + Le): **replace** the trailing Le byte.
-///
-/// Classification is by structure, not length: only an APDU that provably
-/// ends in Le gets its last byte replaced. Every Token2 OTP body command is
-/// short-form (bodies are well under 256 bytes); an extended-form APDU
-/// (`Lc = 00 hi lo`, unused in practice) never matches the case-4 length
-/// check and safely falls through to append.
-fn resend_with_le(original: &[u8], le: u8) -> Vec<u8> {
-    let mut out = original.to_vec();
-    let ends_in_le = match out.len() {
-        0..=4 => false, // case 1 (or truncated): nothing to replace
-        5 => true,      // case 2: the 5th byte is Le
-        n => {
-            // Short-form body APDU: header + Lc + `Lc` data bytes (case 3),
-            // or the same plus one trailing Le (case 4).
-            let lc = out[4] as usize;
-            n == 5 + lc + 1
-        }
-    };
-    if ends_in_le {
-        *out.last_mut().unwrap() = le;
-    } else {
-        out.push(le);
-    }
-    out
-}
+// The `6C xx` ("wrong Le") retry classifier lives in `keyroost_proto::apdu`
+// (pure ISO 7816-4 logic, fuzzed there via the `otp_apdu_retry` target);
+// re-exported so this transport's callers and tests keep their name for it.
+pub(crate) use keyroost_proto::apdu::resend_with_le;
 
 /// USB-HID transport for the Token2 OTP applet (spec §4).
 pub struct HidOtpTransport {

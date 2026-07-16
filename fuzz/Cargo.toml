@@ -130,3 +130,10 @@ path = "fuzz_targets/winhid_detail.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "otp_apdu_retry"
+path = "fuzz_targets/otp_apdu_retry.rs"
+test = false
+doc = false
+bench = false
