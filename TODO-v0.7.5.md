@@ -66,19 +66,20 @@ re-apply in 6–12 months).
 - [ ] **Manual fallback from Linux:** `komac update Framefilter.Keyroost
       --version <V> --urls <signed-asset-url> --submit` (komac is the
       Rust winget-manifest tool; wingetcreate is Windows-only).
-- [ ] **v0.7.5 specifically (decided path):** skipping the Microsoft
-      false-positive submission. Wait for Token2 to sign v0.7.5, attach the
-      signed asset per the convention above, close #402508 (it will
-      otherwise lapse under `Needs-Author-Feedback`), and resubmit via
-      komac against the signed asset. Do NOT host Token2's signed
-      **v0.7.4** on the release page — it predates the v0.7.5 security
-      fixes; ask them to sign v0.7.5 instead.
-- [ ] **README + pages once signed v0.7.5 lands:** update the Windows
-      install instructions (winget + direct download) to point at the
-      signed asset, and add a short explanation that Windows releases
-      trail the other platforms because Windows builds are code-signed
-      out-of-band on the vendor's hardware token (Defender flags unsigned
-      builds — see #402508). Set expectations rather than apologize.
+- [x] **v0.7.5 specifically: RESOLVED without author action** — a winget
+      moderator reran validation on 2026-07-15, it passed on updated
+      Defender definitions (transient false positive), and #402508 merged;
+      0.7.5 is live in the catalog serving the unsigned CI zip. The
+      signed-asset flow above starts with the next release. Still do NOT
+      host Token2's signed **v0.7.4** — it predates the v0.7.5 security
+      fixes; ask them to sign v0.7.5 (or whatever is current) instead.
+- [ ] **README + pages once signed assets exist:** point the Windows
+      direct-download instructions at the signed asset and add a short
+      note that signed Windows builds may trail the release by a few days
+      (vendor signs out-of-band on a hardware token). Softer framing than
+      originally planned — winget shipped v0.7.5 unsigned after moderator
+      re-validation, so the delay affects the signed download, not winget
+      availability.
 
 ## Hardware verification pass for the v0.7.5 security work
 
