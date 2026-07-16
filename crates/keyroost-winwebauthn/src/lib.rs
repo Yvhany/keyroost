@@ -154,8 +154,12 @@ pub fn relaunch_as_admin() -> Result<()> {
 ///
 /// The only production caller is the `#[cfg(windows)]` `sys` module; on other
 /// hosts the function exists solely so the unit tests below exercise it.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn parse_detail_path(buf: &[u8]) -> String {
+// `pub` + `#[doc(hidden)]` so the workspace fuzz harness can reach this
+// extent-bounded parser (KEY-020 surface) without it becoming public API.
+// (Now that it's public with a Linux fuzz consumer, the prior
+// not(windows) dead-code allow is no longer needed.)
+#[doc(hidden)]
+pub fn parse_detail_path(buf: &[u8]) -> String {
     const PATH_OFFSET: usize = 4;
     let mut units = Vec::new();
     let mut i = PATH_OFFSET;

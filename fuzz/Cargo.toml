@@ -27,6 +27,9 @@ keyroost-oath = { path = "../crates/keyroost-oath" }
 keyroost-openpgp = { path = "../crates/keyroost-openpgp" }
 keyroost-piv = { path = "../crates/keyroost-piv" }
 keyroost-token2otp = { path = "../crates/keyroost-token2otp" }
+# winwebauthn is Windows-only for its FFI, but parse_detail_path is pure and
+# compiles/runs on Linux — the audit's KEY-020 surface, fuzzed here.
+keyroost-winwebauthn = { path = "../crates/keyroost-winwebauthn" }
 
 [workspace]
 
@@ -117,6 +120,13 @@ bench = false
 [[bin]]
 name = "molto_parse"
 path = "fuzz_targets/molto_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "winhid_detail"
+path = "fuzz_targets/winhid_detail.rs"
 test = false
 doc = false
 bench = false
