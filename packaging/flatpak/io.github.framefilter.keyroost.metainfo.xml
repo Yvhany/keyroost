@@ -65,7 +65,12 @@
   <releases>
     <!-- CUT STEP: at each release, prepend a <release> for the new version with
          the tag date, matching the workspace version in the root Cargo.toml.
-         Next cut: add <release version="0.7.0" date="YYYY-MM-DD"/> above this. -->
+         The newest entry here is the version flatpak/GNOME Software report and
+         compare against — if it lags the built binary, clients believe they are
+         up to date on the stale version. A CI check enforces newest == Cargo.toml. -->
+    <release version="0.7.5" date="2026-07-14"/>
+    <release version="0.7.4" date="2026-07-06"/>
+    <release version="0.7.3" date="2026-06-30"/>
     <release version="0.7.2" date="2026-06-26"/>
     <release version="0.7.1" date="2026-06-21"/>
     <release version="0.7.0" date="2026-06-20"/>
