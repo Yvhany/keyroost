@@ -13667,3 +13667,123 @@ mod tests {
         ));
     }
 }
+
+/// Randomized coverage (proptest, dev-only) on top of the example-based tests
+/// above, for the pure device-binding guards the audit called out: these are
+/// the GUI's fail-closed decisions and live in a binary crate the libfuzzer
+/// workspace cannot reach.
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// A completion may act only when both the captured and the current
+        /// selection exist — `None` on either side always fails closed.
+        #[test]
+        fn completion_fails_closed_on_any_unbound_side(id in proptest::option::of(".*")) {
+            prop_assert!(!completion_still_valid(None, id.as_ref()));
+            prop_assert!(!completion_still_valid(id.as_ref(), None));
+        }
+
+        /// With both sides bound, the completion acts iff the ids are equal.
+        #[test]
+        fn completion_requires_exact_id_match(a in ".*", b in ".*") {
+            prop_assert_eq!(completion_still_valid(Some(&a), Some(&b)), a == b);
+            prop_assert!(completion_still_valid(Some(&a), Some(&a)));
+        }
+
+        /// KEY-005: a candidate with no stable identity (no HID serial, no
+        /// effective serial) is NEVER accepted for an armed reset, whatever
+        /// the armed target looks like — first-same-model-to-appear is not
+        /// an identity.
+        #[test]
+        fn reset_never_accepts_a_serial_less_candidate(
+            t_hid in proptest::option::of("[ -~]{0,12}"),
+            t_eff in proptest::option::of("[ -~]{0,12}"),
+            t_ids in proptest::option::of(any::<(u16, u16)>()),
+            cand_ids in any::<(u16, u16)>(),
+        ) {
+            prop_assert!(!reset_reinsert_matches(
+                t_hid.as_deref(),
+                t_eff.as_deref(),
+                t_ids,
+                None,
+                None,
+                cand_ids,
+            ));
+        }
+
+        /// A vendor/product-id mismatch rejects the candidate no matter how
+        /// well the serials agree.
+        #[test]
+        fn reset_rejects_model_mismatch_regardless_of_serials(
+            serial in "[ -~]{0,12}",
+            t_ids in any::<(u16, u16)>(),
+            cand_ids in any::<(u16, u16)>(),
+        ) {
+            prop_assume!(t_ids != cand_ids);
+            prop_assert!(!reset_reinsert_matches(
+                Some(&serial),
+                Some(&serial),
+                Some(t_ids),
+                Some(&serial),
+                Some(&serial),
+                cand_ids,
+            ));
+        }
+
+        /// Acceptance requires a *stable* identity match: when both sides
+        /// expose a HID serial that comparison decides alone (the effective
+        /// serial can't override it); otherwise both effective serials must
+        /// exist and match. Any accepted candidate therefore matched on one
+        /// of the two.
+        #[test]
+        fn reset_accepts_only_on_a_stable_serial_match(
+            t_hid in proptest::option::of("[ -~]{0,4}"),
+            t_eff in proptest::option::of("[ -~]{0,4}"),
+            c_hid in proptest::option::of("[ -~]{0,4}"),
+            c_eff in proptest::option::of("[ -~]{0,4}"),
+            ids in any::<(u16, u16)>(),
+        ) {
+            let accepted = reset_reinsert_matches(
+                t_hid.as_deref(),
+                t_eff.as_deref(),
+                Some(ids),
+                c_hid.as_deref(),
+                c_eff.as_deref(),
+                ids,
+            );
+            let expected = match (&t_hid, &c_hid) {
+                (Some(t), Some(c)) => t == c,
+                _ => matches!((&t_eff, &c_eff), (Some(t), Some(c)) if t == c),
+            };
+            prop_assert_eq!(accepted, expected);
+        }
+
+        /// The duplicate-serial advisory fires iff some serial repeats, and
+        /// names a serial that really is duplicated.
+        #[test]
+        fn duplicate_note_iff_some_serial_repeats(
+            serials in proptest::collection::vec("[A-Z0-9]{0,4}", 0..8),
+        ) {
+            let note = duplicate_serial_note(serials.iter().map(|s| s.as_str()));
+            let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+            for s in &serials {
+                *counts.entry(s).or_insert(0) += 1;
+            }
+            let dup = counts.iter().find(|&(_, &n)| n > 1).map(|(s, _)| *s);
+            match (note, dup) {
+                (None, None) => {}
+                (Some(note), Some(serial)) => prop_assert!(
+                    note.contains(serial),
+                    "advisory must name a duplicated serial: {note:?}"
+                ),
+                (note, dup) => prop_assert!(
+                    false,
+                    "advisory presence must track duplication: note={note:?} dup={dup:?}"
+                ),
+            }
+        }
+    }
+}

@@ -18,7 +18,7 @@ use crate::ui::theme::{self, BtnKind, Palette};
 use crate::{now_secs_f64, wipe, App};
 
 /// Which transport the OTP pane should use. Mirrors the CLI `--transport` flag.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum OtpTransportSel {
     #[default]
     Auto,
@@ -1633,5 +1633,70 @@ mod tests {
         assert!(
             otp_target_for(OtpTransportSel::Ccid, Some(Path::new("/dev/hidraw3")), None).is_err()
         );
+    }
+}
+
+/// Randomized coverage (proptest, dev-only) for the endpoint chooser: the
+/// full contract, over arbitrary interface combinations — never panics,
+/// never invents an endpoint, fails closed when the pick is unsatisfiable.
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::path::{Path, PathBuf};
+
+    fn any_sel() -> impl Strategy<Value = OtpTransportSel> {
+        prop_oneof![
+            Just(OtpTransportSel::Auto),
+            Just(OtpTransportSel::Hid),
+            Just(OtpTransportSel::Ccid),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn target_is_exactly_the_contracted_endpoint(
+            sel in any_sel(),
+            hid in proptest::option::of("[ -~]{1,16}"),
+            reader in proptest::option::of("[ -~]{1,16}"),
+        ) {
+            let hid_path = hid.as_ref().map(PathBuf::from);
+            let got = otp_target_for(sel, hid_path.as_deref(), reader.as_deref());
+            // The contract, spelled out per selection: an explicit pick maps
+            // to exactly that interface or fails; Auto prefers HID, falls
+            // back to the reader, and errors only when neither exists.
+            let expected = match sel {
+                OtpTransportSel::Hid => hid_path.clone().map(OtpTarget::HidPath),
+                OtpTransportSel::Ccid => reader.clone().map(OtpTarget::Reader),
+                OtpTransportSel::Auto => hid_path
+                    .clone()
+                    .map(OtpTarget::HidPath)
+                    .or_else(|| reader.clone().map(OtpTarget::Reader)),
+            };
+            match expected {
+                Some(t) => prop_assert_eq!(got, Ok(t)),
+                None => prop_assert!(got.is_err(), "unsatisfiable pick must fail closed"),
+            }
+        }
+
+        /// Whatever comes back Ok points at an interface the device really
+        /// resolved — the chooser can never fabricate an endpoint (that would
+        /// reopen the "first key on the bus" hole).
+        #[test]
+        fn ok_target_never_invents_an_endpoint(
+            sel in any_sel(),
+            hid in proptest::option::of("[ -~]{1,16}"),
+            reader in proptest::option::of("[ -~]{1,16}"),
+        ) {
+            let hid_path = hid.as_ref().map(PathBuf::from);
+            if let Ok(t) = otp_target_for(sel, hid_path.as_deref(), reader.as_deref()) {
+                match t {
+                    OtpTarget::HidPath(p) => {
+                        prop_assert_eq!(Some(p.as_path()), hid_path.as_deref().map(Path::new));
+                    }
+                    OtpTarget::Reader(r) => prop_assert_eq!(Some(r.as_str()), reader.as_deref()),
+                }
+            }
+        }
     }
 }

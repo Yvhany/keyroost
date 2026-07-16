@@ -87,6 +87,14 @@ x11rb = { version = "0.13", optional = true }
 # `serde_repr` without pulling it, and `trash` is the lightest feature that does.
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "screenshot", "trash"], optional = true }
 
+[dev-dependencies]
+# Approved dev-only exception (tests only, never in release builds):
+# randomized property coverage for the pure device-binding guards
+# (completion_still_valid, reset_reinsert_matches, otp_target_for,
+# duplicate_serial_note) that the libfuzzer workspace can't reach inside a
+# binary crate.
+proptest = "1"
+
 [features]
 # Scan a TOTP QR shown on screen to fill a seed/profile form. Adds only the
 # per-platform still-capture backend; decoding/parsing are already in the tree.

@@ -45,6 +45,14 @@ zeroize = { version = "1", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[dev-dependencies]
+# Approved dev-only exception (tests only, never in release builds):
+# randomized property coverage for the pure device-selection and
+# terminal-sanitizing helpers (resolve_otp_target, reader_for_name,
+# sanitize_terminal, sanitize_multiline) that the libfuzzer workspace can't
+# reach inside a binary crate.
+proptest = "1"
+
 # cargo-binstall support: `cargo binstall` fetches the existing attested
 # GitHub release archives (same artifacts, same SHA256SUMS/provenance)
 # instead of compiling. Targets without a prebuilt archive fall back to a

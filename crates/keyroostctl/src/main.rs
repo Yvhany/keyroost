@@ -1925,7 +1925,7 @@ enum OtpCmd {
 }
 
 /// Transport selector for the `otp` command group.
-#[derive(Copy, Clone, ValueEnum)]
+#[derive(Copy, Clone, Debug, ValueEnum)]
 enum OtpTransportArg {
     /// USB-HID first, fall back to CCID/NFC if HID is disabled on the key.
     Auto,
@@ -7778,5 +7778,206 @@ mod cli_tests {
             "--as-cert"
         ])
         .is_ok());
+    }
+}
+
+/// Randomized coverage (proptest, dev-only) for the pure device-selection and
+/// terminal-sanitizing helpers — the CLI's fail-closed / output-hygiene
+/// decisions, unreachable by the libfuzzer workspace because they live in a
+/// binary crate.
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::path::PathBuf;
+
+    /// Minimal Device fixture; only the fields the resolvers consult vary.
+    fn dev(
+        name: Option<&str>,
+        otp: bool,
+        hid: Option<&str>,
+        reader: Option<&str>,
+    ) -> keyroost_resolve::Device {
+        let mut caps = keyroost_resolve::Caps::default();
+        if otp {
+            caps.insert(keyroost_resolve::Caps::OTP);
+        }
+        keyroost_resolve::Device {
+            id: String::new(),
+            name: name.map(String::from),
+            vendor: String::new(),
+            model: String::new(),
+            serial: String::new(),
+            transport: String::new(),
+            firmware: String::new(),
+            caps,
+            kind: keyroost_resolve::DeviceKind::Key,
+            hid_path: hid.map(PathBuf::from),
+            reader: reader.map(String::from),
+        }
+    }
+
+    /// (name, otp-capable, hid path, reader) — the raw shape a strategy
+    /// turns into one test device.
+    type DevSpec = (
+        Option<&'static str>,
+        bool,
+        Option<&'static str>,
+        Option<&'static str>,
+    );
+
+    /// Device-spec lists; names come from a two-value pool so collisions
+    /// with the looked-up name actually happen.
+    fn any_devices() -> impl Strategy<Value = Vec<DevSpec>> {
+        proptest::collection::vec(
+            (
+                proptest::option::of(prop_oneof![Just("alpha"), Just("beta")]),
+                any::<bool>(),
+                proptest::option::of(Just("/dev/hidraw9")),
+                proptest::option::of(Just("Acme CCID 00")),
+            ),
+            0..6,
+        )
+    }
+
+    fn any_transport() -> impl Strategy<Value = OtpTransportArg> {
+        prop_oneof![
+            Just(OtpTransportArg::Auto),
+            Just(OtpTransportArg::Hid),
+            Just(OtpTransportArg::Ccid),
+        ]
+    }
+
+    /// Strings biased toward the hostile end: arbitrary chars salted with
+    /// ANSI escape, bidi override, zero-width space, BOM, newline, and tab —
+    /// `\PC*`-style strategies would almost never produce these.
+    fn any_hostile_string() -> impl Strategy<Value = String> {
+        proptest::collection::vec(
+            prop_oneof![
+                4 => any::<char>(),
+                1 => Just('\x1b'),
+                1 => Just('\u{202E}'),
+                1 => Just('\u{200B}'),
+                1 => Just('\u{FEFF}'),
+                1 => Just('\n'),
+                1 => Just('\t'),
+            ],
+            0..64,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    proptest! {
+        /// `reader_for_name` hands back a reader only when exactly one
+        /// connected device carries the name and that device has one —
+        /// zero, two-plus, or a reader-less match all fail closed (KEY-015).
+        #[test]
+        fn reader_for_name_fails_closed_on_ambiguity(specs in any_devices()) {
+            let devices: Vec<_> =
+                specs.iter().map(|(n, o, h, r)| dev(*n, *o, *h, *r)).collect();
+            let named: Vec<_> = devices
+                .iter()
+                .filter(|d| d.name.as_deref() == Some("alpha"))
+                .collect();
+            let got = reader_for_name(&devices, "alpha");
+            match named.as_slice() {
+                [only] => match &only.reader {
+                    Some(r) => prop_assert_eq!(got.unwrap(), r.clone()),
+                    None => prop_assert!(got.is_err()),
+                },
+                _ => prop_assert!(got.is_err(), "0 or >1 named devices must error"),
+            }
+        }
+
+        /// `resolve_otp_target` binds to the one OTP-capable device carrying
+        /// the name, honors the transport pick, and fails closed on zero /
+        /// ambiguous matches or an unsatisfiable transport (KEY-003).
+        #[test]
+        fn resolve_otp_target_binds_exactly_or_errors(
+            specs in any_devices(),
+            transport in any_transport(),
+        ) {
+            let devices: Vec<_> =
+                specs.iter().map(|(n, o, h, r)| dev(*n, *o, *h, *r)).collect();
+
+            // No selector: never an error, never a target.
+            prop_assert!(matches!(
+                resolve_otp_target(&devices, None, transport),
+                Ok(None)
+            ));
+
+            let named: Vec<_> = devices
+                .iter()
+                .filter(|d| {
+                    d.name.as_deref() == Some("alpha")
+                        && d.caps.has(keyroost_resolve::Caps::OTP)
+                })
+                .collect();
+            let got = resolve_otp_target(&devices, Some("alpha"), transport);
+            let [only] = named.as_slice() else {
+                prop_assert!(got.is_err(), "0 or >1 OTP matches must error");
+                return Ok(());
+            };
+            let expected_endpoint = match transport {
+                OtpTransportArg::Hid => only.hid_path.clone().map(|p| (Some(p), None)),
+                OtpTransportArg::Ccid => only.reader.clone().map(|r| (None, Some(r))),
+                OtpTransportArg::Auto => match (&only.hid_path, &only.reader) {
+                    (Some(p), _) => Some((Some(p.clone()), None)),
+                    (None, Some(r)) => Some((None, Some(r.clone()))),
+                    (None, None) => None,
+                },
+            };
+            match (got, expected_endpoint) {
+                (Ok(Some(OtpTarget::HidPath(p))), Some((Some(exp), None))) => {
+                    prop_assert_eq!(p, exp)
+                }
+                (Ok(Some(OtpTarget::Reader(r))), Some((None, Some(exp)))) => {
+                    prop_assert_eq!(r, exp)
+                }
+                (Err(_), None) => {}
+                (got, exp) => prop_assert!(
+                    false,
+                    "target must be exactly the contracted endpoint: got={got:?} exp={exp:?}"
+                ),
+            }
+        }
+
+        /// Whatever bytes arrive from a device or file, the sanitized line is
+        /// inert: no control, bidi, or zero-width char survives, and the
+        /// character count is preserved so column alignment can't shift.
+        #[test]
+        fn sanitize_terminal_output_is_always_inert(s in any_hostile_string()) {
+            let out = sanitize_terminal(&s);
+            prop_assert!(!out.chars().any(keyroost_keyring::is_spoofing_char));
+            prop_assert_eq!(out.chars().count(), s.chars().count());
+            // Innocent characters pass through untouched, in place.
+            for (o, i) in out.chars().zip(s.chars()) {
+                if keyroost_keyring::is_spoofing_char(i) {
+                    prop_assert_eq!(o, ' ');
+                } else {
+                    prop_assert_eq!(o, i);
+                }
+            }
+        }
+
+        /// The multiline variant keeps only `\n` and `\t` of the control
+        /// space; everything else follows the terminal rule.
+        #[test]
+        fn sanitize_multiline_keeps_only_newline_and_tab(s in any_hostile_string()) {
+            let out = sanitize_multiline(&s);
+            prop_assert!(!out
+                .chars()
+                .any(|c| keyroost_keyring::is_spoofing_char(c) && c != '\n' && c != '\t'));
+            prop_assert_eq!(out.chars().count(), s.chars().count());
+            for (o, i) in out.chars().zip(s.chars()) {
+                if i == '\n' || i == '\t' {
+                    prop_assert_eq!(o, i);
+                } else if keyroost_keyring::is_spoofing_char(i) {
+                    prop_assert_eq!(o, ' ');
+                } else {
+                    prop_assert_eq!(o, i);
+                }
+            }
+        }
     }
 }
