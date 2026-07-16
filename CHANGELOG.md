@@ -9,8 +9,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [0.7.5] - 2026-07-14
 
 A security-focused release: every open finding from an external security
-audit (KEY-001..KEY-020) plus a full branch review is closed here. Thanks to
-the auditors for a thorough, actionable report.
+audit (KEY-001..KEY-020) plus a full branch review is closed here. With thanks
+to [Texas Cyber Command](https://www.txcc.texas.gov/) for a thorough,
+actionable report.
 
 ### Security
 - **Operations are bound to the exact device you selected.** Previously,
