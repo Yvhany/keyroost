@@ -63,6 +63,17 @@ re-apply in 6–12 months).
       `workflow_dispatch` path so the winget leg runs on demand after the
       signed asset lands. New rhythm: tag → fanout (minus winget) → Token2
       signs at their pace → attach signed asset → dispatch winget.
+- [ ] **Explore: hold the winget submission for the Token2-signed binary
+      and ship THAT instead of our CI zip.** winget currently points at the
+      unsigned CI zip (that's what shipped for v0.7.5). Shipping the
+      Authenticode-signed Token2 build in winget would give `winget install`
+      users a SmartScreen-clean binary and sidestep the Defender
+      false-positive entirely. Trade-off to weigh: winget availability would
+      **trail the release by however long signing takes** (days), where the
+      other channels are immediate. Decide the policy — always wait for
+      signed, or submit CI-unsigned first and refresh to signed when it
+      lands. Ties directly into the `publish.yml` rework above (prefer
+      signed / dispatch-after-signing already models the "always wait" path).
 - [ ] **Manual fallback from Linux:** `komac update Framefilter.Keyroost
       --version <V> --urls <signed-asset-url> --submit` (komac is the
       Rust winget-manifest tool; wingetcreate is Windows-only).
