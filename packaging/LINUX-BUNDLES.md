@@ -588,3 +588,40 @@ musl cross toolchain, then build libpcsclite there. See
 - **Whether `--filesystem=/run/udev:ro` is actually needed** for keyroost-hid in
   the Flatpak sandbox — needs a hardware test.
 - Everything is **unverified on real hardware** (Molto2 + a FIDO key) end-to-end.
+
+## Out-of-band runs (workflow_dispatch)
+
+`linux-bundles.yml` mirrors `publish.yml`: it can be re-run without cutting a
+release.
+
+**Build-only probe** (the pre-release packaging proof required by the release
+process — run it from the test branch BEFORE tagging):
+
+    gh workflow run linux-bundles.yml --ref <branch>
+
+No tag input → both bundles build and land as workflow artifacts; nothing is
+attached or published. Approve the release-publish gate; a probe cannot
+publish.
+
+**Republish into an existing release** (e.g. the #80 AppStream fix, where the
+flatpak needed to move without a version bump):
+
+    gh workflow run linux-bundles.yml --ref main -f tag=vX.Y.Z -f flatpak_only=true
+
+Builds from the dispatched ref, publishes into vX.Y.Z's release. Guards and
+semantics:
+
+* the run FAILS unless the ref's workspace version equals the tag — a moved
+  main can't overwrite an old release;
+* asset attach uses `--clobber` (replaces `keyroost.flatpak` + its `.sha256`,
+  adds a fresh provenance attestation alongside the original);
+* the OSTree push commits only when the tree actually changed;
+* drop `flatpak_only` to also rebuild/replace the AppImage assets;
+* the release-publish environment approval is required every time — a
+  republish replaces published bytes, so the maintainer approves personally.
+
+**AppStream `<releases>`:** the committed metainfo block is intentionally
+empty. `packaging/flatpak/gen-metainfo-releases.py` fills it from
+CHANGELOG.md during both bundle builds (CI runs its `--check` on every push).
+Building bundles locally? Run the generator first — and don't commit the
+filled block.
