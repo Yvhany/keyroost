@@ -24,6 +24,18 @@ name: Linux bundles (AppImage + Flatpak)
 #   * AppImage = GUI AppImage attached to each release.
 #   * App-id = io.github.framefilter.keyroost.
 #
+# OUT-OF-BAND RUNS (workflow_dispatch), mirroring publish.yml's tag-input model:
+#   * probe (no tag input): both bundles build and upload as workflow
+#     artifacts; every attach/publish step skips. Safe to run from any branch —
+#     this is the pre-release packaging proof required by CLAUDE.md.
+#   * republish (tag input set): builds from the dispatched ref and publishes
+#     into that tag's existing release — attach steps clobber idempotently and
+#     the OSTree push no-ops when the tree is already current. A version guard
+#     fails the run if the ref's workspace version doesn't match the tag.
+#     `flatpak_only: true` skips the AppImage job (e.g. the #80 AppStream
+#     republish, where only the flatpak needed to move).
+# Every run still passes the release-publish environment approval.
+#
 # ONE-TIME MAINTAINER SETUP required before this produces working bundles:
 #   1. Icon — DONE: the dark-on-amber set is committed in packaging/icons/.
 #   2. pcsc-lite sha256 — DONE: 2.3.0 (.tar.xz) is pinned + hashed in the manifest.
@@ -43,10 +55,31 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Existing release tag to publish into (e.g. v0.7.5). Leave EMPTY for a
+          build-only probe: bundles build and upload as workflow artifacts, but
+          nothing attaches to the release and the OSTree repo is not pushed.
+          When set, the bundles build from the DISPATCHED ref (pick the branch
+          in the run dialog / --ref) — a version guard refuses to publish if
+          that tree's workspace version does not match this tag.
+        required: false
+        default: ''
+      flatpak_only:
+        description: Skip the AppImage job (flatpak-only republish, e.g. #80)
+        type: boolean
+        required: false
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
   APP_ID: io.github.framefilter.keyroost
+  # The release this run publishes into: the pushed tag, or the dispatch
+  # input; empty means build-only. Mirrors publish.yml's
+  # `release.tag_name || inputs.tag` model, adapted to this workflow's
+  # tag-push trigger.
+  TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
 
 # Read-only by default. The flatpak job's Pages push escalates to contents:write
 # only on that job. Build jobs compile third-party code (proc-macros run at build
@@ -61,6 +94,8 @@ jobs:
   # ===========================================================================
   appimage:
     name: AppImage (GUI, x86_64)
+    # Skippable for flatpak-only republishes; push (tag) runs always include it.
+    if: github.event_name == 'push' || !inputs.flatpak_only
     # Gate behind the same manual-approval environment publish.yml uses, so the
     # whole release fanout waits for one approval before anything goes out.
     environment: release-publish
@@ -71,6 +106,19 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # A dispatch builds from an arbitrary ref but publishes into $TAG's
+      # release. Refuse the combination when the tree disagrees with the tag,
+      # so a stale/newer branch can never overwrite a release's bundles.
+      - name: Check tree version matches the target tag
+        if: env.TAG != ''
+        run: |
+          set -euo pipefail
+          v="$(sed -n 's/^version = "\([0-9.]*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [ "v${v}" != "${TAG}" ]; then
+            echo "::error::workspace version v${v} != target tag ${TAG}; refusing to publish mismatched bundles"
+            exit 1
+          fi
 
       # Same build deps release.yml uses for the GUI (GL/wayland/xcb + pcsc).
       - name: Install system dependencies
@@ -112,7 +160,7 @@ jobs:
       # Give the AppImage the same provenance + checksum treatment the main
       # release archives get in release.yml.
       - name: Attest AppImage provenance
-        if: startsWith(github.ref, 'refs/tags/')
+        if: env.TAG != ''
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: ${{ steps.find.outputs.path }}
@@ -131,12 +179,13 @@ jobs:
             target/appimage/*.AppImage
             target/appimage/*.AppImage.zsync
 
-      # Attach to the Release release.yml publishes for this tag. Retry briefly:
-      # this workflow and release.yml run concurrently on the same tag, so the
-      # Release may not exist for the first few seconds. `--clobber` makes re-runs
-      # idempotent. Skipped on workflow_dispatch (no tag / release to attach to).
+      # Attach to the Release for $TAG (release.yml's on a tag push, an
+      # existing one on a dispatch republish). Retry briefly: on a tag push
+      # this workflow and release.yml run concurrently, so the Release may not
+      # exist for the first few seconds. `--clobber` makes re-runs idempotent.
+      # Skipped when no tag is named (build-only probe).
       - name: Attach AppImage to release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: env.TAG != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -144,15 +193,15 @@ jobs:
           img="${{ steps.find.outputs.path }}"
           zsync="${{ steps.find.outputs.zsync }}"
           for i in 1 2 3 4 5 6; do
-            if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-              gh release upload "${GITHUB_REF_NAME}" "${img}" "${img}.sha256" ${zsync:+"${zsync}"} \
+            if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              gh release upload "${TAG}" "${img}" "${img}.sha256" ${zsync:+"${zsync}"} \
                 --repo "${GITHUB_REPOSITORY}" --clobber
               exit 0
             fi
-            echo "release ${GITHUB_REF_NAME} not ready yet (attempt ${i}); waiting…"
+            echo "release ${TAG} not ready yet (attempt ${i}); waiting…"
             sleep 20
           done
-          echo "::error::release ${GITHUB_REF_NAME} never appeared; AppImage left as a build artifact only"
+          echo "::error::release ${TAG} never appeared; AppImage left as a build artifact only"
           exit 1
 
   # ===========================================================================
@@ -178,6 +227,19 @@ jobs:
     # so publishing from inside it would be fragile.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # A dispatch builds from an arbitrary ref but publishes into $TAG's
+      # release. Refuse the combination when the tree disagrees with the tag,
+      # so a stale/newer branch can never overwrite a release's bundles.
+      - name: Check tree version matches the target tag
+        if: env.TAG != ''
+        run: |
+          set -euo pipefail
+          v="$(sed -n 's/^version = "\([0-9.]*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [ "v${v}" != "${TAG}" ]; then
+            echo "::error::workspace version v${v} != target tag ${TAG}; refusing to publish mismatched bundles"
+            exit 1
+          fi
 
       # Generate the offline cargo sources from the committed Cargo.lock. This is
       # done on the runner every build so it can never go stale (the file is large,
@@ -271,7 +333,9 @@ jobs:
     name: Flatpak (attach bundle + publish to keyroost-flatpak)
     environment: release-publish
     needs: flatpak
-    if: startsWith(github.ref, 'refs/tags/')
+    # Runs for a tag push OR a dispatch that names a release tag; a tag-less
+    # dispatch stays build-only (artifacts uploaded, nothing published).
+    if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write # gh release upload + git push of the OSTree tree to Pages
@@ -302,15 +366,15 @@ jobs:
         run: |
           set -euo pipefail
           for i in 1 2 3 4 5 6; do
-            if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-              gh release upload "${GITHUB_REF_NAME}" out/keyroost.flatpak out/keyroost.flatpak.sha256 \
+            if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              gh release upload "${TAG}" out/keyroost.flatpak out/keyroost.flatpak.sha256 \
                 --repo "${GITHUB_REPOSITORY}" --clobber
               exit 0
             fi
-            echo "release ${GITHUB_REF_NAME} not ready yet (attempt ${i}); waiting…"
+            echo "release ${TAG} not ready yet (attempt ${i}); waiting…"
             sleep 20
           done
-          echo "::error::release ${GITHUB_REF_NAME} never appeared; .flatpak left unattached"
+          echo "::error::release ${TAG} never appeared; .flatpak left unattached"
           exit 1
 
       # Publish the OSTree repo to a DEDICATED repo, framefilter/keyroost-flatpak,
@@ -367,5 +431,5 @@ jobs:
             echo "Flatpak OSTree repo already current"
             exit 0
           fi
-          git commit -m "flatpak: publish ${GITHUB_REF_NAME} OSTree repo"
+          git commit -m "flatpak: publish ${TAG} OSTree repo"
           git push origin HEAD
