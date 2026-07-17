@@ -42,11 +42,21 @@ Captured here so they don't get lost. Unchecked = not started.
 
 The v0.7.5 winget PR ([microsoft/winget-pkgs#402508](https://github.com/microsoft/winget-pkgs/pull/402508))
 hit `Validation-Defender-Error` on the unsigned CI zip; a false-positive
-report was filed with Microsoft (WDSI, developer queue). Working theory:
-Token2's *signed* keyroost builds circulate widely, so Defender's
-"unsigned variant of normally-signed software" heuristic trips on the CI
-zip — which means this recurs every release until winget points at signed
-binaries. Decision: keep signing with Token2 (no own signing identity for
+report was filed with Microsoft (WDSI, developer queue).
+
+Root-cause note (researched 2026-07-17): no "unsigned variant of
+normally-signed software" heuristic exists in Defender/SmartScreen —
+reputation keys on signing-cert identity and per-file hash only, so
+Token2's signed builds neither hurt nor help our CI zip. The v0.7.5
+failure was the well-documented prevalence-based false positive on any
+brand-new low-prevalence binary (winget's own docs: reproduce locally,
+report to WDSI, or wait for a pipeline re-run; it can hit signed
+binaries too). Holding winget for the signed zip is still the right
+call — signed bytes carry SmartScreen reputation across releases and the
+submission moves off the release-day critical path — it just doesn't
+*guarantee* validation passes.
+
+Decision: keep signing with Token2 (no own signing identity for
 now — Azure Artifact Signing / Certum would put the maintainer's legal
 name in the cert CN; SignPath OSS rejected the project as too new,
 re-apply in 6–12 months).
@@ -57,23 +67,24 @@ re-apply in 6–12 months).
       would invalidate `SHA256SUMS`, the provenance attestations, and any
       open winget PR's hash. The two variants have complementary trust
       chains (CI provenance vs Authenticode); label them in release notes.
-- [ ] **Rework the `publish.yml` winget job:** prefer the `-signed.zip`
-      asset when present; when absent, **skip cleanly instead of submitting
-      the unsigned zip** (no more racing Defender at release time). Add a
-      `workflow_dispatch` path so the winget leg runs on demand after the
-      signed asset lands. New rhythm: tag → fanout (minus winget) → Token2
-      signs at their pace → attach signed asset → dispatch winget.
-- [ ] **Explore: hold the winget submission for the Token2-signed binary
-      and ship THAT instead of our CI zip.** winget currently points at the
-      unsigned CI zip (that's what shipped for v0.7.5). Shipping the
-      Authenticode-signed Token2 build in winget would give `winget install`
-      users a SmartScreen-clean binary and sidestep the Defender
-      false-positive entirely. Trade-off to weigh: winget availability would
-      **trail the release by however long signing takes** (days), where the
-      other channels are immediate. Decide the policy — always wait for
-      signed, or submit CI-unsigned first and refresh to signed when it
-      lands. Ties directly into the `publish.yml` rework above (prefer
-      signed / dispatch-after-signing already models the "always wait" path).
+- [x] **Rework the `publish.yml` winget job** — RESOLVED (branch
+      `feat/winget-signed-flow`, 2026-07-17): the job submits only the
+      `-signed.zip` (Authenticode-verified first, signer logged), skips
+      with a notice when it isn't attached yet, no-ops when the version is
+      already live in winget-pkgs (so re-dispatching publish.yml is safe),
+      and an expired `WINGET_TOKEN` now FAILS loudly instead of skipping
+      silently. On-demand path = existing `publish.yml` dispatch: attach
+      the signed asset, `gh workflow run publish.yml -f tag=vX.Y.Z`.
+- [x] **Explore: hold the winget submission for the Token2-signed binary**
+      — DECIDED 2026-07-17: **always wait for signed** (encoded in the
+      rework above). Rationale: signed bytes carry SmartScreen cert
+      reputation across releases (better for users); the submission moves
+      off the release-day critical path (Defender validation FPs self-heal
+      by re-run and can hit signed binaries too, so decoupling — not
+      signing — is the real fix); and winget publishes no install stats,
+      so a few days' lag has no measurable adoption cost. Submitting
+      unsigned-first-then-refresh was rejected: it doubles validation
+      exposure (two PRs per release).
 - [ ] **Manual fallback from Linux:** `komac update Framefilter.Keyroost
       --version <V> --urls <signed-asset-url> --submit` (komac is the
       Rust winget-manifest tool; wingetcreate is Windows-only).
