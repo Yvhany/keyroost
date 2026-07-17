@@ -30,6 +30,13 @@ jobs:
       - name: Check release/packaging inputs are pinned
         run: bash packaging/ci/check-pinned-inputs.sh
 
+      # #80 regression guard: the AppStream <releases> block is generated from
+      # CHANGELOG.md at bundle build time; verify here that the generation is
+      # possible and that the newest changelog entry matches the workspace
+      # version, so version/changelog drift fails the PR, not the release.
+      - name: AppStream releases derive cleanly from CHANGELOG
+        run: python3 packaging/flatpak/gen-metainfo-releases.py --check
+
   # One source tree, compiled and tested three ways. This matrix is what keeps
   # the macOS/Windows code (the cfg-gated hidapi HID backend) from rotting: a
   # Linux-only change that breaks another platform fails the PR here, so we never
