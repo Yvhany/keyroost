@@ -689,6 +689,16 @@ fn completion_still_valid(captured: Option<&DeviceId>, current: Option<&DeviceId
     matches!((captured, current), (Some(c), Some(now)) if c == now)
 }
 
+/// Whether the FIDO Settings subview exists for the selected key.
+/// authenticatorReset is a baseline CTAP2 command (present since CTAP 2.0),
+/// so any key that answered getInfo with a CTAP2 version can be reset and
+/// gets the tab; gating the tab on authenticatorConfig — a CTAP 2.1 feature —
+/// hid the only reset path from CTAP 2.0-only keys (#81). The advanced
+/// security-policy controls *inside* the tab stay gated on `authnrCfg`.
+fn fido_settings_available(info: Option<&AuthenticatorInfo>) -> bool {
+    info.is_some_and(|i| i.versions.iter().any(|v| v.starts_with("FIDO_2_")))
+}
+
 /// Decide whether a freshly appeared FIDO HID device may receive an armed
 /// reset. `target_*` describe the key the user armed; `cand_*` the device
 /// that just appeared. Vendor/product ids must match when known, and then a
@@ -8138,6 +8148,10 @@ impl App {
             .as_ref()
             .and_then(|i| i.option("authnrCfg"))
             == Some(true);
+        // The Settings tab itself is broader than the advanced controls: any
+        // CTAP2 key can be reset (#81), so the tab shows whenever the key is
+        // CTAP2 and only the authenticatorConfig section inside is cfg-gated.
+        let settings_available = fido_settings_available(self.security_keys.info.as_ref());
         let has_large_blobs = self
             .security_keys
             .info
@@ -8178,7 +8192,7 @@ impl App {
                         unlock = true;
                     }
                 });
-                let extras = match (has_bio, supports_cfg) {
+                let extras = match (has_bio, settings_available) {
                     (true, true) => "passkeys, fingerprints, and settings",
                     (true, false) => "passkeys and fingerprints",
                     (false, true) => "passkeys and settings",
@@ -8284,7 +8298,7 @@ impl App {
             if has_bio {
                 tabs.push((FidoSubview::Fingerprints, "Fingerprints"));
             }
-            if supports_cfg {
+            if settings_available {
                 tabs.push((FidoSubview::Settings, "Settings"));
             }
             if has_large_blobs {
@@ -8646,8 +8660,13 @@ impl App {
 
         // --- Settings sub-view: advanced config + the danger reset card. ---
         if subview == FidoSubview::Settings {
-            // Advanced (authenticatorConfig) security-policy controls.
-            self.render_fido_advanced(ui, p);
+            // Advanced (authenticatorConfig) security-policy controls — only
+            // on keys that speak authenticatorConfig (CTAP 2.1). The Reset
+            // card below renders unconditionally: authenticatorReset is
+            // baseline CTAP2, and it must stay reachable on 2.0-only keys (#81).
+            if supports_cfg {
+                self.render_fido_advanced(ui, p);
+            }
 
             // Danger: reset key (typed-confirm modal stays).
             ui.add_space(14.0);
@@ -12770,6 +12789,50 @@ fn slot_summary(algo: Option<u8>, fpr: &[u8; 20]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #81: the Settings tab (home of the only Reset path) must exist for any
+    /// CTAP2 key — authenticatorReset is a baseline CTAP 2.0 command, so
+    /// gating the tab on authenticatorConfig (a CTAP 2.1 feature) locked
+    /// CTAP 2.0-only keys out of reset entirely.
+    #[test]
+    fn settings_tab_exists_for_any_ctap2_key() {
+        let ctap20_only = AuthenticatorInfo {
+            versions: vec!["U2F_V2".into(), "FIDO_2_0".into()],
+            ..Default::default()
+        };
+        assert!(
+            fido_settings_available(Some(&ctap20_only)),
+            "a CTAP 2.0-only key is resettable and must get the Settings tab"
+        );
+
+        let ctap21 = AuthenticatorInfo {
+            versions: vec!["FIDO_2_1".into()],
+            options: vec![("authnrCfg".into(), true)],
+            ..Default::default()
+        };
+        assert!(fido_settings_available(Some(&ctap21)));
+
+        // FIDO_2_1_PRE keys predate the final 2.1 naming but are CTAP2.
+        let pre = AuthenticatorInfo {
+            versions: vec!["FIDO_2_1_PRE".into()],
+            ..Default::default()
+        };
+        assert!(fido_settings_available(Some(&pre)));
+    }
+
+    #[test]
+    fn settings_tab_absent_without_a_ctap2_key() {
+        // No getInfo yet (or a CTAP1-only key, which can't answer getInfo):
+        // nothing to reset over CTAP2 — no tab.
+        assert!(!fido_settings_available(None));
+
+        // A hypothetical U2F-only answer offers no CTAP2 reset either.
+        let u2f_only = AuthenticatorInfo {
+            versions: vec!["U2F_V2".into()],
+            ..Default::default()
+        };
+        assert!(!fido_settings_available(Some(&u2f_only)));
+    }
 
     #[test]
     fn duplicate_serial_note_flags_shared_serial() {
