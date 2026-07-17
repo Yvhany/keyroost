@@ -184,7 +184,7 @@ struct SecurityKeysState {
     lb_autoloaded: bool,
 }
 
-#[derive(Default, Clone, Copy, PartialEq)]
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
 enum FidoSubview {
     #[default]
     Passkeys,
@@ -697,6 +697,56 @@ fn completion_still_valid(captured: Option<&DeviceId>, current: Option<&DeviceId
 /// security-policy controls *inside* the tab stay gated on `authnrCfg`.
 fn fido_settings_available(info: Option<&AuthenticatorInfo>) -> bool {
     info.is_some_and(|i| i.versions.iter().any(|v| v.starts_with("FIDO_2_")))
+}
+
+/// Whether to render the Reset card *outside* the Settings subview: the key
+/// is CTAP2 (so resettable) but not unlocked. authenticatorReset takes no
+/// PIN, and its primary use case is recovering from a forgotten or blocked
+/// PIN — the one state in which unlock is impossible — so hiding it behind
+/// the unlock-gated tabs removed reset exactly when it was needed. Once
+/// unlocked, the Settings tab owns the card and this stays false.
+fn show_standalone_reset(unlocked: bool, info: Option<&AuthenticatorInfo>) -> bool {
+    !unlocked && fido_settings_available(info)
+}
+
+/// The subview to actually render: the current pick when its tab is offered,
+/// else the first offered tab. The pick persists across selection changes,
+/// so switching from a key with a fingerprint sensor (or credential
+/// management) to one without would otherwise leave the pane on a tab the
+/// new key doesn't have.
+fn snap_subview(current: FidoSubview, tabs: &[(FidoSubview, &str)]) -> FidoSubview {
+    if tabs.iter().any(|(v, _)| *v == current) {
+        current
+    } else {
+        tabs.first().map(|(v, _)| *v).unwrap_or_default()
+    }
+}
+
+/// What getInfo says about PIN support. An absent `clientPin` option means
+/// the key has no PIN feature at all (CTAP getInfo semantics) — a different
+/// state from "getInfo not read yet", which the pane previously conflated
+/// with it (PIN-less authenticators showed a permanent "Reading key…").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PinSupport {
+    /// No getInfo yet (still loading, or the read failed).
+    Unknown,
+    /// The key does not support clientPin.
+    Unsupported,
+    /// clientPin supported, no PIN set yet.
+    NotSet,
+    /// A PIN is set.
+    Set,
+}
+
+fn pin_support(info: Option<&AuthenticatorInfo>) -> PinSupport {
+    match info {
+        None => PinSupport::Unknown,
+        Some(i) => match i.option("clientPin") {
+            None => PinSupport::Unsupported,
+            Some(false) => PinSupport::NotSet,
+            Some(true) => PinSupport::Set,
+        },
+    }
 }
 
 /// Decide whether a freshly appeared FIDO HID device may receive an armed
@@ -7967,11 +8017,7 @@ impl App {
             }
         }
 
-        let pin_set = self
-            .security_keys
-            .info
-            .as_ref()
-            .and_then(|i| i.option("clientPin"));
+        let pin = pin_support(self.security_keys.info.as_ref());
 
         // --- PIN & sign-in card (inline Set / Change PIN; no floating modal) ---
         let mut go_set = false;
@@ -7987,10 +8033,12 @@ impl App {
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "pin");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (kind, label) = match pin_set {
-                        Some(true) => (BtnKind::Default, "Change PIN"),
-                        Some(false) => (BtnKind::Primary, "Set a PIN"),
-                        None => return,
+                    let (kind, label) = match pin {
+                        PinSupport::Set => (BtnKind::Default, "Change PIN"),
+                        PinSupport::NotSet => (BtnKind::Primary, "Set a PIN"),
+                        // Unknown (still reading) or no PIN feature at all:
+                        // nothing to offer.
+                        PinSupport::Unknown | PinSupport::Unsupported => return,
                     };
                     if theme::button(ui, p, kind, label).clicked() {
                         let open = !self.security_keys.change_pin.open;
@@ -8012,8 +8060,8 @@ impl App {
                 });
             });
             ui.add_space(8.0);
-            match pin_set {
-                Some(true) => {
+            match pin {
+                PinSupport::Set => {
                     ui.horizontal(|ui| {
                         theme::pill(ui, "PIN set", p.ok, p.ok_soft());
                         ui.add_space(8.0);
@@ -8031,7 +8079,7 @@ impl App {
                         );
                     });
                 }
-                Some(false) => {
+                PinSupport::NotSet => {
                     ui.horizontal(|ui| {
                         theme::pill(ui, "No PIN yet", p.warn, p.warn_soft());
                         ui.add_space(8.0);
@@ -8044,7 +8092,22 @@ impl App {
                         );
                     });
                 }
-                None => {
+                PinSupport::Unsupported => {
+                    // getInfo answered and clientPin isn't in the options map:
+                    // the key has no PIN feature. Say so — this state used to
+                    // fall into the None arm below and read "Reading key…"
+                    // forever.
+                    ui.horizontal(|ui| {
+                        theme::pill(ui, "No PIN support", p.txt2, p.raised2);
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("This key does not support a PIN.")
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt2),
+                        );
+                    });
+                }
+                PinSupport::Unknown => {
                     let msg = if self.security_keys.error.is_some() {
                         "Couldn't read this key."
                     } else {
@@ -8065,7 +8128,7 @@ impl App {
             }
 
             if self.security_keys.change_pin.open {
-                let setting = pin_set == Some(false);
+                let setting = pin == PinSupport::NotSet;
                 ui.add_space(10.0);
                 egui::Frame::NONE
                     .fill(p.raised)
@@ -8152,6 +8215,11 @@ impl App {
         // CTAP2 key can be reset (#81), so the tab shows whenever the key is
         // CTAP2 and only the authenticatorConfig section inside is cfg-gated.
         let settings_available = fido_settings_available(self.security_keys.info.as_ref());
+        // Same option pair CredMgmt::new consults: the standard command, or
+        // the pre-2.1 preview many CTAP 2.0 keys ship.
+        let has_cred_mgmt = self.security_keys.info.as_ref().is_some_and(|i| {
+            i.option("credMgmt") == Some(true) || i.option("credentialMgmtPreview") == Some(true)
+        });
         let has_large_blobs = self
             .security_keys
             .info
@@ -8162,7 +8230,7 @@ impl App {
         // When the key has a PIN but isn't unlocked yet, show a standalone
         // unlock card. Unlocking gates passkeys, fingerprints, and settings
         // alike, so it lives above the tabs rather than inside the Passkeys tab.
-        if pin_set == Some(true) && !unlocked {
+        if pin == PinSupport::Set && !unlocked {
             ui.add_space(14.0);
             let mut unlock = false;
             theme::card_frame(p).show(ui, |ui| {
@@ -8290,11 +8358,26 @@ impl App {
             }
         }
 
+        // Reset must stay reachable without the PIN: when the key is CTAP2
+        // but can't be unlocked (PIN forgotten/blocked, not set, or clientPin
+        // unsupported), render the Reset card standalone here — once
+        // unlocked, the Settings tab below owns it instead.
+        if show_standalone_reset(unlocked, self.security_keys.info.as_ref()) {
+            ui.add_space(14.0);
+            self.render_fido_reset_card(ui, p);
+        }
+
         // Once unlocked, the sub-view tabs sit at the top of the content, each
         // owning its own panel below. Styled like the main capability tabs:
         // bold label with an accent underline on the active one.
         if unlocked {
-            let mut tabs: Vec<(FidoSubview, &str)> = vec![(FidoSubview::Passkeys, "Passkeys")];
+            let mut tabs: Vec<(FidoSubview, &str)> = Vec::new();
+            // Passkey management is its own capability (credMgmt, or the
+            // pre-2.1 preview) — a CTAP2 key without it gets no Passkeys tab
+            // rather than a tab whose only content errors at runtime.
+            if has_cred_mgmt {
+                tabs.push((FidoSubview::Passkeys, "Passkeys"));
+            }
             if has_bio {
                 tabs.push((FidoSubview::Fingerprints, "Fingerprints"));
             }
@@ -8304,6 +8387,10 @@ impl App {
             if has_large_blobs {
                 tabs.push((FidoSubview::LargeBlobs, "Storage"));
             }
+            // The persisted pick can be stale (it outlives selection changes,
+            // and the newly selected key may not offer the old tab): snap it
+            // to a tab this key actually has before painting the strip.
+            self.security_keys.subview = snap_subview(self.security_keys.subview, &tabs);
             ui.add_space(14.0);
             let mut next: Option<FidoSubview> = None;
             // Paint an opaque surface strip here first (full content width,
@@ -8668,45 +8755,53 @@ impl App {
                 self.render_fido_advanced(ui, p);
             }
 
-            // Danger: reset key (typed-confirm modal stays).
             ui.add_space(14.0);
-            let mut arm_reset = false;
-            theme::card_frame(p)
-                .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("Reset this key")
-                                .font(theme::f_sb(14.5))
-                                .color(p.err),
-                        );
-                        ui.add_space(6.0);
-                        self.help_dot(ui, p, "reset");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::button(ui, p, BtnKind::Danger, "Reset key\u{2026}").clicked()
-                            {
-                                arm_reset = true;
-                            }
-                        });
-                    });
-                    ui.label(
-                        egui::RichText::new(
-                            "Wipes every passkey and the PIN on this key. Cannot be undone.",
-                        )
-                        .font(theme::f_reg(12.5))
-                        .color(p.txt2),
-                    );
-                });
-            if arm_reset {
-                self.security_keys.reset = ResetDialog {
-                    open: true,
-                    ..Default::default()
-                };
-            }
+            self.render_fido_reset_card(ui, p);
         }
 
         if subview == FidoSubview::LargeBlobs {
             self.render_large_blobs(ui, p);
+        }
+    }
+
+    /// The destructive "Reset this key" card (red stroke; arms the
+    /// typed-confirm ResetDialog, rendered app-level). Shown inside the
+    /// Settings subview when unlocked, and standalone when the key can't be
+    /// unlocked — authenticatorReset needs no PIN and is the recovery path
+    /// for a forgotten/blocked one, so it must never hide behind unlock
+    /// (see [`show_standalone_reset`]).
+    fn render_fido_reset_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let mut arm_reset = false;
+        theme::card_frame(p)
+            .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Reset this key")
+                            .font(theme::f_sb(14.5))
+                            .color(p.err),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "reset");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Danger, "Reset key\u{2026}").clicked() {
+                            arm_reset = true;
+                        }
+                    });
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Wipes every passkey and the PIN on this key. Cannot be undone.",
+                    )
+                    .font(theme::f_reg(12.5))
+                    .color(p.txt2),
+                );
+            });
+        if arm_reset {
+            self.security_keys.reset = ResetDialog {
+                open: true,
+                ..Default::default()
+            };
         }
     }
 
@@ -12832,6 +12927,75 @@ mod tests {
             ..Default::default()
         };
         assert!(!fido_settings_available(Some(&u2f_only)));
+    }
+
+    /// Reset is the recovery for a forgotten/blocked PIN and needs no PIN
+    /// itself, so it must stay reachable when the key can't be unlocked —
+    /// rendered standalone outside the (unlock-gated) Settings tab.
+    #[test]
+    fn reset_card_stands_alone_exactly_when_ctap2_but_locked() {
+        let ctap2 = AuthenticatorInfo {
+            versions: vec!["FIDO_2_0".into()],
+            ..Default::default()
+        };
+        // Locked: forgotten/blocked PIN, no PIN set, or no clientPin at all.
+        assert!(show_standalone_reset(false, Some(&ctap2)));
+        // Unlocked: the Settings tab owns the card; no duplicate.
+        assert!(!show_standalone_reset(true, Some(&ctap2)));
+        // No CTAP2 getInfo: nothing reset could talk to.
+        assert!(!show_standalone_reset(false, None));
+    }
+
+    /// A persisted subview pick must snap to a tab the selected key actually
+    /// offers (capabilities differ across keys; the pick outlives selection).
+    #[test]
+    fn subview_snaps_to_an_offered_tab() {
+        let tabs = [
+            (FidoSubview::Settings, "Settings"),
+            (FidoSubview::LargeBlobs, "Storage"),
+        ];
+        // Present pick is kept.
+        assert_eq!(
+            snap_subview(FidoSubview::Settings, &tabs),
+            FidoSubview::Settings
+        );
+        // Stale pick (tab not offered on this key) snaps to the first tab.
+        assert_eq!(
+            snap_subview(FidoSubview::Fingerprints, &tabs),
+            FidoSubview::Settings
+        );
+        assert_eq!(
+            snap_subview(FidoSubview::Passkeys, &tabs),
+            FidoSubview::Settings
+        );
+        // Degenerate empty list falls back to the default.
+        assert_eq!(
+            snap_subview(FidoSubview::Settings, &[]),
+            FidoSubview::Passkeys
+        );
+    }
+
+    /// getInfo with no `clientPin` option means the key has no PIN feature —
+    /// distinct from "info not read yet", which the pane used to conflate
+    /// with it (permanent "Reading key…" on PIN-less authenticators).
+    #[test]
+    fn pin_support_distinguishes_absent_option_from_missing_info() {
+        assert_eq!(pin_support(None), PinSupport::Unknown);
+        let no_pin_feature = AuthenticatorInfo {
+            versions: vec!["FIDO_2_0".into()],
+            ..Default::default()
+        };
+        assert_eq!(pin_support(Some(&no_pin_feature)), PinSupport::Unsupported);
+        let pin_not_set = AuthenticatorInfo {
+            options: vec![("clientPin".into(), false)],
+            ..Default::default()
+        };
+        assert_eq!(pin_support(Some(&pin_not_set)), PinSupport::NotSet);
+        let pin_set = AuthenticatorInfo {
+            options: vec![("clientPin".into(), true)],
+            ..Default::default()
+        };
+        assert_eq!(pin_support(Some(&pin_set)), PinSupport::Set);
     }
 
     #[test]
