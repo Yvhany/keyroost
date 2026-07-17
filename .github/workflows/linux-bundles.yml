@@ -194,6 +194,14 @@ jobs:
             -o packaging/flatpak/cargo-sources.json
           echo "generated $(python3 -c 'import json,sys; print(len(json.load(open("packaging/flatpak/cargo-sources.json"))))') source entries"
 
+      # Fill the AppStream <releases> block from CHANGELOG.md — the committed
+      # block is intentionally empty (single source of truth; #80). The
+      # manifest consumes the working tree (type: dir), so this pre-build edit
+      # is exactly what ships. The generator fails the build if CHANGELOG.md
+      # was not updated for the current workspace version.
+      - name: Generate AppStream releases from CHANGELOG
+        run: python3 packaging/flatpak/gen-metainfo-releases.py
+
       # Build the app and a single-file bundle. flatpak/flatpak-github-actions
       # v6.7 (pinned to its commit). `bundle` is the .flatpak filename;
       # build-bundle defaults true. The action writes the OSTree repo to ./repo

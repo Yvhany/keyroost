@@ -140,6 +140,10 @@ install -m755 "${REPO_ROOT}/packaging/appimage/AppRun.preflight" "${APPDIR}/AppR
 #     update info and emit keyroost-x86_64.AppImage.zsync, so AppImageUpdate can
 #     do delta updates from each GitHub release.
 [ -f "${METAINFO_FILE}" ] || { echo "ERROR: missing ${METAINFO_FILE}"; exit 1; }
+# Fill the AppStream <releases> block from CHANGELOG.md first — the committed
+# block is intentionally empty (single source of truth; #80). Requires
+# python3, present on the CI runners and any dev box that builds bundles.
+python3 "${REPO_ROOT}/packaging/flatpak/gen-metainfo-releases.py"
 install -Dm644 "${METAINFO_FILE}" "${APPDIR}/usr/share/metainfo/$(basename "${METAINFO_FILE}")"
 export UPDATE_INFORMATION="gh-releases-zsync|framefilter|keyroost|latest|keyroost-*x86_64.AppImage.zsync"
 ./linuxdeploy-plugin-appimage.AppImage --appdir "${APPDIR}"
