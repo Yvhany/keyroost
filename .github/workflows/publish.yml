@@ -226,21 +226,95 @@ jobs:
           git push origin HEAD
 
   winget:
-    name: winget (Framefilter.Keyroost)
+    name: winget (Framefilter.Keyroost, Token2-signed asset)
     runs-on: windows-latest
     environment: release-publish
     steps:
-      - name: Check secret configured
-        id: guard
+      # Decide whether this run submits, in one place. Ordered checks:
+      #   1. WINGET_TOKEN absent            -> skip (setup not done) — notice
+      #   2. WINGET_TOKEN present but dead  -> FAIL loudly (the expired-PAT
+      #      silent-skip trap from the v0.7.5 postmortem)
+      #   3. version already in winget-pkgs -> skip (idempotent re-dispatch)
+      #   4. signed asset not attached yet  -> skip — winget WAITS for the
+      #      Token2-signed zip (policy, 2026-07-17): signed bytes carry
+      #      SmartScreen cert reputation across releases, and submitting
+      #      off the release critical path decouples us from Defender
+      #      validation false positives on brand-new binaries (which are
+      #      prevalence-based, self-heal by re-run, and are NOT caused by
+      #      the signed variant circulating — that theory didn't survive
+      #      research; see docs/superpowers/plans/2026-07-17-winget-signed-asset-flow.md).
+      # New rhythm: tag -> fanout (this job notices + skips) -> Token2 signs
+      # -> maintainer attaches keyroost-vX.Y.Z-windows-x86_64-signed.zip
+      # (+ .sha256) as NEW assets -> `gh workflow run publish.yml -f tag=vX.Y.Z`
+      # -> every other job no-ops, this one submits.
+      - name: Resolve signed asset and submission state
+        id: resolve
         shell: pwsh
         env:
           KEY: ${{ secrets.WINGET_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          "submit=false" | Out-File -Append $Env:GITHUB_OUTPUT
           if (-not $Env:KEY) {
-            Write-Host "WINGET_TOKEN not configured - skipping winget publish"
-            "ready=false" | Out-File -Append $Env:GITHUB_OUTPUT
-          } else {
-            "ready=true" | Out-File -Append $Env:GITHUB_OUTPUT
+            Write-Host "::notice::WINGET_TOKEN not configured - skipping winget publish"
+            exit 0
+          }
+          # 2. A present-but-expired PAT must fail loudly, not skip silently.
+          $headers = @{ Authorization = "token $Env:KEY" }
+          try {
+            Invoke-RestMethod -Uri "https://api.github.com/user" -Headers $headers | Out-Null
+          } catch {
+            Write-Host "::error::WINGET_TOKEN is set but rejected by the GitHub API - the PAT has likely expired. Renew it (classic PAT, public_repo scope) or the winget channel silently stops shipping."
+            exit 1
+          }
+          $version = $Env:TAG.TrimStart('v')
+          # 3. Already live in winget-pkgs? (manifests/f/Framefilter/Keyroost/<version>)
+          $manifestPath = "repos/microsoft/winget-pkgs/contents/manifests/f/Framefilter/Keyroost/$version"
+          $null = & gh api $manifestPath 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "::notice::Framefilter.Keyroost $version already in winget-pkgs - nothing to submit"
+            exit 0
+          }
+          # 4. Is the Token2-signed zip attached to the release?
+          $signedName = "keyroost-$Env:TAG-windows-x86_64-signed.zip"
+          $assets = & gh release view $Env:TAG --repo $Env:GITHUB_REPOSITORY --json assets --jq '.assets[].name'
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::could not read release $Env:TAG asset list"
+            exit 1
+          }
+          if ($assets -notcontains $signedName) {
+            Write-Host "::notice::winget is HOLDING for the Token2-signed build: attach $signedName (+ .sha256) to release $Env:TAG as NEW assets (never replace the CI zips - that invalidates SHA256SUMS/provenance), then re-dispatch publish.yml with tag=$Env:TAG. Every other channel job no-ops on re-dispatch."
+            exit 0
+          }
+          $url = "https://github.com/$Env:GITHUB_REPOSITORY/releases/download/$Env:TAG/$signedName"
+          "url=$url" | Out-File -Append $Env:GITHUB_OUTPUT
+          "submit=true" | Out-File -Append $Env:GITHUB_OUTPUT
+          Write-Host "signed asset present - will verify and submit $url"
+
+      # The whole point of waiting was signed bytes: prove they ARE signed
+      # before pointing the manifest at them. Requires a Valid Authenticode
+      # signature on every PE in the zip; logs the signer so a wrong-cert
+      # upload is visible in the run log.
+      - name: Verify Authenticode signature of the signed zip
+        if: steps.resolve.outputs.submit == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          & gh release download $Env:TAG --repo $Env:GITHUB_REPOSITORY --pattern "keyroost-$Env:TAG-windows-x86_64-signed.zip" --output signed.zip
+          if ($LASTEXITCODE -ne 0) { Write-Error "download failed"; exit 1 }
+          Expand-Archive signed.zip -DestinationPath signed
+          $exes = Get-ChildItem signed -Recurse -Include *.exe,*.dll
+          if (-not $exes) { Write-Error "no PE files found in the signed zip"; exit 1 }
+          $bad = 0
+          foreach ($f in $exes) {
+            $sig = Get-AuthenticodeSignature $f.FullName
+            Write-Host "$($f.Name): $($sig.Status) - $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne 'Valid') { $bad++ }
+          }
+          if ($bad -gt 0) {
+            Write-Host "::error::$bad file(s) in the '-signed' zip lack a Valid Authenticode signature - refusing to submit unsigned bytes under the signed name"
+            exit 1
           }
 
       # wingetcreate is Microsoft's official manifest tool; it updates the
@@ -249,13 +323,13 @@ jobs:
       # (wingetcreate new, or a manual PR from packaging/winget/) — this job
       # only handles version bumps.
       - name: Update winget manifest
-        if: steps.guard.outputs.ready == 'true'
+        if: steps.resolve.outputs.submit == 'true'
         shell: pwsh
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
         run: |
           $version = $Env:TAG.TrimStart('v')
-          $url = "https://github.com/$Env:GITHUB_REPOSITORY/releases/download/$Env:TAG/keyroost-$Env:TAG-windows-x86_64.zip"
+          $url = "${{ steps.resolve.outputs.url }}"
           # Pinned + hash-checked for the same reason the actions above are
           # SHA-pinned: this executable runs with the winget PAT in env.
           # Hash is from wingetcreate.exe.txt on the same release.
