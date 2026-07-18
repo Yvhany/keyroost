@@ -3,6 +3,32 @@
 Deferred items that are too large or too risky to fold into a same-day patch.
 Captured here so they don't get lost. Unchecked = not started.
 
+## v0.7.7 — new items from the v0.7.6 release run
+
+- [ ] **Widen the release-attach retry window in `linux-bundles.yml`.** Both
+      attach loops (AppImage and .flatpak) retry 6×20s waiting for release.yml
+      to create the GitHub Release; v0.7.6 lost that race by 16 seconds (the
+      AppImage was left as a workflow artifact until a manual re-run). Stretch
+      to ~20×30s — `--clobber` makes waiting free, and ten minutes covers any
+      realistic gap between the two workflows' builds and approval gates.
+- [ ] **OATH applet reset (recovery for a forgotten OATH password).** The
+      capability-gating audit behind the #81 fix found the OATH pane's locked
+      view dead-ends at the password prompt, and keyroost implements no OATH
+      reset at any layer — so a forgotten password currently means reaching
+      for ykman. The Yubico/Trussed OATH RESET instruction deliberately works
+      without the password (it wipes all credentials; that's the recovery
+      trade-off). Add it through the stack: keyroost-oath byte layer,
+      transport, `keyroostctl oath reset` (destructive-confirm conventions),
+      and a reset card on the OATH pane's locked view — same never-hide-the-
+      recovery-action principle as the FIDO reset fix in 0.7.6.
+- [ ] **#82 follow-up: native support for the no-status-word HID dialect.**
+      v0.7.6 ships the same-device HID→CCID fallback, which unbreaks the
+      affected keys; the underlying firmware answers GET_INFO over HID with
+      `80 bf 00 01 05` and no trailing `90 00`. Once the reporter names the
+      model (asked in the issue), check with Token2 what that dialect is and
+      whether the HID path should recognize it directly — vendor input first,
+      no empirical probing (the Solo 2 HOTP lesson).
+
 ## Release-day playbook (SOP)
 
 - [ ] Write a **release-day playbook** — a single checklist doc the release
@@ -173,18 +199,13 @@ anything big on top:
       loader ourselves. Design before implementing; verify on a host WITH and a
       host WITHOUT libpcsclite.
 
-## egui / eframe version bump
+## egui / eframe version bump — **DONE**
 
-- [ ] Bump **egui / eframe / egui-winit 0.29.1 → 0.34.3** (current latest).
-      Five minor versions of breaking API changes across the ~11k-line GUI —
-      treat as its own project with a full pass + regression check (zoom/slider,
-      modals, layout, light/dark themes).
-- [ ] **winit stays 0.30.13** either way (0.31 is beta only; egui 0.34 still
-      rides the 0.30.x line), so this is **not** guaranteed to fix the Wayland
-      text-input regression in
-      [#48](https://github.com/framefilter/keyroost/issues/48) — but check
-      whether egui-winit's glue changes incidentally resolve it on Fedora-44 KWin
-      while we're here.
+- [x] Bump egui / eframe — shipped: the GUI is on **eframe/egui 0.35**
+      (crate `rust-version` 1.92). Overtaken since this item was written
+      (it targeted 0.34.3 as "current latest").
+- [x] Wayland text-input regression
+      [#48](https://github.com/framefilter/keyroost/issues/48) — closed.
 
 ## Molto2 — slot overview (titles, occupancy, per-slot delete)
 

@@ -98,13 +98,11 @@ anyone with the Linux build prerequisites from the README.
       change-pin/puk, unblock-pin, set-retries, change-management-key,
       generate-key, import-cert, export-cert, reset), and the full GUI PIV
       pane. Generalizes across PIV devices since it's a NIST standard.
-- [ ] **Publish-channel accounts** — one-time setup per packaging/README.md
-      before the first release: the `release-publish` environment approval
-      gate, crates.io account + manual first publish + trusted-publisher
-      grants, AUR account/SSH key + first `keyroost-bin` push, the Homebrew
-      tap repo + `TAP_PUSH_TOKEN`, and the manual first winget submission +
-      `WINGET_TOKEN`. Channels can be enabled one at a time; unset secrets
-      skip cleanly.
+- [x] **Publish-channel accounts** — DONE: every channel live as of v0.7.5
+      (crates.io via OIDC trusted publishing, Homebrew tap, winget, AUR
+      `keyroost-bin`), all re-verified publishing v0.7.6. The remaining
+      channel nuance (winget waits for the Token2-signed asset) is policy,
+      not setup — see TODO-v0.7.5.md "Windows signing + winget flow".
 - [x] **GUI: move slow imports off the frame loop** — QR decode, vault
       decrypt, and export parse run on a dedicated import thread (not the
       device worker, which serializes card I/O behind whatever runs on it);
@@ -588,13 +586,10 @@ configured (see `packaging/README.md`):
 - [~] **winget** — v0.6.0 manifests rendered (staged under `/tmp/winget/`).
       Remaining: add `WINGET_TOKEN` (classic PAT, `public_repo`) + submit the
       first PR to `microsoft/winget-pkgs`; future bumps auto-PR.
-- [ ] **AUR** — **DEFERRED / BLOCKED.** Account registration is *disabled*
-      during the June 2026 "Atomic Arch" AUR supply-chain incident (~1500
-      hijacked packages; payload steals SSH keys + GitHub PATs — exactly the
-      creds our CI auto-push would create). **Resume signal:** aur.archlinux.org
-      no longer shows "Account registration is currently disabled" AND
-      archlinux.org/news posts an all-clear. Then: account + dedicated SSH key,
-      first `keyroost-bin` push, secret `AUR_SSH_PRIVATE_KEY`.
+- [x] **AUR** — DONE: unblocked July 2026 after the "Atomic Arch" incident
+      cleared; `keyroost-bin` went live with v0.7.5 (env-scoped
+      `AUR_SSH_PRIVATE_KEY`) and auto-bumped to 0.7.6 with the release
+      fanout.
 
 ### B. PIV GUI — issue #31 items 4–6 (items 1–3 shipped in 0.6.0) — **COMPLETE**
 - [x] Slot-first PIV view: pick a slot → see/act on its contents — **DONE**
@@ -790,10 +785,10 @@ their detailed design follows #38 landing.
       etc.). Dispatched to a background agent (2026-06-19).
 
 ### Post-release triage (ongoing, reserve room)
-- [ ] Watch for and triage issues from the v0.6.0 release as they arrive —
-      regressions from the breaking command restructure, packaging/install
-      reports, device-specific bugs. These take priority over the feature work
-      above when they land.
+- [x] Watch for and triage issues from the v0.6.0 release — stale as a
+      checklist item: releases 0.6.0 through 0.7.6 shipped and field reports
+      are triaged as routine (e.g. #80/#81/#82 → fixed in v0.7.6). Issue
+      triage is standing practice now, not a one-time task.
 
 ### Z. End-of-cycle review & hardening — *reserve room before shipping v0.7.0*
 A deliberate pass after the feature work and before the release, ideally run as a
