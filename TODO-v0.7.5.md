@@ -139,13 +139,15 @@ binary ships with none. Nice addition — we should own it so it's in
 **every** `keyroost.exe` (CI, `cargo install`, and future signed builds
 become our-exact-bytes + signature with nothing injected).
 
-- [ ] Add a `winresource` (or `winres`) build-dependency to the `keyroost`
-      crate, gated to Windows targets, compiling a `.ico` into the binary
-      via `build.rs`. Icon source already exists (`packaging/icons/`, and
-      `Keyroost icon design.zip`); produce a multi-resolution `.ico`.
-- [ ] Optionally embed `VS_VERSION_INFO` (product name, version, company)
-      at the same time — the CI GUI exe currently has none.
-- [ ] Verify on a Windows build that the icon shows in Explorer/taskbar;
+- [x] Done (v0.7.7): `winresource` build-dep host-gated to Windows in the
+      `keyroost` crate; `packaging/icons/gen-ico.py` (stdlib) packs the
+      hicolor PNGs into the committed multi-resolution
+      `packaging/icons/keyroost.ico`, embedded via `build.rs`.
+- [x] VS_VERSION_INFO embedded alongside (ProductName / FileDescription /
+      OriginalFilename; versions track CARGO_PKG_VERSION).
+- [ ] Verify on a Windows build that the icon shows in Explorer/taskbar
+      (compile-proof also pending: CI's Windows leg runs on main/PRs, so the
+      first Windows build of build.rs happens at landing);
       confirm the Linux/macOS builds are unaffected (build-dep is
       cfg-gated). Once landed, future signed GUI binaries should be
       byte-identical to CI + signature (no injected `.rsrc`).
