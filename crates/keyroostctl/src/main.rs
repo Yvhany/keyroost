@@ -452,6 +452,19 @@ enum Cmd {
         #[command(subcommand)]
         cmd: OtpCmd,
     },
+    /// Factory-reset EVERY resettable applet on the selected key: OATH,
+    /// OpenPGP, PIV, Token2 OTP, then FIDO2 (which needs an unplug/replug +
+    /// touch at the end). Wipes all credentials, codes, keys, and PINs; the
+    /// key stays fully usable afterward. Irreversible.
+    FactoryReset {
+        /// Substring of the PC/SC reader name (skips auto-detection for the
+        /// smart-card applets).
+        #[arg(long)]
+        reader: Option<String>,
+        /// Confirm the wipe. Required — without it the command refuses.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// A PIV key slot, selected on the CLI by its hex key reference.
@@ -2458,6 +2471,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return run_prog(cmd, cli.debug);
     }
 
+    // Whole-device factory reset: wipe every resettable applet in planner order.
+    if let Cmd::FactoryReset { reader, yes } = cmd {
+        return run_factory_reset(reader.as_deref(), *yes, cli.debug);
+    }
+
     unreachable!("every subcommand is handled above");
 }
 
@@ -3772,6 +3790,172 @@ fn open_oath(
         None => {}
     }
     Ok(session)
+}
+
+/// Resolve exactly one device for a whole-device operation: the one matching
+/// the global `--device` selector, or the lone connected key when no selector
+/// is set. Fails closed on zero matches and refuses to guess among several
+/// (mirrors `resolve_otp_target`'s name-match/ambiguity posture, without an
+/// applet filter).
+fn resolve_single_device<'a>(
+    devices: &'a [keyroost_resolve::Device],
+    name: Option<&str>,
+) -> Result<&'a keyroost_resolve::Device, Box<dyn std::error::Error>> {
+    match name {
+        Some(name) => {
+            let matches: Vec<&keyroost_resolve::Device> = devices
+                .iter()
+                .filter(|d| d.name.as_deref() == Some(name))
+                .collect();
+            match matches.as_slice() {
+                [] => Err(format!(
+                    "no connected device is named '{name}' \
+                     (see `keyroostctl key-name list`)"
+                )
+                .into()),
+                [one] => Ok(*one),
+                many => Err(format!(
+                    "{} connected devices are named '{name}'; refusing to guess \
+                     which key to factory-reset",
+                    many.len()
+                )
+                .into()),
+            }
+        }
+        None => match devices {
+            [] => Err("no security key detected".into()),
+            [one] => Ok(one),
+            many => Err(format!(
+                "{} keys are connected; select one with `--device <name>` before \
+                 factory-resetting",
+                many.len()
+            )
+            .into()),
+        },
+    }
+}
+
+/// Whole-device factory reset: run every applet reset the key supports, in
+/// planner order, continue on failure, print a per-step report, and exit
+/// nonzero if anything failed. FIDO2 is last and needs a physical replug +
+/// touch, prompted interactively.
+fn run_factory_reset(
+    reader: Option<&str>,
+    yes: bool,
+    debug: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use keyroost_resolve::device::{factory_reset_plan, ResetStep, StepOutcome, StepReport};
+
+    if !yes {
+        return Err(
+            "refusing to factory-reset without --yes (wipes ALL applets: \
+                    OATH, OpenPGP, PIV, Token2 OTP, and FIDO2; the key stays \
+                    usable but every credential, code, key, and PIN is erased)"
+                .into(),
+        );
+    }
+
+    // Resolve the one selected device (or a lone key) via the shared model,
+    // so a name/`--device` binds exactly like the other commands.
+    let devices = keyroost_resolve::enumerate()?;
+    let name = SELECTED_KEY_NAME.get().and_then(|o| o.as_deref());
+    let dev = resolve_single_device(&devices, name)?;
+    let plan = factory_reset_plan(dev.caps);
+    if plan.is_empty() {
+        return Err(format!(
+            "'{}' exposes no resettable applet (nothing to factory-reset)",
+            sanitize_terminal(&dev.model)
+        )
+        .into());
+    }
+
+    eprintln!(
+        "\u{2192} factory-resetting {} ({})",
+        sanitize_terminal(&dev.serial),
+        plan.iter()
+            .map(|s| s.label())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let mut reports: Vec<StepReport> = Vec::new();
+    for step in &plan {
+        let outcome = match step {
+            ResetStep::Fido => {
+                // Interactive replug + touch; on its own so a card-step
+                // failure above never skips the FIDO offer.
+                println!("FIDO2  unplug the key, plug it back in, then press Enter\u{2026}");
+                let mut _line = String::new();
+                std::io::stdin().read_line(&mut _line).ok();
+                println!("FIDO2  touch the key now\u{2026}");
+                match run_fido_reset(None) {
+                    Ok(()) => StepOutcome::Wiped,
+                    Err(e) => StepOutcome::Failed(sanitize_terminal(&e.to_string())),
+                }
+            }
+            other => reset_one_card_applet(*other, reader, debug),
+        };
+        let label = step.label();
+        match &outcome {
+            StepOutcome::Wiped => println!("{label:<8} wiped"),
+            StepOutcome::Failed(e) => println!("{label:<8} failed: {e}"),
+            StepOutcome::Skipped => println!("{label:<8} skipped"),
+        }
+        reports.push(StepReport {
+            step: *step,
+            outcome,
+        });
+    }
+
+    let failed = reports
+        .iter()
+        .filter(|r| matches!(r.outcome, StepOutcome::Failed(_)))
+        .count();
+    let wiped = reports.len() - failed;
+    println!("factory reset: {wiped} wiped, {failed} failed");
+    if failed > 0 {
+        return Err(format!("{failed} applet(s) failed to reset").into());
+    }
+    Ok(())
+}
+
+/// Run one card-applet reset step, mapping its result to a StepOutcome so a
+/// single failure is recorded, not propagated (continue-on-error).
+fn reset_one_card_applet(
+    step: keyroost_resolve::device::ResetStep,
+    reader: Option<&str>,
+    debug: bool,
+) -> keyroost_resolve::device::StepOutcome {
+    use keyroost_resolve::device::{ResetStep, StepOutcome};
+    let run = || -> Result<(), Box<dyn std::error::Error>> {
+        match step {
+            ResetStep::Oath => {
+                let by_name = reader_from_name()?;
+                let name = resolve_oath_reader(reader.or(by_name.as_deref()))?;
+                let mut s = keyroost_transport::OathSession::open(&name)?;
+                s.set_debug(debug);
+                s.factory_reset()?;
+            }
+            ResetStep::OpenPgp => {
+                let mut s = open_openpgp(reader, debug)?;
+                s.factory_reset()?;
+            }
+            ResetStep::Piv => {
+                let mut s = open_piv(reader, debug)?;
+                s.force_reset()?;
+            }
+            ResetStep::Token2Otp => {
+                let mut s = open_otp(OtpTransportArg::Auto, debug)?;
+                s.erase_all()?;
+            }
+            ResetStep::Fido => unreachable!("FIDO handled by the interactive path"),
+        }
+        Ok(())
+    };
+    match run() {
+        Ok(()) => StepOutcome::Wiped,
+        Err(e) => StepOutcome::Failed(sanitize_terminal(&e.to_string())),
+    }
 }
 
 fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -7446,6 +7630,21 @@ mod cli_tests {
     }
 
     #[test]
+    fn factory_reset_requires_explicit_yes() {
+        match parse(&["keyroostctl", "factory-reset", "--yes"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::FactoryReset { yes, .. }) => assert!(yes),
+            _ => panic!("expected factory-reset"),
+        }
+        match parse(&["keyroostctl", "factory-reset"]).unwrap().command {
+            Some(Cmd::FactoryReset { yes, .. }) => assert!(!yes),
+            _ => panic!("expected factory-reset"),
+        }
+    }
+
+    #[test]
     fn oath_add_positional_name_does_not_hijack_device_selector() {
         // Regression: a subcommand's `name` arg must not be consumed as the
         // global device selector. That happened when the global selector shared
@@ -7824,7 +8023,6 @@ mod cli_tests {
         assert!(parse(&["keyroostctl", "molto", "reset", "--yes"]).is_ok());
         assert!(parse(&["keyroostctl", "molto", "probe", "--yes"]).is_ok());
         assert!(parse(&["keyroostctl", "set-seed", "--profile", "0", "--hex-stdin"]).is_err());
-        assert!(parse(&["keyroostctl", "factory-reset", "--yes"]).is_err());
         assert!(parse(&["keyroostctl", "molto", "info", "--key-env", "K"]).is_ok());
     }
 
