@@ -118,5 +118,8 @@ Refuses without `--yes` (existing convention). Any failure → per-step
 
 - Molto2 gets no new flow (routes to its existing reset).
 - ProgToken excluded (no manufacturer reset exists).
-- No attempt to wipe anything a vendor doesn't expose a reset for
-  (explicit user constraint: manufacturer intent only).
+- The shipped flow uses manufacturer-intended resets only. Ideas beyond
+  that line are welcome but are **stop-and-discuss, not build**: anything
+  that could render a key permanently unusable requires an explicit
+  conversation with the user before any design work (user amendment,
+  2026-07-18).
