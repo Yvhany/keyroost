@@ -31,7 +31,7 @@ Captured here so they don't get lost. Unchecked = not started.
 
 ## Release-day playbook (SOP)
 
-- [ ] Write a **release-day playbook** — a single checklist doc the release
+- [x] Write a **release-day playbook** — a single checklist doc the release
       runs from, start to finish. Releases so far have been ad-hoc; as the UI
       matures the cut needs to be boring and repeatable. Should cover, in
       order, at least:
@@ -61,8 +61,10 @@ Captured here so they don't get lost. Unchecked = not started.
   - post-release: install-matrix spot check (`cargo install`, flatpak,
     AppImage, Homebrew tap, winget manifest refresh), GUI/CLI version sanity;
   - announcement/notes if any.
-- [ ] Decide where it lives (likely `packaging/RELEASING.md`) and whether any
-      steps can become a workflow-dispatch dry-run instead of prose.
+- [x] Decided + written (v0.7.7): it lives at `packaging/RELEASING.md`. The
+      pre-tag packaging proof already became a workflow-dispatch dry-run
+      (the linux-bundles build-only probe); the rest stays prose because the
+      remaining steps are approvals and out-of-band vendor loops.
 
 ## Windows signing + winget flow (Token2 signed assets)
 
