@@ -454,6 +454,75 @@ pub fn enumerate() -> Result<Vec<Device>, String> {
     Ok(correlate(&hids, &probes, &keyring))
 }
 
+/// One applet-reset step in a whole-device factory reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetStep {
+    Oath,
+    OpenPgp,
+    Piv,
+    Token2Otp,
+    Fido,
+}
+
+impl ResetStep {
+    /// Short badge label — matches the capability vocabulary the CLI/GUI
+    /// already show, so the reset summary reads consistently.
+    pub fn label(self) -> &'static str {
+        match self {
+            ResetStep::Oath => "OATH",
+            ResetStep::OpenPgp => "OpenPGP",
+            ResetStep::Piv => "PIV",
+            ResetStep::Token2Otp => "OTP",
+            ResetStep::Fido => "FIDO2",
+        }
+    }
+}
+
+/// Ordered factory-reset steps for a key with these capabilities. Card
+/// applets first (silent wipes), FIDO last (its reset needs a replug +
+/// touch ceremony, so it ends the flow). Only applets the key advertises
+/// appear. Pure — the single source of truth both the CLI and GUI consume,
+/// so they can never disagree about what "everything" means.
+pub fn factory_reset_plan(caps: Caps) -> Vec<ResetStep> {
+    let mut steps = Vec::new();
+    if caps.has(Caps::OATH) {
+        steps.push(ResetStep::Oath);
+    }
+    if caps.has(Caps::PGP) {
+        steps.push(ResetStep::OpenPgp);
+    }
+    if caps.has(Caps::PIV) {
+        steps.push(ResetStep::Piv);
+    }
+    if caps.has(Caps::OTP) {
+        steps.push(ResetStep::Token2Otp);
+    }
+    if caps.has(Caps::FIDO2) {
+        steps.push(ResetStep::Fido);
+    }
+    steps
+}
+
+/// The outcome of one reset step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepOutcome {
+    /// The applet was reset to factory state.
+    Wiped,
+    /// The reset was attempted and failed; the string is the reason.
+    Failed(String),
+    /// The step was not run (applet not present) — reserved for callers that
+    /// build a full report over all step kinds; `factory_reset_plan` simply
+    /// omits absent applets.
+    Skipped,
+}
+
+/// One line of a factory-reset report: which applet, and how it went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepReport {
+    pub step: ResetStep,
+    pub outcome: StepOutcome,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,5 +932,62 @@ mod tests {
         assert!(devs[0].caps.has(Caps::FIDO2));
         assert!(!devs[0].caps.has(Caps::OTP));
         assert_eq!(devs[0].vendor, "Nitrokey");
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn caps(bits: &[Caps]) -> Caps {
+        let mut c = Caps::default();
+        for b in bits {
+            c.insert(*b);
+        }
+        c
+    }
+
+    #[test]
+    fn plan_is_ordered_and_only_present_applets() {
+        let full = caps(&[Caps::OATH, Caps::PGP, Caps::PIV, Caps::OTP, Caps::FIDO2]);
+        assert_eq!(
+            factory_reset_plan(full),
+            vec![
+                ResetStep::Oath,
+                ResetStep::OpenPgp,
+                ResetStep::Piv,
+                ResetStep::Token2Otp,
+                ResetStep::Fido,
+            ]
+        );
+    }
+
+    #[test]
+    fn fido_is_always_last_when_present() {
+        let c = caps(&[Caps::FIDO2, Caps::OATH]);
+        let plan = factory_reset_plan(c);
+        assert_eq!(plan.last(), Some(&ResetStep::Fido));
+        assert_eq!(plan, vec![ResetStep::Oath, ResetStep::Fido]);
+    }
+
+    #[test]
+    fn absent_applets_are_omitted() {
+        let c = caps(&[Caps::PIV]);
+        assert_eq!(factory_reset_plan(c), vec![ResetStep::Piv]);
+        // TOTP (Molto2) and PROG are not applet-reset steps here.
+        assert_eq!(
+            factory_reset_plan(caps(&[Caps::TOTP])),
+            Vec::<ResetStep>::new()
+        );
+        assert_eq!(factory_reset_plan(Caps::default()), Vec::<ResetStep>::new());
+    }
+
+    #[test]
+    fn labels_are_stable() {
+        assert_eq!(ResetStep::Oath.label(), "OATH");
+        assert_eq!(ResetStep::OpenPgp.label(), "OpenPGP");
+        assert_eq!(ResetStep::Piv.label(), "PIV");
+        assert_eq!(ResetStep::Token2Otp.label(), "OTP");
+        assert_eq!(ResetStep::Fido.label(), "FIDO2");
     }
 }
