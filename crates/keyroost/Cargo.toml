@@ -87,6 +87,12 @@ x11rb = { version = "0.13", optional = true }
 # `serde_repr` without pulling it, and `trash` is the lightest feature that does.
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "screenshot", "trash"], optional = true }
 
+[target.'cfg(windows)'.build-dependencies]
+# Embeds the app icon + VS_VERSION_INFO into keyroost.exe (see build.rs).
+# Host-gated: only Windows builds compile it (CI builds Windows natively),
+# so Linux/macOS builds pull nothing extra.
+winresource = "0.1"
+
 [dev-dependencies]
 # Approved dev-only exception (tests only, never in release builds):
 # randomized property coverage for the pure device-binding guards
