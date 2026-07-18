@@ -179,6 +179,15 @@ anything big on top:
       separately selectable.
 - [ ] **Linux hidraw bounded reads (Task 8):** unplug a key mid-`fido info`
       — the command must error out within the read budget, not hang.
+- [ ] **OATH applet reset (new in v0.7.7):** on a password-PROTECTED test
+      key, reset from the GUI locked view and via `keyroostctl oath reset
+      --yes`; confirm credentials wiped, password cleared, and the pane
+      re-lists empty and unlocked.
+- [ ] **v0.7.6 field fixes:** Settings tab + Reset on a CTAP 2.0-only key
+      (#81 — reporter's device class), and the standalone Reset card on a
+      key with a blocked/absent PIN. (#82's HID→CCID fallback only engages
+      on the quirky firmware — reporter confirmation stands in for local
+      hardware.)
 
 ## PC/SC: load libpcsclite at runtime, degrade gracefully (the real #47 fix)
 
