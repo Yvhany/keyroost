@@ -256,9 +256,11 @@ own follow-up branch: the EPIPE panic. Remaining deferred items below.
       slot-list header for on-demand re-read — deferred to avoid worsening the
       already-crowded six-button action row.
 
-## GUI — Text-size control polish ([#42](https://github.com/framefilter/keyroost/issues/42), @token2)
+## GUI — Text-size control polish ([#42](https://github.com/framefilter/keyroost/issues/42), @token2) — **DONE**
 
-- [ ] Add discrete **"−" / "+" buttons** on the ends of the zoom slider; mouse
-      dragging is unpredictable near the boundaries.
-- [ ] **Light theme:** the slider track/handle is almost invisible — restyle it
-      so it reads on the light palette (it's currently tuned for dark only).
+- [x] Discrete "−" / "+" steppers flank the zoom slider (with a
+      preview-then-commit debounce so the buttons don't rescale out from
+      under a run of clicks). #42 is closed.
+- [x] Light theme slider visibility — fixed with the #59 light-mode pass
+      (dedicated darker control gray for the rail/handle/steppers on light;
+      see the styling comment at the slider). #59 is closed.
