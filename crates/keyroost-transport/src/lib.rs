@@ -252,6 +252,7 @@ impl std::error::Error for TransportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             TransportError::PcscUnavailable(e) | TransportError::Pcsc(e) => Some(e),
+            TransportError::PublicData(e) => Some(e),
             TransportError::OathParse(e) => Some(e),
             TransportError::OpenPgpParse(e) => Some(e),
             TransportError::PivParse(e) => Some(e),
@@ -1186,6 +1187,19 @@ pub(crate) fn transmit_applet(
 #[cfg(test)]
 mod redaction_tests {
     use super::*;
+
+    /// `TransportError::PublicData` must chain its inner error via
+    /// `source()` like the OATH/OpenPGP/PIV parse siblings do, so callers
+    /// walking the chain (or `anyhow`-style reporters) see the strict-envelope
+    /// detail instead of a dead end.
+    #[test]
+    fn public_data_error_chains_via_source() {
+        use std::error::Error;
+        let e = TransportError::PublicData(PublicDataError::BadOuterTag);
+        let src = e.source().expect("PublicData must expose a source");
+        assert!(src.downcast_ref::<PublicDataError>().is_some());
+        assert_eq!(src.to_string(), "leading tag is not 0x95");
+    }
 
     #[test]
     fn auth_tries_decodes_iso_63cx_form() {

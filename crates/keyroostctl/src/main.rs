@@ -2377,11 +2377,18 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
         let mut session = open_molto_session()?;
         session.set_debug(debug);
         let info = session.read_info()?;
-        let mut slots = Vec::with_capacity(100);
-        for p in 0..=99u8 {
-            slots.push(session.read_public_data(p)?);
-        }
+        // A mid-sweep failure keeps the slots already read; the table below
+        // prints them plus an error row instead of discarding everything a
+        // flaky read had already produced (TODO-v0.7.5 hygiene item).
+        let (slots, sweep_err) =
+            sweep_until_error((0..=99u8).map(|p| (p, session.read_public_data(p))));
         if json_output() {
+            if let Some((slot, e)) = sweep_err {
+                // JSON consumers get all-or-nothing: partial data with no
+                // in-band error marker would read as "the other slots are
+                // empty", which is worse than failing.
+                return Err(format!("reading slot {slot}'s public block failed: {e}").into());
+            }
             let out: Vec<json_out::MoltoSlotJson> = slots
                 .iter()
                 .enumerate()
@@ -2410,7 +2417,7 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
             .enumerate()
             .filter(|(_, b)| *all || b.seed_present || b.title.is_some())
             .collect();
-        if shown.is_empty() {
+        if shown.is_empty() && sweep_err.is_none() {
             println!("no occupied or titled slots (use --all to list all 100)");
             return Ok(());
         }
@@ -2431,6 +2438,16 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
                 b.time_step,
                 b.digits,
             );
+        }
+        if let Some((slot, e)) = sweep_err {
+            println!(
+                "{:>4}  {}",
+                slot,
+                sanitize_terminal(&format!(
+                    "read failed here — slots {slot}..=99 not shown: {e}"
+                ))
+            );
+            return Err(format!("slot sweep incomplete: slot {slot} failed: {e}").into());
         }
         return Ok(());
     }
@@ -3753,6 +3770,36 @@ fn oath_type_str(t: keyroost_oath::OathType) -> &'static str {
         keyroost_oath::OathType::Totp => "TOTP",
         keyroost_oath::OathType::Hotp => "HOTP",
     }
+}
+
+/// Run a Molto2 slot sweep until the first read failure: everything read so
+/// far is kept, and the failing (slot, error) pair — if any — is reported
+/// alongside it. Sweeping past a failed read is pointless (a wedged CCID
+/// session fails the remaining ~90 reads slowly, one timeout each), but the
+/// slots already read are real data the user should still see. Pure over an
+/// iterator of results so it is unit-testable without hardware.
+fn sweep_until_error<I>(
+    reads: I,
+) -> (
+    Vec<keyroost_proto::ProfilePublicData>,
+    Option<(u8, keyroost_transport::TransportError)>,
+)
+where
+    I: Iterator<
+        Item = (
+            u8,
+            Result<keyroost_proto::ProfilePublicData, keyroost_transport::TransportError>,
+        ),
+    >,
+{
+    let mut slots = Vec::with_capacity(100);
+    for (slot, read) in reads {
+        match read {
+            Ok(b) => slots.push(b),
+            Err(e) => return (slots, Some((slot, e))),
+        }
+    }
+    (slots, None)
 }
 
 /// Where an explicit `--device` selection resolves to for the Token2 OTP applet.
@@ -8024,5 +8071,58 @@ mod prop_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod slot_sweep_tests {
+    use super::*;
+    use keyroost_proto::{ProfilePublicData, PublicDataError};
+    use keyroost_transport::TransportError;
+
+    fn block(title: Option<&str>) -> ProfilePublicData {
+        ProfilePublicData {
+            title: title.map(String::from),
+            flag: 0,
+            algorithm: 1,
+            time_step: 30,
+            time_a: 0,
+            time_b: 0,
+            digits: 6,
+            seed_present: title.is_some(),
+        }
+    }
+
+    /// A mid-sweep read failure must yield everything read so far plus the
+    /// failing slot, not throw the partial results away.
+    #[test]
+    fn sweep_keeps_partial_results_up_to_the_failure() {
+        let reads = vec![
+            (0u8, Ok(block(Some("github")))),
+            (1u8, Ok(block(None))),
+            (
+                2u8,
+                Err(TransportError::PublicData(PublicDataError::Truncated)),
+            ),
+            // Never reached — the sweep stops at the first failure.
+            (3u8, Ok(block(Some("unreachable")))),
+        ];
+        let (slots, err) = sweep_until_error(reads.into_iter());
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[0].title.as_deref(), Some("github"));
+        let (slot, e) = err.expect("failure must be reported");
+        assert_eq!(slot, 2);
+        assert!(matches!(
+            e,
+            TransportError::PublicData(PublicDataError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn clean_sweep_reports_no_error() {
+        let reads = (0u8..=3).map(|p| (p, Ok(block(None))));
+        let (slots, err) = sweep_until_error(reads);
+        assert_eq!(slots.len(), 4);
+        assert!(err.is_none());
     }
 }

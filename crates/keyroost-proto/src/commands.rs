@@ -151,6 +151,8 @@ impl fmt::Display for PublicDataError {
     }
 }
 
+impl std::error::Error for PublicDataError {}
+
 /// Error decoding a `get info` (`0x41`) response body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InfoError {
