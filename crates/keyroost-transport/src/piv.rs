@@ -15,6 +15,14 @@ use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchP
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
 use zeroize::Zeroizing;
 
+/// How many wrong-credential attempts to make when intentionally blocking a
+/// PIN or PUK during a factory reset: always more than the card's reported
+/// retry count so a block is guaranteed, but hard-capped so a card that
+/// misreports (or never decrements) cannot loop forever.
+fn block_attempts_cap(reported: Option<u8>) -> u32 {
+    reported.map(u32::from).unwrap_or(10).min(20) + 2
+}
+
 /// A read-only snapshot of a PIV application's state.
 #[derive(Debug, Clone)]
 pub struct PivStatus {
@@ -496,6 +504,72 @@ impl PivSession {
         ok_or_write("piv reset", sw)
     }
 
+    /// Factory-reset the PIV applet the manufacturer-intended way even when the
+    /// PIN/PUK are unknown: deliberately exhaust the PIN retry counter with wrong
+    /// values, then the PUK counter, then send RESET (which the card only accepts
+    /// once BOTH are blocked). This is the documented decommission path; it wipes
+    /// all PIV keys, certificates, and PINs and leaves the applet at defaults.
+    ///
+    /// Used only by the whole-device factory reset — the single-applet PIV reset
+    /// keeps requiring an already-blocked card (that path is a user who knows the
+    /// card is blocked, not one asking us to block it).
+    pub fn force_reset(&mut self) -> Result<(), TransportError> {
+        // Wrong values that satisfy the 6–8 byte length rule so the card actually
+        // evaluates (and decrements) rather than rejecting on length. The real
+        // PIN/PUK is never these, so each attempt consumes exactly one try.
+        const WRONG_A: &[u8] = b"00000000";
+        const WRONG_B: &[u8] = b"99999999";
+
+        // 1. Block the PIN.
+        let pin_tries = self.status().ok().and_then(|s| s.pin_retries);
+        let mut blocked = false;
+        for i in 0..block_attempts_cap(pin_tries) {
+            let guess = if i % 2 == 0 { WRONG_A } else { WRONG_B };
+            match self.verify_pin(guess) {
+                Ok(()) => { /* absurd: the wrong PIN "worked"; keep going */ }
+                Err(TransportError::PivPinRejected {
+                    tries_remaining: Some(0),
+                }) => {
+                    blocked = true;
+                    break;
+                }
+                Err(TransportError::PivPinRejected { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if !blocked {
+            return Err(TransportError::MalformedResponse(
+                "PIV PIN would not block after the attempt cap",
+            ));
+        }
+
+        // 2. Block the PUK (via unblock-pin, whose wrong PUK decrements the PUK
+        //    counter). new_pin is irrelevant — the unblock never succeeds.
+        let mut puk_blocked = false;
+        for i in 0..block_attempts_cap(None) {
+            let guess = if i % 2 == 0 { WRONG_A } else { WRONG_B };
+            match self.unblock_pin(guess, b"00000000") {
+                Ok(()) => {}
+                Err(TransportError::PivPinRejected {
+                    tries_remaining: Some(0),
+                }) => {
+                    puk_blocked = true;
+                    break;
+                }
+                Err(TransportError::PivPinRejected { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if !puk_blocked {
+            return Err(TransportError::MalformedResponse(
+                "PIV PUK would not block after the attempt cap",
+            ));
+        }
+
+        // 3. Both blocked — RESET now succeeds.
+        self.reset()
+    }
+
     /// Whether `slot` holds a certificate (GET DATA), and its size if so.
     fn slot_status(&mut self, slot: piv::Slot) -> Result<PivSlotStatus, TransportError> {
         let (data, sw) = self.transmit_full(&piv::get_data(&slot.cert_object_tag()))?;
@@ -705,7 +779,7 @@ fn block_crypt(
 
 #[cfg(test)]
 mod tests {
-    use super::move_key_supported;
+    use super::*;
 
     #[test]
     fn move_key_firmware_gate() {
@@ -716,5 +790,15 @@ mod tests {
         assert!(move_key_supported(Some((6, 0, 0))));
         // Unknown version -> allow the attempt (card will reject if unsupported).
         assert!(move_key_supported(None));
+    }
+
+    #[test]
+    fn block_attempts_cap_exceeds_reported_but_is_bounded() {
+        // A card reporting 3 tries: we try a few more than 3 to guarantee a block.
+        assert_eq!(block_attempts_cap(Some(3)), 5);
+        // Unknown count: default to 10 (max PIV retry the spec allows) + margin.
+        assert_eq!(block_attempts_cap(None), 12);
+        // A pathological huge count is clamped so the loop can't run away.
+        assert_eq!(block_attempts_cap(Some(200)), 22);
     }
 }
