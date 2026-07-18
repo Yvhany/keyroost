@@ -180,7 +180,8 @@ jobs:
             target/appimage/*.AppImage.zsync
 
       # Attach to the Release for $TAG (release.yml's on a tag push, an
-      # existing one on a dispatch republish). Retry briefly: on a tag push
+      # existing one on a dispatch republish). Retry patiently (20×30s — v0.7.6
+      # lost the old 2-minute window by 16 seconds): on a tag push
       # this workflow and release.yml run concurrently, so the Release may not
       # exist for the first few seconds. `--clobber` makes re-runs idempotent.
       # Skipped when no tag is named (build-only probe).
@@ -192,14 +193,14 @@ jobs:
           set -euo pipefail
           img="${{ steps.find.outputs.path }}"
           zsync="${{ steps.find.outputs.zsync }}"
-          for i in 1 2 3 4 5 6; do
+          for i in $(seq 1 20); do
             if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
               gh release upload "${TAG}" "${img}" "${img}.sha256" ${zsync:+"${zsync}"} \
                 --repo "${GITHUB_REPOSITORY}" --clobber
               exit 0
             fi
             echo "release ${TAG} not ready yet (attempt ${i}); waiting…"
-            sleep 20
+            sleep 30
           done
           echo "::error::release ${TAG} never appeared; AppImage left as a build artifact only"
           exit 1
@@ -358,21 +359,23 @@ jobs:
         run: ( cd out && sha256sum keyroost.flatpak > keyroost.flatpak.sha256 )
 
       # Attach the single-file bundle to the release (offline / one-off install).
-      # Retry-and-clobber: this workflow and release.yml run concurrently on the
-      # same tag, so the Release may not exist for the first few seconds.
+      # Retry-and-clobber, patiently (20×30s): this workflow and release.yml run
+      # concurrently on the same tag, and the Release only exists once
+      # release.yml finishes all three platform builds plus its approval gate —
+      # v0.7.6 lost the old 2-minute window by 16 seconds.
       - name: Attach .flatpak bundle to release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          for i in 1 2 3 4 5 6; do
+          for i in $(seq 1 20); do
             if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
               gh release upload "${TAG}" out/keyroost.flatpak out/keyroost.flatpak.sha256 \
                 --repo "${GITHUB_REPOSITORY}" --clobber
               exit 0
             fi
             echo "release ${TAG} not ready yet (attempt ${i}); waiting…"
-            sleep 20
+            sleep 30
           done
           echo "::error::release ${TAG} never appeared; .flatpak left unattached"
           exit 1
