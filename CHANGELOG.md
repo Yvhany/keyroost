@@ -6,6 +6,59 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-07-17
+
+A bug-fix release for three field reports, plus the follow-through on the
+v0.7.5 audit: deeper fuzz/property coverage and a self-healing release
+pipeline.
+
+### Fixed
+- **CTAP 2.0-only keys can be reset again** ([#81]). The FIDO Settings tab —
+  home of the "Reset this key" card — was gated on `authenticatorConfig`, a
+  CTAP 2.1 feature, while reset itself is baseline CTAP 2.0. The tab now
+  appears for any CTAP2 key; only the advanced security-policy controls
+  inside it remain 2.1-gated.
+- **Reset no longer hides behind the PIN it exists to recover from.** The
+  Reset card now renders even when the key can't be unlocked — PIN forgotten
+  or blocked, no PIN set, or no PIN support at all. `authenticatorReset`
+  never needed a PIN; the GUI just wouldn't show it.
+- **On-device OTP works again on firmware with a quirky HID dialect**
+  ([#82]). Some keys answer the OTP-over-HID probe with a reply that omits
+  the ISO status word, which v0.7.5's strict device binding surfaced as
+  `unexpected status word 0x0105`. Automatic transport now falls back from
+  USB-HID to the *same key's* smart-card interface — the pre-0.7.5
+  resilience, without reopening the first-matching-key hole (KEY-003).
+- The Passkeys tab is only offered on keys that actually support credential
+  management, and the remembered tab selection snaps to a tab the selected
+  key has (switching from a fingerprint key to one without a sensor no
+  longer strands the pane on a ghost tab).
+- Keys without `clientPin` support now say so, instead of showing
+  "Reading key…" forever.
+- **Flatpak clients can no longer be stranded on an old version** ([#80]).
+  The AppStream release list is now generated from this changelog at bundle
+  build time — the hand-maintained copy that silently fell three releases
+  behind is gone, and CI fails any change where the changelog and workspace
+  version disagree.
+
+### Added
+- Two new fuzz targets: the Windows HID interface-detail parser (the
+  audit's KEY-020 surface) and the ISO 7816-4 `6C xx` retry classifier,
+  which moved into `keyroost-proto` as `apdu::resend_with_le` to be
+  fuzzable (new public API).
+- Randomized property tests (dev-only, via proptest) over the GUI and CLI
+  fail-closed device-binding guards and the terminal-output sanitizers.
+
+### Changed
+- The Linux bundle workflow can now be re-run out of band, publish.yml
+  style: build-only probes from any branch, and tagged republishes into an
+  existing release with a version guard and `flatpak_only` support.
+- winget now waits for the Token2-signed Windows build and verifies its
+  Authenticode signature before submitting — `winget install` may trail a
+  release by a few days, in exchange for signed bytes and no more
+  release-day races against Defender validation false positives. An
+  expired winget token now fails the job loudly instead of skipping
+  silently.
+
 ## [0.7.5] - 2026-07-14
 
 A security-focused release: every open finding from an external security
@@ -563,7 +616,11 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
   external dependencies are `pcsc`, `clap`, `eframe`/`egui`, `serde`, and
   (for RSA keygen/parsing) `rsa`/`rand`.
 
-[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.7.4...HEAD
+[#80]: https://github.com/framefilter/keyroost/issues/80
+[#81]: https://github.com/framefilter/keyroost/issues/81
+[#82]: https://github.com/framefilter/keyroost/issues/82
+[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.7.6...HEAD
+[0.7.6]: https://github.com/framefilter/keyroost/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/framefilter/keyroost/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/framefilter/keyroost/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/framefilter/keyroost/compare/v0.7.2...v0.7.3
