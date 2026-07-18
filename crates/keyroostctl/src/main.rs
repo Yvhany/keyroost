@@ -3760,6 +3760,13 @@ fn oath_type_str(t: keyroost_oath::OathType) -> &'static str {
 enum OtpTarget {
     HidPath(std::path::PathBuf),
     Reader(String),
+    /// An `auto` pick on a key exposing both interfaces: open USB-HID first,
+    /// fall back to the SAME device's PC/SC reader when the HID open (or its
+    /// applet probe) fails — some firmware answers the HID GET_INFO probe
+    /// with a malformed status word while its CCID side works (#82). Both
+    /// endpoints belong to the one resolved device, so the KEY-003
+    /// never-first-match guarantee is preserved.
+    HidThenReader(std::path::PathBuf, String),
 }
 
 /// Resolve the global `--device` selector to a concrete OTP transport target so
@@ -3806,15 +3813,18 @@ fn resolve_otp_target(
                 format!("device '{name}' has no PC/SC reader for --transport ccid")
             })?),
             OtpTransportArg::Auto => {
-                if let Some(p) = dev.hid_path.clone() {
-                    OtpTarget::HidPath(p)
-                } else if let Some(r) = dev.reader.clone() {
-                    OtpTarget::Reader(r)
-                } else {
-                    return Err(format!(
-                        "device '{name}' exposes no OTP transport (neither USB-HID nor PC/SC)"
-                    )
-                    .into());
+                match (dev.hid_path.clone(), dev.reader.clone()) {
+                    // Both interfaces: HID first, the same key's reader as an
+                    // open-time fallback (#82).
+                    (Some(p), Some(r)) => OtpTarget::HidThenReader(p, r),
+                    (Some(p), None) => OtpTarget::HidPath(p),
+                    (None, Some(r)) => OtpTarget::Reader(r),
+                    (None, None) => {
+                        return Err(format!(
+                            "device '{name}' exposes no OTP transport (neither USB-HID nor PC/SC)"
+                        )
+                        .into());
+                    }
                 }
             }
         };
@@ -3838,6 +3848,21 @@ fn open_otp(
             }
             Some(OtpTarget::Reader(r)) => {
                 keyroost_transport::Token2OtpSession::open_pcsc_reader(&r, debug)?
+            }
+            Some(OtpTarget::HidThenReader(p, r)) => {
+                match keyroost_transport::Token2OtpSession::open_hid_path(&p, debug) {
+                    Ok(s) => s,
+                    Err(hid_err) => {
+                        eprintln!(
+                            "{}",
+                            sanitize_terminal(&format!(
+                                "USB-HID path failed ({hid_err}); trying the same \
+                                 key's smart-card reader\u{2026}"
+                            ))
+                        );
+                        keyroost_transport::Token2OtpSession::open_pcsc_reader(&r, debug)?
+                    }
+                }
             }
             None => unreachable!("a set --device always yields a target or an error"),
         }
@@ -7132,12 +7157,25 @@ mod cli_tests {
             Ok(None)
         ));
 
-        // Named + Auto -> the *selected* device's HID path, never the first.
+        // Named + Auto on a dual-interface key -> the *selected* device's HID
+        // path with ITS OWN reader kept as an open-time fallback (#82: some
+        // firmware botches the HID probe while CCID works), never the first
+        // device on the bus.
         match resolve_otp_target(&devices, Some("keyB"), OtpTransportArg::Auto) {
-            Ok(Some(OtpTarget::HidPath(p))) => {
-                assert_eq!(p, std::path::PathBuf::from("/dev/hidraw1"))
+            Ok(Some(OtpTarget::HidThenReader(p, r))) => {
+                assert_eq!(p, std::path::PathBuf::from("/dev/hidraw1"));
+                assert_eq!(r, "Token2 B 00 00");
             }
-            other => panic!("expected keyB HID path, got {other:?}"),
+            other => panic!("expected keyB HID path + reader fallback, got {other:?}"),
+        }
+
+        // Named + Auto on a HID-only key -> a plain HID target.
+        let hid_only = vec![otp_dev("solo", Some("/dev/hidraw7"), None)];
+        match resolve_otp_target(&hid_only, Some("solo"), OtpTransportArg::Auto) {
+            Ok(Some(OtpTarget::HidPath(p))) => {
+                assert_eq!(p, std::path::PathBuf::from("/dev/hidraw7"))
+            }
+            other => panic!("expected plain HID target, got {other:?}"),
         }
 
         // Named + Ccid -> that device's reader.
@@ -7921,8 +7959,11 @@ mod prop_tests {
             let expected_endpoint = match transport {
                 OtpTransportArg::Hid => only.hid_path.clone().map(|p| (Some(p), None)),
                 OtpTransportArg::Ccid => only.reader.clone().map(|r| (None, Some(r))),
+                // Auto binds every interface the selected device offers:
+                // both → HID first, its own reader as fallback (#82).
                 OtpTransportArg::Auto => match (&only.hid_path, &only.reader) {
-                    (Some(p), _) => Some((Some(p.clone()), None)),
+                    (Some(p), Some(r)) => Some((Some(p.clone()), Some(r.clone()))),
+                    (Some(p), None) => Some((Some(p.clone()), None)),
                     (None, Some(r)) => Some((None, Some(r.clone()))),
                     (None, None) => None,
                 },
@@ -7933,6 +7974,10 @@ mod prop_tests {
                 }
                 (Ok(Some(OtpTarget::Reader(r))), Some((None, Some(exp)))) => {
                     prop_assert_eq!(r, exp)
+                }
+                (Ok(Some(OtpTarget::HidThenReader(p, r))), Some((Some(ep), Some(er)))) => {
+                    prop_assert_eq!(p, ep);
+                    prop_assert_eq!(r, er);
                 }
                 (Err(_), None) => {}
                 (got, exp) => prop_assert!(
