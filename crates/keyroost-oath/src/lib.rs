@@ -390,6 +390,17 @@ pub fn list() -> Vec<u8> {
     build_apdu_get(0x00, Instruction::List.code(), 0x00, 0x00, 0x00)
 }
 
+/// Build the `RESET` APDU (`00 04 DE AD`, case 1 — no body, no Le).
+///
+/// Wipes every credential and clears the access password. Deliberately
+/// requires NO validation first: this is the documented recovery for a
+/// forgotten OATH password on both the Yubico and Trussed applets, and the
+/// fixed `DE AD` P1/P2 pair is the applet's confirm-of-intent. Callers own
+/// the human-facing destructive confirmation.
+pub fn reset() -> Vec<u8> {
+    vec![0x00, Instruction::Reset.code(), 0xDE, 0xAD]
+}
+
 /// Build a `CALCULATE` APDU requesting a truncated OTP for `name`.
 ///
 /// `challenge` is the 8-byte big-endian counter (for TOTP,
@@ -811,6 +822,15 @@ pub fn parse_calculate(buf: &[u8]) -> Result<OtpCode, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RESET is the Yubico/Trussed `00 04 DE AD` case-1 APDU — deliberately
+    /// password-less (it wipes credentials AND the access password; that is
+    /// the recovery path for a forgotten password). The DE AD parameter pair
+    /// is the applet's own confirm-of-intent, not authentication.
+    #[test]
+    fn reset_apdu_is_the_yubico_de_ad_form() {
+        assert_eq!(reset(), vec![0x00, 0x04, 0xDE, 0xAD]);
+    }
 
     // --- Truncation / formatting: RFC 4226 Appendix D --------------------
 

@@ -1258,6 +1258,17 @@ enum OathCmd {
         #[command(flatten)]
         access: OathAccess,
     },
+    /// Factory-reset the OATH applet: wipe ALL authenticator credentials and
+    /// clear the access password. Needs no password — this is the recovery
+    /// path for a forgotten one. Irreversible.
+    Reset {
+        /// Substring of the PC/SC reader name to use (skips auto-detection).
+        #[arg(long)]
+        reader: Option<String>,
+        /// Confirm the wipe. Required: without it the command refuses to run.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Molto2 customer-key selection (Molto2-scoped; was global pre-0.6.0).
@@ -3760,6 +3771,24 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             let mut session = open_oath(access, debug)?;
             session.clear_password()?;
             println!("OATH password cleared.");
+        }
+        OathCmd::Reset { reader, yes } => {
+            if !*yes {
+                return Err("refusing to reset the OATH applet without --yes \
+                            (wipes ALL authenticator credentials and clears the \
+                            access password; this cannot be undone)"
+                    .into());
+            }
+            // Deliberately NOT open_oath(): reset must work on a
+            // password-protected applet whose password is lost — that's its
+            // entire purpose — so no unlock is attempted.
+            let by_name = reader_from_name()?;
+            let name = resolve_oath_reader(reader.as_deref().or(by_name.as_deref()))?;
+            eprintln!("\u{2192} OATH on {}", sanitize_terminal(&name));
+            let mut session = keyroost_transport::OathSession::open(&name)?;
+            session.set_debug(debug);
+            session.factory_reset()?;
+            println!("OATH applet reset: all credentials wiped, access password cleared.");
         }
     }
     Ok(())
@@ -6988,6 +7017,28 @@ mod cli_tests {
         // Global flags decode as themselves.
         let g = parse(&["keyroostctl", "--json", "--debug", "piv", "status"]).unwrap();
         assert!(g.json && g.debug && g.device.is_none());
+    }
+
+    #[test]
+    fn oath_reset_requires_explicit_yes() {
+        // Same decode guarantee as molto/fido reset: --yes must land in the
+        // confirm field, and omitting it must decode to false so the handler
+        // refuses to wipe.
+        match parse(&["keyroostctl", "oath", "reset", "--yes"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Oath {
+                cmd: OathCmd::Reset { yes, .. },
+            }) => assert!(yes),
+            _ => panic!("expected oath reset"),
+        }
+        match parse(&["keyroostctl", "oath", "reset"]).unwrap().command {
+            Some(Cmd::Oath {
+                cmd: OathCmd::Reset { yes, .. },
+            }) => assert!(!yes),
+            _ => panic!("expected oath reset"),
+        }
     }
 
     #[test]

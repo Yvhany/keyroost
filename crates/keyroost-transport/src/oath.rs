@@ -108,6 +108,21 @@ impl OathSession {
         Ok(())
     }
 
+    /// Factory-reset the OATH applet: wipe every credential and clear the
+    /// access password. Deliberately needs NO prior unlock — the applet's
+    /// `RESET` (`00 04 DE AD`) is the documented recovery for a forgotten
+    /// password, so gating it on validation would defeat its purpose (same
+    /// never-hide-the-recovery-action principle as the FIDO reset). The
+    /// destructive confirmation is the caller's job.
+    pub fn factory_reset(&mut self) -> Result<(), TransportError> {
+        let (_, sw) = self.transmit_full(&oath::reset())?;
+        ok_or_apdu("oath reset", sw)?;
+        // The wipe cleared any password; reflect that locally so a follow-up
+        // command in this session doesn't try to validate against stale state.
+        self.select_info.challenge = None;
+        Ok(())
+    }
+
     /// Enable per-APDU stderr tracing.
     pub fn set_debug(&mut self, on: bool) {
         self.debug = on;

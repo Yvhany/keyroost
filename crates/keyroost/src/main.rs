@@ -390,6 +390,11 @@ struct OathState {
     /// unlock a protected applet and re-locked the pane every time).
     /// Cleared on selection change and on a rejected password.
     unlocked_password: Option<zeroize::Zeroizing<String>>,
+    /// Pending applet-reset confirmation, bound to the device it was opened
+    /// for (same KEY-008 posture as `confirm_delete`). Reset works without
+    /// the password by design — it is the recovery for a forgotten one — so
+    /// this is reachable from the locked view too.
+    confirm_reset: Option<DeviceId>,
 }
 
 /// One credential row in the OATH pane: its stored name and the last code we
@@ -4000,6 +4005,80 @@ impl App {
         }
     }
 
+    /// Modal confirmation before factory-resetting the OATH applet. Same
+    /// device binding as the delete confirmation (KEY-008): a stale
+    /// confirmation is dropped, never rendered over the new selection.
+    fn render_oath_reset_confirm(&mut self, ctx: &egui::Context) {
+        let Some(for_device) = self.oath.confirm_reset.clone() else {
+            return;
+        };
+        if !completion_still_valid(Some(&for_device), self.selected_device.as_ref()) {
+            self.oath.confirm_reset = None;
+            return;
+        }
+        let mut decision: Option<bool> = None;
+        egui::Window::new("Reset OATH applet?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    "Permanently wipe EVERY authenticator credential on this key \
+                     and clear its password? This cannot be undone.",
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Reset applet").clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        match decision {
+            Some(true) => {
+                self.oath.confirm_reset = None;
+                self.reset_oath_applet();
+            }
+            Some(false) => self.oath.confirm_reset = None,
+            None => {}
+        }
+    }
+
+    /// Factory-reset the OATH applet on the selected key. Opens WITHOUT
+    /// unlocking — the applet's RESET requires no password (it is the
+    /// recovery path for a forgotten one) — then rebuilds the pane state
+    /// from scratch, which now shows an empty, unprotected applet.
+    fn reset_oath_applet(&mut self) {
+        self.oath.error = None;
+        let Some(reader) = self.selected_oath_reader() else {
+            self.oath.error = Some("no OATH key selected".into());
+            return;
+        };
+        let for_device = self.selected_device.clone();
+        self.spawn_job("Resetting OATH applet\u{2026}", move || {
+            let result = (|| -> Result<(), TransportError> {
+                let mut session = keyroost_transport::OathSession::open(&reader)?;
+                session.factory_reset()
+            })();
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        // Fresh state: the applet is now empty and unprotected;
+                        // clearing oath_tried lets the pane re-list on its own.
+                        app.oath = OathState::default();
+                        app.oath_tried = false;
+                    }
+                    Err(e) => app.oath.error = Some(format!("reset failed: {e}")),
+                }
+            })
+        });
+    }
+
     /// Reset confirmation: wiping a key is irreversible, so require the user to
     /// type `reset` before the button activates, then a physical touch.
     fn render_reset_dialog(&mut self, ctx: &egui::Context) {
@@ -6682,6 +6761,7 @@ impl eframe::App for App {
             self.delete_fingerprint(id);
         }
         self.render_oath_delete_confirm(ctx);
+        self.render_oath_reset_confirm(ctx);
         self.render_oath_add_modal(ctx, &p);
         self.render_openpgp_cred_modal(ctx, &p);
         self.render_piv_confirms(ctx);
@@ -10768,6 +10848,11 @@ impl App {
                     }
                 });
             });
+            // Forgotten the password? Reset is the documented recovery and
+            // needs no password — it must stay reachable from the locked
+            // view, not hide behind the unlock it exists to replace.
+            ui.add_space(14.0);
+            self.render_oath_reset_card(ui, p);
             return;
         }
         if !self.oath.loaded {
@@ -10802,6 +10887,10 @@ impl App {
                         .color(p.txt3),
                 );
             }
+            // An empty applet can still carry a password; keep the reset
+            // reachable so it can be cleared.
+            ui.add_space(14.0);
+            self.render_oath_reset_card(ui, p);
             return;
         }
 
@@ -10854,6 +10943,49 @@ impl App {
         }
         if let Some(name) = read {
             self.read_hotp_code(&name);
+        }
+
+        // Danger card at the bottom of the pane, mirroring the FIDO2 /
+        // OpenPGP / PIV reset cards.
+        ui.add_space(14.0);
+        self.render_oath_reset_card(ui, p);
+    }
+
+    /// The destructive "Reset applet" card for the OATH pane (red stroke;
+    /// arms the device-bound confirmation modal). Rendered at the bottom of
+    /// the unlocked pane AND under the locked view's password prompt — the
+    /// applet's RESET needs no password and is the documented recovery for a
+    /// forgotten one, so it must never hide behind the unlock (the same
+    /// principle as the standalone FIDO reset card, 0.7.6).
+    fn render_oath_reset_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let mut arm = false;
+        theme::card_frame(p)
+            .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Reset applet")
+                            .font(theme::f_sb(14.5))
+                            .color(p.err),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}").clicked() {
+                            arm = true;
+                        }
+                    });
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Wipes every authenticator credential and clears the password. \
+                         Works without the password — this is the recovery for a \
+                         forgotten one. Cannot be undone.",
+                    )
+                    .font(theme::f_reg(12.5))
+                    .color(p.txt2),
+                );
+            });
+        if arm {
+            self.oath.confirm_reset = self.selected_device.clone();
         }
     }
 
