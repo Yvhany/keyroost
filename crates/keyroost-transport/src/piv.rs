@@ -12,6 +12,16 @@
 use crate::TransportError;
 use keyroost_piv as piv;
 use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchPolicy};
+
+/// Whether MOVE KEY is available given the reported firmware `(major, minor, _)`.
+/// fw 5.7+ (Yubico). Unknown version → allow the attempt; the card refuses if
+/// it truly can't (belt-and-suspenders with the pre-check).
+fn move_key_supported(version: Option<(u8, u8, u8)>) -> bool {
+    match version {
+        Some((major, minor, _)) => major > 5 || (major == 5 && minor >= 7),
+        None => true,
+    }
+}
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
 use zeroize::Zeroizing;
 
@@ -432,6 +442,43 @@ impl PivSession {
         Ok(der)
     }
 
+    /// Relocate a slot's private key to another slot (Yubico MOVE KEY). Refuses
+    /// a same-slot move, firmware below 5.7, and an occupied destination
+    /// (GET METADATA pre-check — the card also refuses, this gives a clear error
+    /// first). Moves ONLY the key; the source slot's certificate stays put.
+    /// Requires prior management-key auth ([`authenticate_management`]), same
+    /// as [`delete_key`].
+    ///
+    /// [`authenticate_management`]: PivSession::authenticate_management
+    /// [`delete_key`]: PivSession::delete_key
+    pub fn move_key(&mut self, src: Slot, dest: Slot) -> Result<(), TransportError> {
+        if src.key_ref() == dest.key_ref() {
+            return Err(TransportError::MalformedResponse(
+                "source and destination slots are the same",
+            ));
+        }
+        if !move_key_supported(self.version()) {
+            return Err(TransportError::PivFirmwareTooOld(
+                "moving a key requires YubiKey firmware 5.7 or newer",
+            ));
+        }
+        if self.slot_has_key(dest)? {
+            return Err(TransportError::PivDestinationOccupied(dest));
+        }
+        let (_, sw) = self.transmit_full(&piv::move_key(src, dest))?;
+        ok_or_write("piv move key", sw)
+    }
+
+    /// Whether `slot` holds a private key, via GET METADATA. Works for retired
+    /// slots too — it just reads whatever key reference `slot` maps to. This is
+    /// the on-demand occupancy check (not part of [`status`]'s snapshot, which
+    /// stays 4 GET DATA calls rather than 24 by never touching retired slots).
+    ///
+    /// [`status`]: PivSession::status
+    pub fn slot_has_key(&mut self, slot: Slot) -> Result<bool, TransportError> {
+        Ok(self.metadata(slot.key_ref()).is_some())
+    }
+
     /// Reset the PIV application to factory defaults. Only succeeds when **both**
     /// the PIN and PUK are blocked (the card enforces this); otherwise the card
     /// returns `6983` and this maps to [`TransportError::PivResetNotAllowed`].
@@ -647,5 +694,21 @@ fn block_crypt(
             let c = aes::Aes256::new_from_slice(key).map_err(bad)?;
             Ok(run(&c, data, op, 16))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::move_key_supported;
+
+    #[test]
+    fn move_key_firmware_gate() {
+        // MOVE KEY needs fw 5.7+. Below that -> refuse.
+        assert!(!move_key_supported(Some((5, 6, 0))));
+        assert!(move_key_supported(Some((5, 7, 0))));
+        assert!(move_key_supported(Some((5, 7, 4))));
+        assert!(move_key_supported(Some((6, 0, 0))));
+        // Unknown version -> allow the attempt (card will reject if unsupported).
+        assert!(move_key_supported(None));
     }
 }

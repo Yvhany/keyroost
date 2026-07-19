@@ -114,6 +114,9 @@ pub enum TransportError {
     /// A PIV operation needs a newer firmware than the card reports. Carries the
     /// human-readable operation that was attempted.
     PivFirmwareTooOld(&'static str),
+    /// A PIV MOVE KEY refused because the destination slot already holds a key
+    /// (GET METADATA pre-check, ahead of the card's own refusal).
+    PivDestinationOccupied(keyroost_piv::Slot),
     /// The host operating system's random-number source failed; a security
     /// handshake that needs an unpredictable challenge was aborted.
     HostRngFailed,
@@ -230,6 +233,11 @@ impl fmt::Display for TransportError {
             TransportError::PivFirmwareTooOld(op) => {
                 write!(f, "{}", op)
             }
+            TransportError::PivDestinationOccupied(slot) => write!(
+                f,
+                "slot {} already holds a key — delete it first or pick an empty slot",
+                slot.label()
+            ),
             TransportError::HostRngFailed => {
                 write!(f, "the host OS random-number source failed")
             }
