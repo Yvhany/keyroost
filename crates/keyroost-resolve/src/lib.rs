@@ -16,7 +16,10 @@ use keyroost_keyring::{ConnectedKey, IdSource};
 use keyroost_transport::YubiKeyCcid;
 
 pub mod device;
-pub use device::{correlate, enumerate, Caps, Device, DeviceId, DeviceKind};
+pub use device::{
+    correlate, enumerate, factory_reset_plan, Caps, Device, DeviceId, DeviceKind, ResetStep,
+    StepOutcome, StepReport,
+};
 
 /// USB vendor ID for Yubico keys, which expose no USB `iSerialNumber`.
 pub const VID_YUBICO: u16 = 0x1050;

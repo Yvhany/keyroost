@@ -3844,7 +3844,7 @@ fn run_factory_reset(
     yes: bool,
     debug: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use keyroost_resolve::device::{factory_reset_plan, ResetStep, StepOutcome, StepReport};
+    use keyroost_resolve::{factory_reset_plan, ResetStep, StepOutcome, StepReport};
 
     if !yes {
         return Err(
@@ -3922,11 +3922,11 @@ fn run_factory_reset(
 /// Run one card-applet reset step, mapping its result to a StepOutcome so a
 /// single failure is recorded, not propagated (continue-on-error).
 fn reset_one_card_applet(
-    step: keyroost_resolve::device::ResetStep,
+    step: keyroost_resolve::ResetStep,
     reader: Option<&str>,
     debug: bool,
-) -> keyroost_resolve::device::StepOutcome {
-    use keyroost_resolve::device::{ResetStep, StepOutcome};
+) -> keyroost_resolve::StepOutcome {
+    use keyroost_resolve::{ResetStep, StepOutcome};
     let run = || -> Result<(), Box<dyn std::error::Error>> {
         match step {
             ResetStep::Oath => {
