@@ -275,6 +275,9 @@ curl -L https://github.com/framefilter/keyroost/releases/latest/download/keyroos
   | tar xz   # then move keyroostctl / keyroost onto your PATH
 ```
 
+The prebuilt binaries need `libpcsclite` at runtime — on a FIDO-only machine install it
+(`apt install libpcsclite1` / `dnf install pcsc-lite`) or use a package that declares the dependency.
+
 ### cargo (from source)
 
 Needs the Rust toolchain (and, on Linux, the PC/SC dev package — see
@@ -503,6 +506,9 @@ keyroostctl prog config --algorithm sha1 --time-step 30 --display-timeout 30
 keyroostctl otp list
 keyroostctl otp add GitHub me@x.com --seed-stdin    # base32 seed from stdin, never argv
 keyroostctl otp get GitHub me@x.com
+
+# --- Destructive operations ---
+keyroostctl factory-reset --device <name> --yes    # reset all applets on a key
 
 # name a key to target it when several are plugged in (opt-in)
 keyroostctl key-name list

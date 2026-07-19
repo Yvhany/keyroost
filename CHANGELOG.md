@@ -17,6 +17,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   certificate a tool like `fido2-token` stored in a resident SSH credential's
   largeBlob and writes it as a standard `-cert.pub` file — so the cert travels
   with the key. Read/extract only; PIN required, no touch.
+- **Factory reset (all applets):** one action — `keyroostctl factory-reset`
+  and a card on the GUI device Overview tab — resets every resettable applet
+  on a key (OATH, OpenPGP, PIV, Token2 OTP, then FIDO2). Uses only
+  manufacturer-intended resets; the key stays fully usable. Per-applet resets
+  remain available individually.
 
 ## [0.7.6] - 2026-07-17
 

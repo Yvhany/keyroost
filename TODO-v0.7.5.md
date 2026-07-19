@@ -187,6 +187,12 @@ anything big on top:
       key, reset from the GUI locked view and via `keyroostctl oath reset
       --yes`; confirm credentials wiped, password cleared, and the pane
       re-lists empty and unlocked.
+- [ ] **Factory reset (all applets), flagship (v0.7.7):** one full run on a
+      disposable multi-applet test key — confirm each applet's reset fires in
+      order, the PIV PIN+PUK retry burn completes and RESET succeeds, the FIDO
+      replug+touch finale works, and the per-step summary matches reality
+      (including a deliberately-induced mid-sequence failure showing
+      continue-on-error).
 - [ ] **v0.7.6 field fixes:** Settings tab + Reset on a CTAP 2.0-only key
       (#81 — reporter's device class), and the standalone Reset card on a
       key with a blocked/absent PIN. (#82's HID→CCID fallback only engages
