@@ -937,6 +937,7 @@ enum PivCredKind {
     ChangeMgmtKey,
     DeleteCert,
     DeleteKey,
+    MoveKey,
 }
 
 impl PivCredKind {
@@ -954,6 +955,7 @@ impl PivCredKind {
             PivCredKind::ChangeMgmtKey => "Change management key",
             PivCredKind::DeleteCert => "Delete certificate",
             PivCredKind::DeleteKey => "Delete key",
+            PivCredKind::MoveKey => "Move key",
         }
     }
     /// Label for the modal's primary Submit button. Shorter than the title for
@@ -968,6 +970,7 @@ impl PivCredKind {
             PivCredKind::ChangeMgmtKey => "Change key",
             PivCredKind::DeleteCert => "Delete",
             PivCredKind::DeleteKey => "Delete",
+            PivCredKind::MoveKey => "Move",
             _ => self.title(),
         }
     }
@@ -986,6 +989,7 @@ impl PivCredKind {
             PivCredKind::ChangeMgmtKey => "Changing management key\u{2026}",
             PivCredKind::DeleteCert => "Deleting certificate\u{2026}",
             PivCredKind::DeleteKey => "Deleting key\u{2026}",
+            PivCredKind::MoveKey => "Moving key\u{2026}",
         }
     }
     /// True when this flow collects the *current* management key (and therefore
@@ -1000,6 +1004,7 @@ impl PivCredKind {
                 | PivCredKind::ChangeMgmtKey
                 | PivCredKind::DeleteCert
                 | PivCredKind::DeleteKey
+                | PivCredKind::MoveKey
         )
     }
 }
@@ -1097,6 +1102,15 @@ struct PivState {
     /// The PIN/PUK secret fields above render *inside* this modal, not inline in
     /// the pane, so the entry and its result stay on-screen (issue #31).
     cred_modal: Option<PivCredModal>,
+    /// Chosen destination slot for the Move-key flow (empty until the user picks
+    /// one in the modal's destination combo). Reset when the modal closes.
+    move_dest: Option<keyroost_piv::Slot>,
+    /// Whether the collapsible "Retired slots" section is expanded.
+    retired_expanded: bool,
+    /// Lazily-read occupancy of the 20 retired slots (`slot -> has_key`), cached
+    /// so expanding the section only probes the card once. `None` until read;
+    /// invalidated after a move so the section re-reads on its next expand.
+    retired_occupancy: Option<Vec<(keyroost_piv::Slot, bool)>>,
 }
 
 // The pane is replaced wholesale on device switch (`self.piv =
@@ -1154,6 +1168,9 @@ impl Default for PivState {
             csr_path: String::new(),
             confirm_reset: None,
             cred_modal: None,
+            move_dest: None,
+            retired_expanded: false,
+            retired_occupancy: None,
         }
     }
 }
@@ -1166,6 +1183,9 @@ enum PivSlotSel {
     Sign,
     KeyMgmt,
     CardAuth,
+    /// A Yubico retired key-management slot (n = 1..=20), selectable from the
+    /// collapsible "Retired slots" section.
+    Retired(u8),
 }
 
 impl PivSlotSel {
@@ -1175,6 +1195,7 @@ impl PivSlotSel {
             PivSlotSel::Sign => keyroost_piv::Slot::Signature,
             PivSlotSel::KeyMgmt => keyroost_piv::Slot::KeyManagement,
             PivSlotSel::CardAuth => keyroost_piv::Slot::CardAuthentication,
+            PivSlotSel::Retired(n) => keyroost_piv::Slot::Retired(n),
         }
     }
     fn label(self) -> String {
@@ -5569,6 +5590,78 @@ impl App {
         });
     }
 
+    /// Relocate the selected slot's private key to the chosen destination slot
+    /// (Yubico MOVE KEY). Mirrors `piv_delete_key`: management-key auth, then the
+    /// move, then a status re-read. The source slot's certificate stays put.
+    fn piv_move_key(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let mgmt = match self.piv_current_mgmt_key() {
+            Ok(b) => b,
+            Err(e) => {
+                self.piv.error = Some(e);
+                return;
+            }
+        };
+        let src = self.piv.selected_slot.to_slot();
+        let Some(dest) = self.piv.move_dest else {
+            self.piv.error = Some("choose a destination slot".into());
+            return;
+        };
+        self.piv.notice = None;
+        self.spawn_job("Moving key\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
+                let mut s = keyroost_transport::PivSession::open(&name)?;
+                let mgmt_alg = s.management_key_algorithm();
+                s.authenticate_management(mgmt_alg, &mgmt)?;
+                s.move_key(src, dest)?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                wipe(&mut app.piv.mgmt_key_input);
+                Self::apply_piv_write(
+                    app,
+                    result,
+                    format!("Key moved from {} to {}.", src.label(), dest.label()),
+                );
+                // Retired occupancy changed (source and/or destination); drop the
+                // cache and collapse the section so it re-reads on the next open.
+                app.piv.retired_occupancy = None;
+                app.piv.retired_expanded = false;
+                Self::apply_piv_cred_result(app);
+            })
+        });
+    }
+
+    /// Lazily read which of the 20 retired slots hold a key (GET METADATA each),
+    /// caching the result in `PivState::retired_occupancy`. Triggered once when
+    /// the "Retired slots" section is expanded (or the move modal opens) rather
+    /// than on every status refresh, keeping the common path to 4 slot reads.
+    fn load_piv_retired_occupancy(&mut self) {
+        let Some(reader) = self.selected_oath_reader() else {
+            return;
+        };
+        let for_device = self.selected_device.clone();
+        self.spawn_job("Reading retired slots\u{2026}", move || {
+            let result = keyroost_transport::PivSession::open(&reader).map(|mut s| {
+                keyroost_piv::Slot::retired_all()
+                    .into_iter()
+                    .map(|slot| (slot, s.slot_has_key(slot).unwrap_or(false)))
+                    .collect::<Vec<_>>()
+            });
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // selection changed mid-read; discard
+                }
+                match result {
+                    Ok(v) => app.piv.retired_occupancy = Some(v),
+                    Err(e) => app.piv.error = Some(e.to_string()),
+                }
+            })
+        });
+    }
+
     /// Normalize the certificate-subject field: a bare name becomes `CN=name`;
     /// anything containing `=` is taken as a full distinguished name.
     fn piv_subject(&self) -> Option<String> {
@@ -6034,7 +6127,8 @@ fn piv_cred_mismatch(piv: &PivState, kind: PivCredKind) -> Option<&'static str> 
         | PivCredKind::SetRetries
         | PivCredKind::ChangeMgmtKey
         | PivCredKind::DeleteCert
-        | PivCredKind::DeleteKey => return None,
+        | PivCredKind::DeleteKey
+        | PivCredKind::MoveKey => return None,
     };
     if confirm.is_empty() || new == confirm {
         None
@@ -6060,7 +6154,21 @@ fn piv_cred_success(kind: PivCredKind) -> &'static str {
         PivCredKind::ChangeMgmtKey => "Management key changed",
         PivCredKind::DeleteCert => "Certificate deleted",
         PivCredKind::DeleteKey => "Key deleted",
+        PivCredKind::MoveKey => "Key moved",
     }
+}
+
+/// Slots a key may be moved to: every standard + retired slot that is empty
+/// and is not the source. `occupied(slot)` reports current key presence.
+fn move_key_eligible_destinations(
+    src: keyroost_piv::Slot,
+    occupied: &dyn Fn(keyroost_piv::Slot) -> bool,
+) -> Vec<keyroost_piv::Slot> {
+    keyroost_piv::Slot::all()
+        .into_iter()
+        .chain(keyroost_piv::Slot::retired_all())
+        .filter(|&s| s != src && !occupied(s))
+        .collect()
 }
 
 fn pin_field(ui: &mut egui::Ui, p: &Palette, label: &str, buf: &mut String) {
@@ -10336,6 +10444,35 @@ impl App {
         // the modal's error line; blocks Submit when set.
         let mismatch = piv_cred_mismatch(&self.piv, kind);
 
+        // Move-key flow: precompute the source slot and the eligible destination
+        // slots (empty, non-source) before the modal borrows `self` mutably. A
+        // standard slot is occupied when its `slot_keys` entry carries a key
+        // algorithm; a retired slot's occupancy comes from the lazily-read cache
+        // (unknown → treated as empty; the transport re-checks and refuses an
+        // occupied destination, so a stale cache can't cause a bad move).
+        let move_src = self.piv.selected_slot.to_slot();
+        let move_dests: Vec<keyroost_piv::Slot> = if kind == PivCredKind::MoveKey {
+            let piv = &self.piv;
+            let occupied = |s: keyroost_piv::Slot| -> bool {
+                if matches!(s, keyroost_piv::Slot::Retired(_)) {
+                    piv.retired_occupancy
+                        .as_ref()
+                        .and_then(|v| v.iter().find(|(rs, _)| *rs == s))
+                        .map(|(_, has)| *has)
+                        .unwrap_or(false)
+                } else {
+                    piv.slot_keys
+                        .iter()
+                        .find(|(sl, _, _)| *sl == s)
+                        .map(|(_, alg, _)| alg.is_some())
+                        .unwrap_or(false)
+                }
+            };
+            move_key_eligible_destinations(move_src, &occupied)
+        } else {
+            Vec::new()
+        };
+
         let closed = Self::modal_window(ctx, p, "piv_cred", kind.title(), |ui| {
             match &result {
                 Some(Ok(())) => {
@@ -10450,6 +10587,49 @@ impl App {
                                  YubiKey 5.7 or newer.",
                             );
                         }
+                        PivCredKind::MoveKey => {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Move the key in {} to another slot.",
+                                    move_src.label()
+                                ))
+                                .font(theme::f_reg(12.5))
+                                .color(p.txt2),
+                            );
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Destination")
+                                        .font(theme::f_reg(13.0))
+                                        .color(p.txt2),
+                                );
+                                ui.add_space(8.0);
+                                let sel_text = self
+                                    .piv
+                                    .move_dest
+                                    .map(|d| d.label())
+                                    .unwrap_or_else(|| "Choose a slot\u{2026}".to_string());
+                                egui::ComboBox::from_id_salt("piv-move-dest")
+                                    .selected_text(sel_text)
+                                    .show_ui(ui, |ui| {
+                                        for dest in &move_dests {
+                                            ui.selectable_value(
+                                                &mut self.piv.move_dest,
+                                                Some(*dest),
+                                                dest.label(),
+                                            );
+                                        }
+                                    });
+                            });
+                            ui.add_space(6.0);
+                            self.piv_modal_mgmt_field(ui, p, kind);
+                            card_note(
+                                ui,
+                                p,
+                                "Moves only the key; the certificate stays in the \
+                                 source slot. Needs YubiKey 5.7 or newer.",
+                            );
+                        }
                     }
 
                     // Inline error/result line: the new==confirm mismatch, then
@@ -10517,6 +10697,7 @@ impl App {
                 PivCredKind::ChangeMgmtKey => self.piv_change_management_key(),
                 PivCredKind::DeleteCert => self.piv_delete_cert(),
                 PivCredKind::DeleteKey => self.piv_delete_key(),
+                PivCredKind::MoveKey => self.piv_move_key(),
             }
             // If the op didn't actually queue, unstick the modal. This happens
             // either because the worker was busy (no error set — just retry on
@@ -10553,6 +10734,7 @@ impl App {
         wipe(&mut self.piv.sign_pin);
         wipe(&mut self.piv.retries_pin_auth);
         self.piv.use_default_mgmt = false;
+        self.piv.move_dest = None;
         self.piv.cred_modal = None;
     }
 
@@ -11359,6 +11541,8 @@ impl App {
         let mut open_change_mgmt = false;
         let mut open_delete_cert = false;
         let mut open_delete_key = false;
+        let mut open_move_key = false;
+        let mut toggle_retired = false;
         let mut arm_reset = false;
         let mut copy_pem: Option<String> = None;
         // Slot the user clicked in the status card this frame (applied after the
@@ -11542,6 +11726,27 @@ impl App {
             }
             s
         };
+        // Whether the active slot holds a private key — gates the Move button
+        // (and Move source). Standard slots read from `slot_keys`; a retired slot
+        // reads from the lazily-populated occupancy cache.
+        let selected_has_key = match selected {
+            PivSlotSel::Retired(n) => self
+                .piv
+                .retired_occupancy
+                .as_ref()
+                .and_then(|v| v.iter().find(|(s, _)| *s == keyroost_piv::Slot::Retired(n)))
+                .map(|(_, has)| *has)
+                .unwrap_or(false),
+            _ => {
+                let sel_slot = selected.to_slot();
+                self.piv
+                    .slot_keys
+                    .iter()
+                    .find(|(s, _, _)| *s == sel_slot)
+                    .map(|(_, a, _)| a.is_some())
+                    .unwrap_or(false)
+            }
+        };
         // Key deletion (Yubico MOVE/DELETE KEY) needs firmware 5.7+. The
         // transport version-gates as a backstop; here we hide the button (and
         // explain) when the loaded status reports an older — or unknown —
@@ -11599,6 +11804,83 @@ impl App {
                 }
             }
         });
+        // --- Retired slots (collapsible) -----------------------------------
+        // Yubico firmware 5.7+ exposes 20 retired key-management slots. They're
+        // read lazily (they matter mainly as a move destination / archive), so
+        // they sit behind a collapsing header rather than in the tab strip.
+        ui.add_space(10.0);
+        {
+            let expanded = self.piv.retired_expanded;
+            let caret = if expanded { "\u{25BE}" } else { "\u{25B8}" };
+            let hdr = ui
+                .add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("{caret} Retired slots"))
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt2),
+                    )
+                    .sense(egui::Sense::click()),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if hdr.clicked() {
+                toggle_retired = true;
+            }
+            if expanded {
+                ui.add_space(6.0);
+                match self.piv.retired_occupancy.clone() {
+                    Some(occ) => {
+                        // While the move modal is up, show empty slots too so the
+                        // full retired map is visible; otherwise only the occupied
+                        // (selectable) slots appear.
+                        let move_open = matches!(
+                            self.piv.cred_modal.as_ref().map(|m| m.kind),
+                            Some(PivCredKind::MoveKey)
+                        );
+                        if !occ.iter().any(|(_, has)| *has) && !move_open {
+                            note(ui, "No retired slots hold a key.");
+                        }
+                        for (slot, has_key) in occ {
+                            if !has_key && !move_open {
+                                continue;
+                            }
+                            let keyroost_piv::Slot::Retired(n) = slot else {
+                                continue;
+                            };
+                            let sel_variant = PivSlotSel::Retired(n);
+                            let active = selected == sel_variant;
+                            let color = if active {
+                                p.txt
+                            } else if has_key {
+                                p.txt2
+                            } else {
+                                p.txt3
+                            };
+                            let text = if has_key {
+                                slot.label()
+                            } else {
+                                format!("{} \u{00B7} empty", slot.label())
+                            };
+                            let resp = ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(text)
+                                        .font(theme::f_reg(12.5))
+                                        .color(color),
+                                )
+                                .sense(egui::Sense::click()),
+                            );
+                            if has_key
+                                && resp
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .clicked()
+                            {
+                                clicked_slot = Some(sel_variant);
+                            }
+                        }
+                    }
+                    None => note(ui, "Reading retired slots\u{2026}"),
+                }
+            }
+        }
         // --- Selected slot content (single column under the strip) ----------
         // State line for the active slot, then the styled full-width action
         // cards (unchanged from the old detail column) in single-column flow.
@@ -11811,6 +12093,14 @@ impl App {
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "piv-delete");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Move key: relocate the slot's key to an empty slot. Needs
+                    // 5.7+ (same gate as delete) and a key in the active slot.
+                    if can_delete_key && selected_has_key {
+                        if theme::button(ui, p, BtnKind::Default, "Move key\u{2026}").clicked() {
+                            open_move_key = true;
+                        }
+                        ui.add_space(6.0);
+                    }
                     if can_delete_key {
                         if theme::button(ui, p, BtnKind::Danger, "Delete key\u{2026}").clicked() {
                             open_delete_key = true;
@@ -11923,6 +12213,21 @@ impl App {
         if open_delete_key {
             self.piv_cred_modal_close();
             self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::DeleteKey));
+        }
+        if open_move_key {
+            self.piv_cred_modal_close();
+            self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::MoveKey));
+            // Populate retired occupancy so the destination combo can exclude
+            // occupied retired slots (the transport re-checks regardless).
+            if self.piv.retired_occupancy.is_none() {
+                self.load_piv_retired_occupancy();
+            }
+        }
+        if toggle_retired {
+            self.piv.retired_expanded = !self.piv.retired_expanded;
+            if self.piv.retired_expanded && self.piv.retired_occupancy.is_none() {
+                self.load_piv_retired_occupancy();
+            }
         }
         if arm_reset {
             self.piv.confirm_reset = Some(String::new());
@@ -13409,6 +13714,8 @@ mod tests {
         // Slot deletion is authorized by the management key (like generate).
         assert!(PivCredKind::DeleteCert.needs_mgmt_key());
         assert!(PivCredKind::DeleteKey.needs_mgmt_key());
+        // Moving a key is authorized by the management key too.
+        assert!(PivCredKind::MoveKey.needs_mgmt_key());
         // CSR signs with the PIN only — no management key.
         assert!(!PivCredKind::RequestCsr.needs_mgmt_key());
         // PIN/PUK flows never collect a management key.
@@ -13430,6 +13737,7 @@ mod tests {
             PivCredKind::ChangeMgmtKey,
             PivCredKind::DeleteCert,
             PivCredKind::DeleteKey,
+            PivCredKind::MoveKey,
         ];
         for k in kinds {
             assert!(!k.title().is_empty());
@@ -13443,6 +13751,23 @@ mod tests {
         for k in kinds {
             assert_eq!(piv_cred_mismatch(&piv, k), None);
         }
+    }
+
+    /// Given occupancy (slot -> has_key), the eligible move destinations are the
+    /// empty slots that aren't the source — across standard *and* retired slots.
+    #[test]
+    fn move_key_destinations_exclude_occupied_and_source() {
+        let occupied = |s: keyroost_piv::Slot| {
+            s == keyroost_piv::Slot::Authentication // 9A occupied
+                || s == keyroost_piv::Slot::retired(1).unwrap()
+        };
+        let src = keyroost_piv::Slot::KeyManagement;
+        let dests = move_key_eligible_destinations(src, &occupied);
+        assert!(!dests.contains(&src));
+        assert!(!dests.contains(&keyroost_piv::Slot::Authentication)); // occupied
+        assert!(!dests.contains(&keyroost_piv::Slot::retired(1).unwrap()));
+        assert!(dests.contains(&keyroost_piv::Slot::retired(2).unwrap())); // empty
+        assert!(dests.contains(&keyroost_piv::Slot::Signature)); // empty standard
     }
 
     /// The standard PIV factory default is 24 bytes of `01..08` ×3; Token2 PIN+
