@@ -469,6 +469,66 @@ enum CliPivSlot {
     /// 9E — Card Authentication.
     #[value(name = "9e")]
     CardAuth,
+    /// 82 — Retired key 1.
+    #[value(name = "82")]
+    Retired1,
+    /// 83 — Retired key 2.
+    #[value(name = "83")]
+    Retired2,
+    /// 84 — Retired key 3.
+    #[value(name = "84")]
+    Retired3,
+    /// 85 — Retired key 4.
+    #[value(name = "85")]
+    Retired4,
+    /// 86 — Retired key 5.
+    #[value(name = "86")]
+    Retired5,
+    /// 87 — Retired key 6.
+    #[value(name = "87")]
+    Retired6,
+    /// 88 — Retired key 7.
+    #[value(name = "88")]
+    Retired7,
+    /// 89 — Retired key 8.
+    #[value(name = "89")]
+    Retired8,
+    /// 8A — Retired key 9.
+    #[value(name = "8a")]
+    Retired9,
+    /// 8B — Retired key 10.
+    #[value(name = "8b")]
+    Retired10,
+    /// 8C — Retired key 11.
+    #[value(name = "8c")]
+    Retired11,
+    /// 8D — Retired key 12.
+    #[value(name = "8d")]
+    Retired12,
+    /// 8E — Retired key 13.
+    #[value(name = "8e")]
+    Retired13,
+    /// 8F — Retired key 14.
+    #[value(name = "8f")]
+    Retired14,
+    /// 90 — Retired key 15.
+    #[value(name = "90")]
+    Retired15,
+    /// 91 — Retired key 16.
+    #[value(name = "91")]
+    Retired16,
+    /// 92 — Retired key 17.
+    #[value(name = "92")]
+    Retired17,
+    /// 93 — Retired key 18.
+    #[value(name = "93")]
+    Retired18,
+    /// 94 — Retired key 19.
+    #[value(name = "94")]
+    Retired19,
+    /// 95 — Retired key 20.
+    #[value(name = "95")]
+    Retired20,
 }
 
 impl CliPivSlot {
@@ -478,6 +538,26 @@ impl CliPivSlot {
             CliPivSlot::Sign => keyroost_piv::Slot::Signature,
             CliPivSlot::KeyMgmt => keyroost_piv::Slot::KeyManagement,
             CliPivSlot::CardAuth => keyroost_piv::Slot::CardAuthentication,
+            CliPivSlot::Retired1 => keyroost_piv::Slot::retired(1).unwrap(),
+            CliPivSlot::Retired2 => keyroost_piv::Slot::retired(2).unwrap(),
+            CliPivSlot::Retired3 => keyroost_piv::Slot::retired(3).unwrap(),
+            CliPivSlot::Retired4 => keyroost_piv::Slot::retired(4).unwrap(),
+            CliPivSlot::Retired5 => keyroost_piv::Slot::retired(5).unwrap(),
+            CliPivSlot::Retired6 => keyroost_piv::Slot::retired(6).unwrap(),
+            CliPivSlot::Retired7 => keyroost_piv::Slot::retired(7).unwrap(),
+            CliPivSlot::Retired8 => keyroost_piv::Slot::retired(8).unwrap(),
+            CliPivSlot::Retired9 => keyroost_piv::Slot::retired(9).unwrap(),
+            CliPivSlot::Retired10 => keyroost_piv::Slot::retired(10).unwrap(),
+            CliPivSlot::Retired11 => keyroost_piv::Slot::retired(11).unwrap(),
+            CliPivSlot::Retired12 => keyroost_piv::Slot::retired(12).unwrap(),
+            CliPivSlot::Retired13 => keyroost_piv::Slot::retired(13).unwrap(),
+            CliPivSlot::Retired14 => keyroost_piv::Slot::retired(14).unwrap(),
+            CliPivSlot::Retired15 => keyroost_piv::Slot::retired(15).unwrap(),
+            CliPivSlot::Retired16 => keyroost_piv::Slot::retired(16).unwrap(),
+            CliPivSlot::Retired17 => keyroost_piv::Slot::retired(17).unwrap(),
+            CliPivSlot::Retired18 => keyroost_piv::Slot::retired(18).unwrap(),
+            CliPivSlot::Retired19 => keyroost_piv::Slot::retired(19).unwrap(),
+            CliPivSlot::Retired20 => keyroost_piv::Slot::retired(20).unwrap(),
         }
     }
 }
@@ -791,6 +871,24 @@ enum PivCmd {
         mgmt_key_stdin: bool,
         #[arg(long)]
         yes: bool,
+    },
+    /// Move a slot's private key to another slot (Yubico MOVE KEY, fw 5.7+).
+    /// Non-destructive; refuses an occupied destination. The certificate stays
+    /// in the source slot.
+    MoveKey {
+        /// Source slot (9a/9c/9d/9e/82–95).
+        #[arg(long)]
+        from: CliPivSlot,
+        /// Destination slot (must be empty).
+        #[arg(long)]
+        to: CliPivSlot,
+        /// PC/SC reader substring (skips auto-detection).
+        #[arg(long)]
+        reader: Option<String>,
+        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        mgmt_key_env: Option<String>,
+        #[arg(long)]
+        mgmt_key_stdin: bool,
     },
 }
 
@@ -5026,6 +5124,24 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 slot.to_slot().label()
             );
         }
+
+        PivCmd::MoveKey {
+            from,
+            to,
+            reader,
+            mgmt_key_env,
+            mgmt_key_stdin,
+        } => {
+            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
+            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
+            s.move_key(from.to_slot(), to.to_slot())?;
+            println!(
+                "moved the private key {} \u{2192} {}; the certificate remains in {}",
+                from.to_slot().label(),
+                to.to_slot().label(),
+                from.to_slot().label()
+            );
+        }
     }
     Ok(())
 }
@@ -7445,6 +7561,30 @@ mod cli_tests {
         assert!(parse(&["keyroostctl", "--json", "molto", "info"]).is_ok());
         // Position-insensitive: --json after the subcommand also works (global).
         assert!(parse(&["keyroostctl", "piv", "status", "--json"]).is_ok());
+    }
+
+    #[test]
+    fn piv_move_key_parses_standard_and_retired_slots() {
+        match parse(&[
+            "keyroostctl",
+            "piv",
+            "move-key",
+            "--from",
+            "9d",
+            "--to",
+            "82",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Piv {
+                cmd: PivCmd::MoveKey { from, to, .. },
+            }) => {
+                assert_eq!(from.to_slot().key_ref(), 0x9D);
+                assert_eq!(to.to_slot().key_ref(), 0x82);
+            }
+            _ => panic!("expected piv move-key"),
+        }
     }
 
     /// Serialize `value`, assert it parses back to a JSON object, and assert
