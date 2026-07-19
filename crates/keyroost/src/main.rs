@@ -1195,7 +1195,9 @@ impl PivSlotSel {
             PivSlotSel::Sign => keyroost_piv::Slot::Signature,
             PivSlotSel::KeyMgmt => keyroost_piv::Slot::KeyManagement,
             PivSlotSel::CardAuth => keyroost_piv::Slot::CardAuthentication,
-            PivSlotSel::Retired(n) => keyroost_piv::Slot::Retired(n),
+            PivSlotSel::Retired(n) => {
+                keyroost_piv::Slot::retired(n).expect("PivSlotSel::Retired always holds 1..=20")
+            }
         }
     }
     fn label(self) -> String {
@@ -5269,6 +5271,12 @@ impl App {
                 // Re-read so per-slot key algorithms (and anything the write
                 // touched) reflect the new state without a manual Refresh.
                 app.load_piv_status();
+                // Any successful PIV write (delete, reset, move, ...) can change
+                // retired-slot occupancy; drop the cache and collapse the section
+                // so it re-reads fresh on the next expand instead of showing
+                // stale occupancy (see piv_move_key for the same invalidation).
+                app.piv.retired_occupancy = None;
+                app.piv.retired_expanded = false;
             }
             Err(e) => {
                 app.piv.notice = None;
@@ -5638,9 +5646,12 @@ impl App {
     /// caching the result in `PivState::retired_occupancy`. Triggered once when
     /// the "Retired slots" section is expanded (or the move modal opens) rather
     /// than on every status refresh, keeping the common path to 4 slot reads.
-    fn load_piv_retired_occupancy(&mut self) {
+    /// Returns whether the read was actually queued (mirrors `spawn_job`'s
+    /// contract): `false` means no job is in flight, so callers must not act
+    /// as though a load is pending.
+    fn load_piv_retired_occupancy(&mut self) -> bool {
         let Some(reader) = self.selected_oath_reader() else {
-            return;
+            return false;
         };
         let for_device = self.selected_device.clone();
         self.spawn_job("Reading retired slots\u{2026}", move || {
@@ -5659,7 +5670,7 @@ impl App {
                     Err(e) => app.piv.error = Some(e.to_string()),
                 }
             })
-        });
+        })
     }
 
     /// Normalize the certificate-subject field: a bare name becomes `CN=name`;
@@ -12237,15 +12248,25 @@ impl App {
             self.piv_cred_modal_close();
             self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::MoveKey));
             // Populate retired occupancy so the destination combo can exclude
-            // occupied retired slots (the transport re-checks regardless).
+            // occupied retired slots (the transport re-checks regardless). If
+            // the worker is busy the read just doesn't queue; occupancy stays
+            // `None` and the modal falls back to treating retired slots as
+            // available, with the transport's own occupied-destination check
+            // as the backstop.
             if self.piv.retired_occupancy.is_none() {
-                self.load_piv_retired_occupancy();
+                let _ = self.load_piv_retired_occupancy();
             }
         }
         if toggle_retired {
             self.piv.retired_expanded = !self.piv.retired_expanded;
-            if self.piv.retired_expanded && self.piv.retired_occupancy.is_none() {
-                self.load_piv_retired_occupancy();
+            if self.piv.retired_expanded
+                && self.piv.retired_occupancy.is_none()
+                && !self.load_piv_retired_occupancy()
+            {
+                // Job didn't queue (worker busy): collapse again so a later
+                // click retries instead of getting stuck showing "Reading
+                // retired slots…" forever with no read in flight.
+                self.piv.retired_expanded = false;
             }
         }
         if arm_reset {

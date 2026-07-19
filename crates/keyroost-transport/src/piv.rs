@@ -12,16 +12,6 @@
 use crate::TransportError;
 use keyroost_piv as piv;
 use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchPolicy};
-
-/// Whether MOVE KEY is available given the reported firmware `(major, minor, _)`.
-/// fw 5.7+ (Yubico). Unknown version → allow the attempt; the card refuses if
-/// it truly can't (belt-and-suspenders with the pre-check).
-fn move_key_supported(version: Option<(u8, u8, u8)>) -> bool {
-    match version {
-        Some((major, minor, _)) => major > 5 || (major == 5 && minor >= 7),
-        None => true,
-    }
-}
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
 use zeroize::Zeroizing;
 
@@ -54,6 +44,16 @@ pub struct PivSlotStatus {
 pub struct PivSession {
     card: Card,
     debug: bool,
+}
+
+/// Whether MOVE KEY is available given the reported firmware `(major, minor, _)`.
+/// fw 5.7+ (Yubico). Unknown version → allow the attempt; the card refuses if
+/// it truly can't (belt-and-suspenders with the pre-check).
+fn move_key_supported(version: Option<(u8, u8, u8)>) -> bool {
+    match version {
+        Some((major, minor, _)) => major > 5 || (major == 5 && minor >= 7),
+        None => true,
+    }
 }
 
 impl PivSession {
@@ -474,7 +474,13 @@ impl PivSession {
     /// the on-demand occupancy check (not part of [`status`]'s snapshot, which
     /// stays 4 GET DATA calls rather than 24 by never touching retired slots).
     ///
+    /// Derives occupancy from [`metadata`], which folds a transient/comms
+    /// error into the same `None` as a genuinely empty slot, so a rare
+    /// transient failure here is reported as an empty slot; the card's own
+    /// refusal to write over an occupied destination is the backstop.
+    ///
     /// [`status`]: PivSession::status
+    /// [`metadata`]: PivSession::metadata
     pub fn slot_has_key(&mut self, slot: Slot) -> Result<bool, TransportError> {
         Ok(self.metadata(slot.key_ref()).is_some())
     }
