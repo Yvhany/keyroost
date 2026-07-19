@@ -29,6 +29,34 @@ Captured here so they don't get lost. Unchecked = not started.
       whether the HID path should recognize it directly — vendor input first,
       no empirical probing (the Solo 2 HOTP lesson).
 
+### Factory-reset fix-later batch (from the `feat/factory-reset` final review)
+
+These are the defer-grade findings the whole-branch review surfaced; the
+feature shipped without them (none block correctness or the wrong-key-safety
+core). Fold into a follow-up on the factory-reset branch or a later pass.
+
+- [ ] **GUI OTP reset step lacks the #82 HID→CCID fallback the CLI has.**
+      In `run_card_reset_step` (crates/keyroost/src/main.rs) the OTP step opens
+      only the HID path when present, while the CLI's `open_otp` uses the
+      `HidThenReader` same-device fallback. On the quirky #82 firmware the GUI
+      factory reset reports OTP `Failed` where the CLI succeeds. Continue-on-
+      error still holds; this is a cross-frontend inconsistency, not a wipe
+      hazard. Give the GUI step the same fallback.
+- [ ] **CLI factory-reset: `--reader` silently outranks `--device`.** The card
+      steps resolve `reader.or(by_name)`, so passing both contradictorily opens
+      the `--reader` key while the banner prints the `--device` serial.
+      `resolve_fido_path` already rejects the analogous `--path`+`--device`
+      combo; the card path should refuse the conflict too rather than pick one.
+- [ ] **Failed PIV RESET after a successful block isn't spelled out.** When
+      `force_reset` blocks the PIN and PUK but the final RESET then fails, the
+      report row says only `PIV failed: <e>`. The card is NOT bricked — that
+      exact blocked state is what `keyroostctl piv reset` needs — but the
+      message should say so (append "PIN and PUK are now blocked; recover with
+      `keyroostctl piv reset`") so the state is fully honest. Also soften the
+      GUI's "Live per-step report" comment (it populates on completion, not
+      streaming) and have the CLI's "no resettable applet" error on a Molto2
+      hint at `keyroostctl molto reset`.
+
 ## Release-day playbook (SOP)
 
 - [x] Write a **release-day playbook** — a single checklist doc the release
