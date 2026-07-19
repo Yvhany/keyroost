@@ -122,10 +122,14 @@ pub enum Slot {
     KeyManagement,
     /// `9E` — Card Authentication.
     CardAuthentication,
+    /// Yubico retired key-management slots (fw 5.7+). `Retired(n)` for
+    /// n = 1..=20 → key_ref 0x82..=0x95. Construct via [`Slot::retired`],
+    /// which rejects out-of-range n.
+    Retired(u8),
 }
 
 impl Slot {
-    /// The key-reference byte (`9A`/`9C`/`9D`/`9E`).
+    /// The key-reference byte (`9A`/`9C`/`9D`/`9E`, or `82`..=`95` for retired).
     #[must_use]
     pub const fn key_ref(self) -> u8 {
         match self {
@@ -133,6 +137,7 @@ impl Slot {
             Slot::Signature => 0x9C,
             Slot::KeyManagement => 0x9D,
             Slot::CardAuthentication => 0x9E,
+            Slot::Retired(n) => 0x81 + n,
         }
     }
 
@@ -144,21 +149,24 @@ impl Slot {
             Slot::Signature => [0x5F, 0xC1, 0x0A],
             Slot::KeyManagement => [0x5F, 0xC1, 0x0B],
             Slot::CardAuthentication => [0x5F, 0xC1, 0x01],
+            Slot::Retired(n) => [0x5F, 0xC1, 0x0C + n],
         }
     }
 
     /// Short human label.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            Slot::Authentication => "authentication (9A)",
-            Slot::Signature => "signature (9C)",
-            Slot::KeyManagement => "key management (9D)",
-            Slot::CardAuthentication => "card authentication (9E)",
+            Slot::Authentication => "authentication (9A)".into(),
+            Slot::Signature => "signature (9C)".into(),
+            Slot::KeyManagement => "key management (9D)".into(),
+            Slot::CardAuthentication => "card authentication (9E)".into(),
+            Slot::Retired(n) => format!("retired {n} ({:02X})", 0x81 + n),
         }
     }
 
-    /// All four slots, in canonical order.
+    /// All four standard slots, in canonical order. Retired slots are kept
+    /// separate — see [`Slot::retired_all`] — so status() stays cheap.
     #[must_use]
     pub const fn all() -> [Slot; 4] {
         [
@@ -167,6 +175,28 @@ impl Slot {
             Slot::KeyManagement,
             Slot::CardAuthentication,
         ]
+    }
+
+    /// Checked constructor for a retired slot: `Some` for n in 1..=20, else `None`.
+    /// All retired-slot construction must go through here so an invalid ref can
+    /// never be built.
+    #[must_use]
+    pub fn retired(n: u8) -> Option<Slot> {
+        (1..=20).contains(&n).then_some(Slot::Retired(n))
+    }
+
+    /// The 20 retired slots in order (Retired(1)..=Retired(20)). Kept separate
+    /// from [`Slot::all`] so status() stays cheap — retired occupancy is read
+    /// lazily, not on every refresh.
+    #[must_use]
+    pub fn retired_all() -> [Slot; 20] {
+        let mut out = [Slot::Retired(1); 20];
+        let mut i = 0u8;
+        while i < 20 {
+            out[i as usize] = Slot::Retired(i + 1);
+            i += 1;
+        }
+        out
     }
 }
 
@@ -976,6 +1006,32 @@ mod tests {
             Slot::CardAuthentication.cert_object_tag(),
             [0x5F, 0xC1, 0x01]
         );
+    }
+
+    #[test]
+    fn retired_slot_refs_and_tags_across_the_range() {
+        let r1 = Slot::retired(1).unwrap();
+        let r20 = Slot::retired(20).unwrap();
+        assert_eq!(r1.key_ref(), 0x82);
+        assert_eq!(r20.key_ref(), 0x95);
+        assert_eq!(r1.cert_object_tag(), [0x5F, 0xC1, 0x0D]);
+        assert_eq!(r20.cert_object_tag(), [0x5F, 0xC1, 0x20]);
+        // Out-of-range rejected by the constructor.
+        assert!(Slot::retired(0).is_none());
+        assert!(Slot::retired(21).is_none());
+        // retired_all() is the 20 retired slots in order.
+        let all = Slot::retired_all();
+        assert_eq!(all.len(), 20);
+        assert_eq!(all[0], r1);
+        assert_eq!(all[19], r20);
+        // The standard Slot::all() is unchanged (still 4).
+        assert_eq!(Slot::all().len(), 4);
+    }
+
+    #[test]
+    fn retired_label_is_stable() {
+        assert_eq!(Slot::retired(1).unwrap().label(), "retired 1 (82)");
+        assert_eq!(Slot::retired(20).unwrap().label(), "retired 20 (95)");
     }
 
     #[test]

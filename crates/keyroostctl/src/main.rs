@@ -4666,7 +4666,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         .slots
                         .iter()
                         .map(|s| json_out::PivSlotJson {
-                            slot: s.slot.label().to_string(),
+                            slot: s.slot.label(),
                             cert_present: s.cert_present,
                             cert_len: s.cert_len,
                         })

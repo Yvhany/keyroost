@@ -1177,7 +1177,7 @@ impl PivSlotSel {
             PivSlotSel::CardAuth => keyroost_piv::Slot::CardAuthentication,
         }
     }
-    fn label(self) -> &'static str {
+    fn label(self) -> String {
         self.to_slot().label()
     }
 }
