@@ -5460,6 +5460,7 @@ impl App {
         self.oath.confirm_delete = None;
         self.openpgp.cred_modal = None;
         self.security_keys.reset = ResetDialog::default();
+        self.factory_reset_report.clear();
         self.oath_tried = false;
         self.piv_tried = false;
         self.otp_tried = false;
