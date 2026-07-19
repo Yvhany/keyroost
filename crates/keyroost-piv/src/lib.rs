@@ -814,6 +814,21 @@ pub fn delete_key(slot: Slot) -> Vec<u8> {
     vec![0x00, Instruction::MoveKey.code(), 0xFF, slot.key_ref()]
 }
 
+/// Yubico MOVE KEY: relocate a slot's private key to another slot.
+/// `00 F6 <dest key_ref> <src key_ref>`. The move variant of the same 0xF6
+/// opcode whose 0xFF-sentinel form deletes (see [`delete_key`]). Moves ONLY
+/// the private key — the source slot's certificate object is untouched.
+/// Requires firmware 5.7+ and prior management-key authentication.
+#[must_use]
+pub fn move_key(src: Slot, dest: Slot) -> Vec<u8> {
+    vec![
+        0x00,
+        Instruction::MoveKey.code(),
+        dest.key_ref(),
+        src.key_ref(),
+    ]
+}
+
 /// Clear a slot's certificate object by writing an empty PUT DATA template
 /// (`53 00`). Standard PIV and universal across firmware. This removes only the
 /// X.509 certificate from `slot`; the slot's private key persists. Requires
@@ -1242,6 +1257,25 @@ mod tests {
         assert_eq!(
             delete_key(Slot::CardAuthentication),
             vec![0x00, 0xF6, 0xFF, 0x9E]
+        );
+    }
+
+    #[test]
+    fn move_key_kat() {
+        // 00 F6 <dest> <src>. Standard -> retired (archive KeyManagement to Retired1).
+        assert_eq!(
+            move_key(Slot::KeyManagement, Slot::retired(1).unwrap()),
+            vec![0x00, 0xF6, 0x82, 0x9D]
+        );
+        // Retired -> standard (restore).
+        assert_eq!(
+            move_key(Slot::retired(20).unwrap(), Slot::Authentication),
+            vec![0x00, 0xF6, 0x9A, 0x95]
+        );
+        // Standard -> standard.
+        assert_eq!(
+            move_key(Slot::Signature, Slot::CardAuthentication),
+            vec![0x00, 0xF6, 0x9E, 0x9C]
         );
     }
 
