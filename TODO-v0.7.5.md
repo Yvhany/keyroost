@@ -192,6 +192,11 @@ anything big on top:
       key with a blocked/absent PIN. (#82's HID→CCID fallback only engages
       on the quirky firmware — reporter confirmation stands in for local
       hardware.)
+- [ ] **PIV move-key (v0.7.7):** on the YubiKey 5.7, a rotate-and-archive
+      round trip — move the Key-Management (9D) key to a retired slot, confirm
+      it's gone from 9D and present in the retired slot, confirm the cert
+      stayed in 9D, and that an occupied-destination move is refused. GUI:
+      retired-slots section shows the archived key.
 
 ## PC/SC: load libpcsclite at runtime, degrade gracefully (the real #47 fix)
 

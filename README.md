@@ -53,7 +53,7 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   serial, PIN retries, which slots 9A/9C/9D/9E hold a certificate), on-card key
   generation, certificate import / export, self-signed certs or a CSR for a CA,
   clearing a slot's certificate (`delete-cert`) or key (`delete-key`, on YubiKey
-  5.7+), and PIN / PUK / management-key changes and applet reset. The GUI collects the
+  5.7+), moving a key between slots (`move-key`, on YubiKey 5.7+), and PIN / PUK / management-key changes and applet reset. The GUI collects the
   management key per operation (and wipes it after), which is ideal for a slot or
   two; for **provisioning many slots or keys, the CLI is the intended path** — the
   management key and PIN come from env/stdin once, so a shell loop does the batch

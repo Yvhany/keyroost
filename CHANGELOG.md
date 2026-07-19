@@ -6,6 +6,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **PIV move-key:** relocate a private key between slots (`keyroostctl piv
+  move-key --from <slot> --to <slot>` and a GUI "Move key…" action), including
+  the 20 Yubico retired key-management slots (82–95) for key archival /
+  rotation. Non-destructive — refuses an occupied destination; the certificate
+  stays in the source slot. Requires firmware 5.7+.
+
 ## [0.7.6] - 2026-07-17
 
 A bug-fix release for three field reports, plus the follow-through on the
