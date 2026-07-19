@@ -11691,7 +11691,26 @@ impl App {
         });
 
         // --- Selected-slot display data (shown under the slot tab strip) ---
-        let sel_state: String = {
+        let sel_state: String = if let PivSlotSel::Retired(n) = selected {
+            // Retired slots aren't tracked by `status.slots` / `slot_keys`
+            // (those only cover the four standard slots), so an occupied
+            // retired slot would otherwise fall through to "empty" below.
+            // Consult the lazily-populated retired-occupancy cache instead —
+            // the same one `selected_has_key` reads — so the label stays
+            // honest before a user hits Generate/Import on an archived key.
+            let has_key = self
+                .piv
+                .retired_occupancy
+                .as_ref()
+                .and_then(|v| v.iter().find(|(s, _)| *s == keyroost_piv::Slot::Retired(n)))
+                .map(|(_, has)| *has);
+            match has_key {
+                Some(true) => "key present".to_string(),
+                // Cache reports empty, or hasn't loaded yet for this slot:
+                // fall back to the same "empty" wording used elsewhere.
+                _ => "empty".to_string(),
+            }
+        } else {
             let sel_slot = selected.to_slot();
             let cert_present = self
                 .piv
