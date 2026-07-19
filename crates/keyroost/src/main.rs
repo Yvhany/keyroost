@@ -5673,6 +5673,17 @@ impl App {
         })
     }
 
+    /// Whether the currently selected PIV slot already holds a private key.
+    /// Thin wrapper over [`piv_slot_occupied`] reading the loaded caches; drives
+    /// the Generate-key overwrite warning and the Import-cert replace note.
+    fn piv_selected_occupied(&self) -> bool {
+        piv_slot_occupied(
+            self.piv.selected_slot,
+            &self.piv.slot_keys,
+            self.piv.retired_occupancy.as_deref(),
+        )
+    }
+
     /// Normalize the certificate-subject field: a bare name becomes `CN=name`;
     /// anything containing `=` is taken as a full distinguished name.
     fn piv_subject(&self) -> Option<String> {
@@ -6171,6 +6182,36 @@ fn piv_cred_success(kind: PivCredKind) -> &'static str {
 
 /// Slots a key may be moved to: every standard + retired slot that is empty
 /// and is not the source. `occupied(slot)` reports current key presence.
+/// Whether `sel` currently holds a private key, read from the loaded occupancy
+/// caches. Standard slots read `slot_keys` (a carried algorithm means a key is
+/// present); a retired slot reads the lazily-populated `retired_occupancy`
+/// cache (`None` cache, or a slot the cache doesn't list, is treated as empty).
+/// Pure so the overwrite guard can be unit-tested without hardware or `self`.
+fn piv_slot_occupied(
+    sel: PivSlotSel,
+    slot_keys: &[(
+        keyroost_piv::Slot,
+        Option<keyroost_piv::KeyAlg>,
+        Option<String>,
+    )],
+    retired_occupancy: Option<&[(keyroost_piv::Slot, bool)]>,
+) -> bool {
+    match sel {
+        PivSlotSel::Retired(n) => retired_occupancy
+            .and_then(|v| v.iter().find(|(s, _)| *s == keyroost_piv::Slot::Retired(n)))
+            .map(|(_, has)| *has)
+            .unwrap_or(false),
+        _ => {
+            let sel_slot = sel.to_slot();
+            slot_keys
+                .iter()
+                .find(|(s, _, _)| *s == sel_slot)
+                .map(|(_, a, _)| a.is_some())
+                .unwrap_or(false)
+        }
+    }
+}
+
 fn move_key_eligible_destinations(
     src: keyroost_piv::Slot,
     occupied: &dyn Fn(keyroost_piv::Slot) -> bool,
@@ -10454,6 +10495,10 @@ impl App {
         // Inline new==confirm guard, mirroring the op-level backstop. Shown as
         // the modal's error line; blocks Submit when set.
         let mismatch = piv_cred_mismatch(&self.piv, kind);
+        // Whether the target slot already holds a key — drives the Generate-key
+        // overwrite warning + relabel and the Import-cert replace note.
+        // Precomputed before the closure borrows `self` mutably.
+        let selected_occupied = self.piv_selected_occupied();
 
         // Move-key flow: precompute the source slot and the eligible destination
         // slots (empty, non-source) before the modal borrows `self` mutably. A
@@ -10522,11 +10567,38 @@ impl App {
                         // Management-key-gated flows: only the *secrets* live here;
                         // their non-secret parameters stay inline in the pane.
                         PivCredKind::GenerateKey => {
+                            // Generating into an occupied slot silently destroys
+                            // the existing private key (irreversible). Warn in
+                            // red before the auth field, mirroring the delete
+                            // cards; the submit button is relabelled below.
+                            if selected_occupied {
+                                let slot = self.piv.selected_slot.to_slot().label();
+                                ui.colored_label(
+                                    p.err,
+                                    egui::RichText::new(format!(
+                                        "This OVERWRITES and destroys the existing key in \
+                                         {slot}. This cannot be undone."
+                                    ))
+                                    .font(theme::f_sb(12.5)),
+                                );
+                                ui.add_space(6.0);
+                            }
                             self.piv_modal_mgmt_field(ui, p, kind);
                             card_note(ui, p, "Authorizes overwriting the slot with a fresh key.");
                         }
                         PivCredKind::ImportCert => {
                             self.piv_modal_mgmt_field(ui, p, kind);
+                            // Importing only replaces the public certificate
+                            // object (no key loss) — a lighter note, not a red
+                            // warning.
+                            if selected_occupied {
+                                let slot = self.piv.selected_slot.to_slot().label();
+                                card_note(
+                                    ui,
+                                    p,
+                                    &format!("This replaces the certificate currently in {slot}."),
+                                );
+                            }
                             card_note(ui, p, "Authorizes writing the certificate to the slot.");
                         }
                         PivCredKind::SelfSign => {
@@ -10663,7 +10735,15 @@ impl App {
                                     .color(p.txt2),
                             );
                         } else {
-                            if theme::button(ui, p, BtnKind::Primary, kind.submit_label()).clicked()
+                            // Relabel Generate as a conscious "Overwrite key"
+                            // when the target slot is occupied; the op itself is
+                            // unchanged.
+                            let submit = if kind == PivCredKind::GenerateKey && selected_occupied {
+                                "Overwrite key"
+                            } else {
+                                kind.submit_label()
+                            };
+                            if theme::button(ui, p, BtnKind::Primary, submit).clicked()
                                 && mismatch.is_none()
                             {
                                 want_submit = true;
@@ -11759,24 +11839,11 @@ impl App {
         // Whether the active slot holds a private key — gates the Move button
         // (and Move source). Standard slots read from `slot_keys`; a retired slot
         // reads from the lazily-populated occupancy cache.
-        let selected_has_key = match selected {
-            PivSlotSel::Retired(n) => self
-                .piv
-                .retired_occupancy
-                .as_ref()
-                .and_then(|v| v.iter().find(|(s, _)| *s == keyroost_piv::Slot::Retired(n)))
-                .map(|(_, has)| *has)
-                .unwrap_or(false),
-            _ => {
-                let sel_slot = selected.to_slot();
-                self.piv
-                    .slot_keys
-                    .iter()
-                    .find(|(s, _, _)| *s == sel_slot)
-                    .map(|(_, a, _)| a.is_some())
-                    .unwrap_or(false)
-            }
-        };
+        let selected_has_key = piv_slot_occupied(
+            selected,
+            &self.piv.slot_keys,
+            self.piv.retired_occupancy.as_deref(),
+        );
         // Key deletion (Yubico MOVE/DELETE KEY) needs firmware 5.7+. The
         // transport version-gates as a backstop; here we hide the button (and
         // explain) when the loaded status reports an older — or unknown —
@@ -13791,6 +13858,51 @@ mod tests {
         for k in kinds {
             assert_eq!(piv_cred_mismatch(&piv, k), None);
         }
+    }
+
+    /// The overwrite-guard occupancy predicate reads the right cache for each
+    /// selection kind: standard slots from `slot_keys`, retired slots from the
+    /// lazily-populated `retired_occupancy` cache.
+    #[test]
+    fn piv_slot_occupied_reads_the_right_cache() {
+        use keyroost_piv::{KeyAlg, Slot};
+
+        // Standard-slot occupancy comes from `slot_keys`: a carried algorithm
+        // means the slot holds a private key; `None` means empty.
+        let slot_keys = vec![
+            (Slot::Authentication, Some(KeyAlg::EccP256), None),
+            (Slot::Signature, None, None),
+        ];
+        assert!(piv_slot_occupied(PivSlotSel::Auth, &slot_keys, None));
+        // alg is None -> empty
+        assert!(!piv_slot_occupied(PivSlotSel::Sign, &slot_keys, None));
+        // slot absent from the cache -> treated as empty
+        assert!(!piv_slot_occupied(PivSlotSel::CardAuth, &slot_keys, None));
+
+        // Retired-slot occupancy comes from the `retired_occupancy` cache.
+        let retired = vec![
+            (Slot::retired(1).unwrap(), true),
+            (Slot::retired(2).unwrap(), false),
+        ];
+        assert!(piv_slot_occupied(
+            PivSlotSel::Retired(1),
+            &slot_keys,
+            Some(&retired)
+        ));
+        // listed but empty
+        assert!(!piv_slot_occupied(
+            PivSlotSel::Retired(2),
+            &slot_keys,
+            Some(&retired)
+        ));
+        // not listed in the cache -> false
+        assert!(!piv_slot_occupied(
+            PivSlotSel::Retired(3),
+            &slot_keys,
+            Some(&retired)
+        ));
+        // cache absent entirely -> false (unknown treated as empty)
+        assert!(!piv_slot_occupied(PivSlotSel::Retired(1), &slot_keys, None));
     }
 
     /// Given occupancy (slot -> has_key), the eligible move destinations are the
