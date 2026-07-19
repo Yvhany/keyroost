@@ -1176,7 +1176,7 @@ impl Default for PivState {
 }
 
 /// PIV key-slot selector for the GUI controls.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum PivSlotSel {
     #[default]
     Auth,
@@ -5277,6 +5277,15 @@ impl App {
                 // stale occupancy (see piv_move_key for the same invalidation).
                 app.piv.retired_occupancy = None;
                 app.piv.retired_expanded = false;
+                // A retired-slot selection is stale once its occupancy cache is
+                // dropped (the section also collapses); snapping back to a
+                // standard slot prevents acting on it with unknown occupancy —
+                // notably the Generate overwrite guard, which would otherwise
+                // see "unknown" as "empty" and skip its warning on a still-
+                // occupied archived key.
+                if matches!(app.piv.selected_slot, PivSlotSel::Retired(_)) {
+                    app.piv.selected_slot = PivSlotSel::Auth;
+                }
             }
             Err(e) => {
                 app.piv.notice = None;
@@ -5637,6 +5646,15 @@ impl App {
                 // cache and collapse the section so it re-reads on the next open.
                 app.piv.retired_occupancy = None;
                 app.piv.retired_expanded = false;
+                // A retired-slot selection is stale once its occupancy cache is
+                // dropped (the section also collapses); snapping back to a
+                // standard slot prevents acting on it with unknown occupancy —
+                // notably the Generate overwrite guard, which would otherwise
+                // see "unknown" as "empty" and skip its warning on a still-
+                // occupied archived key.
+                if matches!(app.piv.selected_slot, PivSlotSel::Retired(_)) {
+                    app.piv.selected_slot = PivSlotSel::Auth;
+                }
                 Self::apply_piv_cred_result(app);
             })
         });
@@ -13806,6 +13824,50 @@ mod tests {
         let busy: Vec<_> = kinds.iter().map(|k| k.busy_label()).collect();
         assert!(busy.iter().all(|s| !s.is_empty()));
         assert_eq!(busy[0], "Changing PIV PIN\u{2026}");
+    }
+
+    /// A successful PIV write drops the retired-occupancy cache (so the
+    /// section re-reads fresh on next expand). If a retired slot was selected
+    /// when that happens, the selection must snap back to a standard slot —
+    /// otherwise the Generate overwrite guard reads the now-cleared cache as
+    /// "unknown occupancy" and treats that as empty, silently skipping its
+    /// warning on what may still be an occupied archived key.
+    #[test]
+    fn apply_piv_write_success_clears_stale_retired_selection() {
+        let mut app = App::default();
+        app.piv.selected_slot = PivSlotSel::Retired(3);
+        app.piv.retired_occupancy = Some(vec![(keyroost_piv::Slot::Retired(3), true)]);
+        app.piv.retired_expanded = true;
+        let status = keyroost_transport::PivStatus {
+            version: None,
+            serial: None,
+            pin_retries: None,
+            slots: vec![],
+        };
+        App::apply_piv_write(&mut app, Ok(status), "did a thing".into());
+        assert_eq!(
+            app.piv.selected_slot,
+            PivSlotSel::Auth,
+            "a retired-slot selection must not survive its occupancy cache clearing"
+        );
+        assert!(app.piv.retired_occupancy.is_none());
+        assert!(!app.piv.retired_expanded);
+    }
+
+    /// A standard-slot selection is left untouched by the same invalidation —
+    /// only a stale `Retired` selection needs to be reset.
+    #[test]
+    fn apply_piv_write_success_leaves_standard_selection_alone() {
+        let mut app = App::default();
+        app.piv.selected_slot = PivSlotSel::KeyMgmt;
+        let status = keyroost_transport::PivStatus {
+            version: None,
+            serial: None,
+            pin_retries: None,
+            slots: vec![],
+        };
+        App::apply_piv_write(&mut app, Ok(status), "did a thing".into());
+        assert_eq!(app.piv.selected_slot, PivSlotSel::KeyMgmt);
     }
 
     /// The management-key-gated flows declare they collect the current
