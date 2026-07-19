@@ -745,6 +745,90 @@ fn fido_settings_available(info: Option<&AuthenticatorInfo>) -> bool {
     info.is_some_and(|i| i.versions.iter().any(|v| v.starts_with("FIDO_2_")))
 }
 
+/// The confirmation body for the Factory reset modal: what key, and exactly
+/// which applets get wiped, with the two ceremonies that aren't a plain wipe
+/// spelled out (PIV blocks its PIN+PUK first; FIDO needs a replug + touch).
+fn factory_reset_confirm_summary(
+    serial: &str,
+    model: &str,
+    plan: &[keyroost_resolve::ResetStep],
+) -> String {
+    use keyroost_resolve::ResetStep;
+    let applets = plan
+        .iter()
+        .map(|s| s.label())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut msg = format!(
+        "Factory-reset {model} (serial {serial})?\n\nWipes: {applets}.\nEvery \
+         credential, code, key, and PIN is erased. The key stays fully usable."
+    );
+    if plan.contains(&ResetStep::Piv) {
+        msg.push_str(
+            "\n\nPIV: the PIN and PUK are intentionally blocked, then the applet \
+             is wiped (the standard reset path).",
+        );
+    }
+    if plan.contains(&ResetStep::Fido) {
+        msg.push_str("\n\nFinishes with a step to unplug the key, plug it back in, and touch it.");
+    }
+    msg
+}
+
+/// Run one non-FIDO applet reset off the UI thread, mapping the result to a
+/// [`StepOutcome`](keyroost_resolve::StepOutcome) so a single failure is
+/// recorded rather than aborting the sweep (continue-on-error, matching the
+/// CLI's `factory-reset`). FIDO is never routed here — it is handed to the
+/// armed `ResetDialog` flow, which owns the replug + touch ceremony.
+fn run_card_reset_step(
+    step: keyroost_resolve::ResetStep,
+    reader: Option<&str>,
+    hid_path: Option<&std::path::Path>,
+) -> keyroost_resolve::StepOutcome {
+    use keyroost_resolve::{ResetStep, StepOutcome};
+    let run = || -> Result<(), String> {
+        match step {
+            ResetStep::Oath => {
+                let name = reader.ok_or("no PC/SC reader for the OATH applet")?;
+                let mut s =
+                    keyroost_transport::OathSession::open(name).map_err(|e| e.to_string())?;
+                s.factory_reset().map_err(|e| e.to_string())?;
+            }
+            ResetStep::OpenPgp => {
+                let name = reader.ok_or("no PC/SC reader for the OpenPGP applet")?;
+                let mut s =
+                    keyroost_transport::OpenPgpSession::open(name).map_err(|e| e.to_string())?;
+                s.factory_reset().map_err(|e| e.to_string())?;
+            }
+            ResetStep::Piv => {
+                let name = reader.ok_or("no PC/SC reader for the PIV applet")?;
+                let mut s =
+                    keyroost_transport::PivSession::open(name).map_err(|e| e.to_string())?;
+                s.force_reset().map_err(|e| e.to_string())?;
+            }
+            ResetStep::Token2Otp => {
+                // The OTP applet lives on the FIDO HID node when present, else on
+                // the PC/SC reader — the same preference the CLI's `open_otp` uses.
+                let mut s = match hid_path {
+                    Some(p) => keyroost_transport::Token2OtpSession::open_hid_path(p, false),
+                    None => {
+                        let name = reader.ok_or("no transport for the OTP applet")?;
+                        keyroost_transport::Token2OtpSession::open_pcsc_reader(name, false)
+                    }
+                }
+                .map_err(|e| e.to_string())?;
+                s.erase_all().map_err(|e| e.to_string())?;
+            }
+            ResetStep::Fido => {}
+        }
+        Ok(())
+    };
+    match run() {
+        Ok(()) => StepOutcome::Wiped,
+        Err(e) => StepOutcome::Failed(e),
+    }
+}
+
 /// Whether to render the Reset card *outside* the Settings subview: the key
 /// is CTAP2 (so resettable) but not unlocked. authenticatorReset takes no
 /// PIN, and its primary use case is recovering from a forgotten or blocked
@@ -1582,6 +1666,11 @@ struct App {
     /// While `Some`, a FIDO reset is armed and waiting for the key to be
     /// unplugged and plugged back in (see [`ResetArm`]).
     reset_arm: Option<ResetArm>,
+    /// Pending whole-device factory-reset confirmation, bound to the device it
+    /// was opened for (KEY-008 posture). None unless the modal is open.
+    factory_reset_confirm: Option<DeviceId>,
+    /// Live per-step report while a factory reset runs (empty when idle).
+    factory_reset_report: Vec<keyroost_resolve::StepReport>,
     /// Remaining scans in the current burst. A single scan races slow-to-
     /// register readers (the Molto2's CCID interface appears in pcscd a beat
     /// after the USB device), so startup and every hotplug schedule several
@@ -4247,6 +4336,130 @@ impl App {
                         app.oath_tried = false;
                     }
                     Err(e) => app.oath.error = Some(format!("reset failed: {e}")),
+                }
+            })
+        });
+    }
+
+    /// Confirm modal for the whole-device factory reset. Device-bound like
+    /// `render_oath_reset_confirm`: it dies the instant the selection changes,
+    /// so a confirmed wipe can only ever land on the key it was opened for
+    /// (KEY-008). "Yes, wipe this key" starts the sequential reset job.
+    fn render_factory_reset_confirm(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(for_device) = self.factory_reset_confirm.clone() else {
+            return;
+        };
+        if !completion_still_valid(Some(&for_device), self.selected_device.as_ref()) {
+            self.factory_reset_confirm = None;
+            return;
+        }
+        let summary = match self.selected_device() {
+            Some(dev) => {
+                let plan = keyroost_resolve::factory_reset_plan(dev.caps);
+                factory_reset_confirm_summary(&dev.serial, &dev.model, &plan)
+            }
+            None => {
+                self.factory_reset_confirm = None;
+                return;
+            }
+        };
+        let mut decision: Option<bool> = None;
+        egui::Window::new("Factory reset this key?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(summary);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if theme::button(ui, p, BtnKind::Danger, "Yes, wipe this key").clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        match decision {
+            Some(true) => {
+                self.factory_reset_confirm = None;
+                self.run_factory_reset_gui();
+            }
+            Some(false) => self.factory_reset_confirm = None,
+            None => {}
+        }
+    }
+
+    /// Run a whole-device factory reset: sweep every card applet in the shared
+    /// plan off the UI thread (continue-on-error), record a per-step report,
+    /// re-initialise the wiped panes, and — when the plan ends in FIDO — hand
+    /// the finale to the existing armed `ResetDialog` (which owns the replug +
+    /// touch ceremony), so no new FIDO logic is written here.
+    fn run_factory_reset_gui(&mut self) {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let Some(dev) = self.selected_device().cloned() else {
+            return;
+        };
+        let plan = keyroost_resolve::factory_reset_plan(dev.caps);
+        if plan.is_empty() {
+            return;
+        }
+        // Capture the transport descriptors before going off-thread.
+        let reader = dev.reader.clone();
+        let hid_path = dev.hid_path.clone();
+        let for_device = self.selected_device.clone();
+        let ends_in_fido = plan.last() == Some(&ResetStep::Fido);
+        // Card applets run on the worker; FIDO (if present) is left to the
+        // armed ResetDialog after the card sweep completes.
+        let card_steps: Vec<ResetStep> = plan
+            .iter()
+            .copied()
+            .filter(|s| *s != ResetStep::Fido)
+            .collect();
+        // Clear any stale report so the pane shows this run's progress only.
+        self.factory_reset_report.clear();
+        self.spawn_job("Factory-resetting key\u{2026}", move || {
+            let mut reports: Vec<StepReport> = Vec::new();
+            for step in card_steps {
+                let outcome = run_card_reset_step(step, reader.as_deref(), hid_path.as_deref());
+                reports.push(StepReport { step, outcome });
+            }
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // selection changed mid-reset; don't paint A's outcome under B
+                }
+                // Re-initialise each wiped applet's pane to a fresh, empty state
+                // (mirrors the OATH reset apply), clearing its "tried" flag so the
+                // pane re-lists on its own.
+                for r in &reports {
+                    if matches!(r.outcome, StepOutcome::Wiped) {
+                        match r.step {
+                            ResetStep::Oath => {
+                                app.oath = OathState::default();
+                                app.oath_tried = false;
+                            }
+                            ResetStep::OpenPgp => {
+                                app.openpgp = OpenPgpState::default();
+                            }
+                            ResetStep::Piv => {
+                                app.piv = PivState::default();
+                                app.piv_tried = false;
+                            }
+                            ResetStep::Token2Otp => {
+                                app.otp = OtpState::default();
+                                app.otp_tried = false;
+                            }
+                            ResetStep::Fido => {}
+                        }
+                    }
+                }
+                app.factory_reset_report = reports;
+                // Hand the FIDO finale to the tested armed-reset flow.
+                if ends_in_fido {
+                    app.security_keys.reset = ResetDialog {
+                        open: true,
+                        ..Default::default()
+                    };
                 }
             })
         });
@@ -7094,6 +7307,7 @@ impl eframe::App for App {
         }
         self.render_oath_delete_confirm(ctx);
         self.render_oath_reset_confirm(ctx);
+        self.render_factory_reset_confirm(ctx, &p);
         self.render_oath_add_modal(ctx, &p);
         self.render_openpgp_cred_modal(ctx, &p);
         self.render_piv_confirms(ctx);
@@ -8348,6 +8562,80 @@ impl App {
                         );
                     }
                 });
+            }
+            // Whole-device factory reset — offered only for a Key (Molto2 keeps
+            // its own reset in its pane; a bare ProgToken has no resettable
+            // applet, so its plan is empty and no card renders).
+            if dev.kind == DeviceKind::Key {
+                let plan = keyroost_resolve::factory_reset_plan(dev.caps);
+                if !plan.is_empty() {
+                    ui.add_space(14.0);
+                    let mut arm = false;
+                    theme::card_frame(p)
+                        .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Factory reset")
+                                        .font(theme::f_sb(14.5))
+                                        .color(p.err),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if theme::button(
+                                            ui,
+                                            p,
+                                            BtnKind::Danger,
+                                            "Factory reset\u{2026}",
+                                        )
+                                        .clicked()
+                                        {
+                                            arm = true;
+                                        }
+                                    },
+                                );
+                            });
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Resets every applet on this key ({}) to factory state. \
+                                     The key stays fully usable.",
+                                    plan.iter()
+                                        .map(|s| s.label())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ))
+                                .font(theme::f_reg(12.5))
+                                .color(p.txt2),
+                            );
+                            // Live per-step report while a reset runs (or its
+                            // outcome afterwards, until the selection changes).
+                            if !self.factory_reset_report.is_empty() {
+                                ui.add_space(8.0);
+                                for r in &self.factory_reset_report {
+                                    let (text, color) = match &r.outcome {
+                                        keyroost_resolve::StepOutcome::Wiped => {
+                                            (format!("{}  wiped", r.step.label()), p.ok)
+                                        }
+                                        keyroost_resolve::StepOutcome::Failed(e) => {
+                                            (format!("{}  failed: {e}", r.step.label()), p.err)
+                                        }
+                                        keyroost_resolve::StepOutcome::Skipped => {
+                                            (format!("{}  skipped", r.step.label()), p.txt3)
+                                        }
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(text)
+                                            .font(theme::f_reg(12.5))
+                                            .color(color),
+                                    );
+                                }
+                            }
+                        });
+                    if arm {
+                        self.factory_reset_confirm = self.selected_device.clone();
+                    }
+                }
             }
         });
     }
@@ -13644,6 +13932,21 @@ fn slot_summary(algo: Option<u8>, fpr: &[u8; 20]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn factory_reset_summary_lists_applets_and_flags_piv_and_fido() {
+        use keyroost_resolve::{factory_reset_plan, Caps};
+        let mut caps = Caps::default();
+        for c in [Caps::OATH, Caps::PIV, Caps::FIDO2] {
+            caps.insert(c);
+        }
+        let msg = factory_reset_confirm_summary("SN123", "Token2 PIN+", &factory_reset_plan(caps));
+        assert!(msg.contains("SN123") && msg.contains("Token2 PIN+"));
+        assert!(msg.contains("OATH") && msg.contains("PIV") && msg.contains("FIDO2"));
+        // PIV disclosure and FIDO replug note are present.
+        assert!(msg.contains("PIN and PUK"));
+        assert!(msg.to_lowercase().contains("unplug"));
+    }
 
     /// #81: the Settings tab (home of the only Reset path) must exist for any
     /// CTAP2 key — authenticatorReset is a baseline CTAP 2.0 command, so
