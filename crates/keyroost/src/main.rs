@@ -4382,8 +4382,11 @@ impl App {
             });
         match decision {
             Some(true) => {
-                self.factory_reset_confirm = None;
-                self.run_factory_reset_gui();
+                if self.run_factory_reset_gui() {
+                    self.factory_reset_confirm = None;
+                }
+                // else: a job is in flight; keep the modal open so the confirmed
+                // wipe isn't silently swallowed — the user can retry when it clears.
             }
             Some(false) => self.factory_reset_confirm = None,
             None => {}
@@ -4395,14 +4398,14 @@ impl App {
     /// re-initialise the wiped panes, and — when the plan ends in FIDO — hand
     /// the finale to the existing armed `ResetDialog` (which owns the replug +
     /// touch ceremony), so no new FIDO logic is written here.
-    fn run_factory_reset_gui(&mut self) {
+    fn run_factory_reset_gui(&mut self) -> bool {
         use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
         let Some(dev) = self.selected_device().cloned() else {
-            return;
+            return false;
         };
         let plan = keyroost_resolve::factory_reset_plan(dev.caps);
         if plan.is_empty() {
-            return;
+            return false;
         }
         // Capture the transport descriptors before going off-thread.
         let reader = dev.reader.clone();
@@ -4462,7 +4465,7 @@ impl App {
                     };
                 }
             })
-        });
+        })
     }
 
     /// Reset confirmation: wiping a key is irreversible, so require the user to
