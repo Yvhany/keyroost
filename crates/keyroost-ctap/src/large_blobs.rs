@@ -488,9 +488,104 @@ pub fn write(
     Ok(())
 }
 
+/// AES-256-GCM decrypt of one largeBlob entry (CTAP §6.10.4). AAD is
+/// `b"blob"` followed by the 8-byte little-endian original (uncompressed)
+/// size. `ciphertext` includes the trailing 16-byte GCM tag. Returns None on
+/// any authentication failure — the caller trial-decrypts entries and treats
+/// None as "not this credential's blob".
+// Consumed by the largeBlob cert-read path in a later task; standalone here.
+#[allow(dead_code)]
+pub(crate) fn gcm_decrypt(
+    key: &[u8; 32],
+    nonce: &[u8],
+    ciphertext: &[u8],
+    orig_size: u64,
+) -> Option<Vec<u8>> {
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes256Gcm, Nonce};
+
+    if nonce.len() != 12 {
+        return None;
+    }
+    let mut aad = Vec::with_capacity(12);
+    aad.extend_from_slice(b"blob");
+    aad.extend_from_slice(&orig_size.to_le_bytes());
+    let cipher = Aes256Gcm::new_from_slice(key).ok()?;
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
+        .ok()
+}
+
+/// Raw-DEFLATE inflate (RFC 1951 — NOT zlib-wrapped) of the decrypted
+/// plaintext, bounded by `orig_size`. Returns None on malformed input or when
+/// the inflated length does not equal `orig_size`.
+// Consumed by the largeBlob cert-read path in a later task; standalone here.
+#[allow(dead_code)]
+pub(crate) fn inflate_raw(compressed: &[u8], orig_size: u64) -> Option<Vec<u8>> {
+    let limit = usize::try_from(orig_size).ok()?;
+    // The RAW (non-zlib) limited inflate. `decompress_to_vec_with_limit` is
+    // raw DEFLATE with a size cap; the `_zlib` variants expect a zlib header,
+    // which the largeBlob plaintext does NOT have.
+    let out = miniz_oxide::inflate::decompress_to_vec_with_limit(compressed, limit).ok()?;
+    (out.len() as u64 == orig_size).then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gcm_roundtrip_and_wrong_key_fails() {
+        use aes_gcm::{
+            aead::{Aead, KeyInit, Payload},
+            Aes256Gcm, Nonce,
+        };
+        let key = [7u8; 32];
+        let nonce = [3u8; 12];
+        let plaintext = b"hello blob";
+        let orig_size = plaintext.len() as u64;
+        let mut aad = b"blob".to_vec();
+        aad.extend_from_slice(&orig_size.to_le_bytes());
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let ct = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        // Right key decrypts.
+        assert_eq!(
+            gcm_decrypt(&key, &nonce, &ct, orig_size).as_deref(),
+            Some(&plaintext[..])
+        );
+        // Wrong key fails the tag.
+        assert_eq!(gcm_decrypt(&[9u8; 32], &nonce, &ct, orig_size), None);
+        // Wrong orig_size changes the AAD → tag fails.
+        assert_eq!(gcm_decrypt(&key, &nonce, &ct, orig_size + 1), None);
+    }
+
+    #[test]
+    fn inflate_raw_roundtrip_and_bounds() {
+        let data = b"the quick brown fox ".repeat(50);
+        let compressed = miniz_oxide::deflate::compress_to_vec(&data, 6);
+        assert_eq!(
+            inflate_raw(&compressed, data.len() as u64).as_deref(),
+            Some(&data[..])
+        );
+        // Garbage input → None, not a panic.
+        assert_eq!(inflate_raw(&[0xff, 0x00, 0x13, 0x37], 100), None);
+        // A declared orig_size the inflated data doesn't match → None.
+        assert_eq!(inflate_raw(&compressed, (data.len() + 1) as u64), None);
+    }
 
     fn sample_entry(seed: u8) -> LargeBlobEntry {
         LargeBlobEntry {

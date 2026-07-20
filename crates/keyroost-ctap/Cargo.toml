@@ -43,6 +43,13 @@ rand_core = { version = "0.6", default-features = false, features = ["getrandom"
 # Already in the tree via p256/elliptic-curve; used to scrub shared secrets
 # and pinUvAuthTokens on drop (forbid(unsafe_code) rules out a manual wipe).
 zeroize = { version = "1", default-features = false }
+# Per-credential largeBlob AEAD (CTAP §6.10.4): AES-256-GCM. Already resolved
+# in the workspace lockfile via keyroost-import's Aegis path; direct use here
+# for reading a cert out of largeBlob storage.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+# Raw-DEFLATE inflate for the compressed largeBlob plaintext. Pure Rust;
+# already transitively in the tree.
+miniz_oxide = "0.8"
 
 # Auto-select the hidapi I/O backend on macOS / Windows (Linux keeps the
 # dependency-free hidraw File backend).
