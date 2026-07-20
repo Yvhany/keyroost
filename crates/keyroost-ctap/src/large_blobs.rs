@@ -493,8 +493,6 @@ pub fn write(
 /// size. `ciphertext` includes the trailing 16-byte GCM tag. Returns None on
 /// any authentication failure — the caller trial-decrypts entries and treats
 /// None as "not this credential's blob".
-// Consumed by the largeBlob cert-read path in a later task; standalone here.
-#[allow(dead_code)]
 pub(crate) fn gcm_decrypt(
     key: &[u8; 32],
     nonce: &[u8],
@@ -525,8 +523,6 @@ pub(crate) fn gcm_decrypt(
 /// Raw-DEFLATE inflate (RFC 1951 — NOT zlib-wrapped) of the decrypted
 /// plaintext, bounded by `orig_size`. Returns None on malformed input or when
 /// the inflated length does not equal `orig_size`.
-// Consumed by the largeBlob cert-read path in a later task; standalone here.
-#[allow(dead_code)]
 pub(crate) fn inflate_raw(compressed: &[u8], orig_size: u64) -> Option<Vec<u8>> {
     let limit = usize::try_from(orig_size).ok()?;
     // The RAW (non-zlib) limited inflate. `decompress_to_vec_with_limit` is
@@ -534,6 +530,33 @@ pub(crate) fn inflate_raw(compressed: &[u8], orig_size: u64) -> Option<Vec<u8>> 
     // which the largeBlob plaintext does NOT have.
     let out = miniz_oxide::inflate::decompress_to_vec_with_limit(compressed, limit).ok()?;
     (out.len() as u64 == orig_size).then_some(out)
+}
+
+/// Find and decode this credential's SSH certificate from the largeBlob
+/// array. Trial-decrypts each entry with the credential's largeBlobKey (the
+/// GCM tag identifies the matching entry), inflates the raw-DEFLATE plaintext,
+/// and returns the certificate **wire bytes** when the result parses as an
+/// OpenSSH certificate. None when no entry is this credential's, or the
+/// decrypted blob is not a certificate. Pure over already-read entries.
+pub fn extract_cert_from_entries(
+    large_blob_key: &[u8; 32],
+    entries: &[LargeBlobEntry],
+) -> Option<Vec<u8>> {
+    for e in entries {
+        let Some(plain) = gcm_decrypt(large_blob_key, &e.nonce, &e.ciphertext, e.orig_size) else {
+            continue; // not this credential's entry (tag failed)
+        };
+        let Some(wire) = inflate_raw(&plain, e.orig_size) else {
+            continue; // decrypted but not valid DEFLATE / size mismatch
+        };
+        if ssh_cert::parse_wire(&wire).is_some() {
+            return Some(wire);
+        }
+        // Decrypted + inflated but not a cert: it's this credential's blob but
+        // holds non-cert data. Stop — this IS the credential's entry.
+        return None;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -665,6 +688,61 @@ mod tests {
         assert!(parsed[0].is_kr_note());
         assert_eq!(parsed[0].as_text().as_deref(), Some(text));
         assert_eq!(parsed[0].orig_size, text.len() as u64);
+    }
+
+    #[test]
+    fn extract_cert_from_entries_roundtrips_a_real_cert() {
+        use aes_gcm::{
+            aead::{Aead, KeyInit, Payload},
+            Aes256Gcm, Nonce,
+        };
+        // A known-good OpenSSH cert fixture already exists for the ssh_cert tests.
+        let cert_pub = crate::ssh_cert::tests_fixture::FIXTURE_CERT_PUB;
+        let (_, wire) = crate::ssh_cert::parse_text(cert_pub.trim()).unwrap();
+
+        // Build the largeBlob entry the way fido2-token would: raw-DEFLATE then
+        // AES-256-GCM with AAD = "blob" || origSize LE.
+        let key = [0x11u8; 32];
+        let nonce = [0x22u8; 12];
+        let orig_size = wire.len() as u64;
+        let compressed = miniz_oxide::deflate::compress_to_vec(&wire, 6);
+        let mut aad = b"blob".to_vec();
+        aad.extend_from_slice(&orig_size.to_le_bytes());
+        let ct = Aes256Gcm::new_from_slice(&key)
+            .unwrap()
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &compressed,
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        let entry = LargeBlobEntry {
+            ciphertext: ct,
+            nonce: nonce.to_vec(),
+            orig_size,
+        };
+        // A decoy entry encrypted with a different key must be skipped.
+        let decoy = LargeBlobEntry {
+            ciphertext: vec![0u8; 40],
+            nonce: vec![0u8; 12],
+            orig_size: 8,
+        };
+
+        let got =
+            extract_cert_from_entries(&key, &[decoy.clone(), entry.clone()]).expect("cert found");
+        assert_eq!(got, wire);
+        // Full round trip back to -cert.pub reproduces the original type +
+        // base64 body (the comment is not part of the certificate, so it is
+        // not preserved — matches ssh_cert's own round-trip test).
+        let line = crate::ssh_cert::to_cert_pub(&got).unwrap();
+        let mut parts = line.split_ascii_whitespace();
+        let mut orig_parts = cert_pub.split_ascii_whitespace();
+        assert_eq!(parts.next(), orig_parts.next());
+        assert_eq!(parts.next(), orig_parts.next());
+        // Wrong key → nothing.
+        assert!(extract_cert_from_entries(&[0x99u8; 32], &[decoy, entry]).is_none());
     }
 
     #[test]
