@@ -53,6 +53,8 @@ const RESP_USER: u64 = 0x06;
 const RESP_CREDENTIAL_ID: u64 = 0x07;
 const RESP_PUBLIC_KEY: u64 = 0x08;
 const RESP_TOTAL_CREDS: u64 = 0x09;
+// 0x0A is credProtect (a small uint), not parsed here.
+const RESP_LARGE_BLOB_KEY: u64 = 0x0B;
 
 /// Upper bound on the RP / credential count we'll enumerate. Real
 /// authenticators hold at most a few dozen resident credentials; the spec's
@@ -110,6 +112,10 @@ pub struct Credential {
     pub user: CredentialUser,
     /// COSE algorithm identifier extracted from the credential public key.
     pub algorithm: Option<i64>,
+    /// The credential's 32-byte largeBlobKey, when the authenticator returned
+    /// one (present only for credentials created with the largeBlob extension).
+    /// Used to decrypt this credential's per-credential largeBlob entry.
+    pub large_blob_key: Option<[u8; 32]>,
 }
 
 /// Bundle of (device, token, command-code) for issuing credentialManagement
@@ -361,10 +367,16 @@ pub fn parse_credential(v: &Value) -> Result<Credential, CtapError> {
 
     let algorithm = pubkey.and_then(public_key_algorithm);
 
+    let large_blob_key = v
+        .get_uint_key(RESP_LARGE_BLOB_KEY)
+        .and_then(|x| x.as_bytes())
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+
     Ok(Credential {
         credential_id,
         user: credential_user,
         algorithm,
+        large_blob_key,
     })
 }
 
@@ -678,5 +690,49 @@ mod tests {
         assert_eq!(parsed.user.name.as_deref(), Some("alice"));
         assert_eq!(parsed.user.display_name.as_deref(), Some("Alice Liddell"));
         assert_eq!(parsed.algorithm, Some(-7));
+    }
+
+    #[test]
+    fn parse_credential_reads_large_blob_key() {
+        let key = [0x5Au8; 32];
+        let cred = Value::Map(vec![
+            (
+                Value::UInt(RESP_USER),
+                Value::Map(vec![(
+                    Value::Text("id".into()),
+                    Value::Bytes(vec![1, 2, 3]),
+                )]),
+            ),
+            (
+                Value::UInt(RESP_CREDENTIAL_ID),
+                Value::Map(vec![(
+                    Value::Text("id".into()),
+                    Value::Bytes(vec![0xAB; 32]),
+                )]),
+            ),
+            (Value::UInt(RESP_LARGE_BLOB_KEY), Value::Bytes(key.to_vec())),
+        ]);
+        let parsed = parse_credential(&cred).unwrap();
+        assert_eq!(parsed.large_blob_key, Some(key));
+
+        // No 0x0B entry at all -> None.
+        let cred_no_blob_key = Value::Map(vec![
+            (
+                Value::UInt(RESP_USER),
+                Value::Map(vec![(
+                    Value::Text("id".into()),
+                    Value::Bytes(vec![1, 2, 3]),
+                )]),
+            ),
+            (
+                Value::UInt(RESP_CREDENTIAL_ID),
+                Value::Map(vec![(
+                    Value::Text("id".into()),
+                    Value::Bytes(vec![0xAB; 32]),
+                )]),
+            ),
+        ]);
+        let parsed = parse_credential(&cred_no_blob_key).unwrap();
+        assert_eq!(parsed.large_blob_key, None);
     }
 }
