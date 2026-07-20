@@ -5907,10 +5907,13 @@ fn run_fido_ssh_cert_extract(
     let cert_pub = keyroost_ctap::ssh_cert::to_cert_pub(&wire)
         .ok_or("stored blob is not a valid OpenSSH certificate")?;
 
-    // Resolve the output path (default: <sanitised rp-id>-cert.pub).
+    // Resolve the output path (default: <sanitised rp-id>-cert.pub). The RP id
+    // is device-derived and must be treated as hostile: use the path-safe
+    // filename sanitizer here, not sanitize_terminal (which only neutralizes
+    // control/bidi/zero-width chars for display, not `/`, `\`, or `..`).
     let out_path = match out {
         Some(p) => p.to_path_buf(),
-        None => std::path::PathBuf::from(format!("{}-cert.pub", sanitize_terminal(rp_id))),
+        None => std::path::PathBuf::from(keyroost_ctap::ssh_cert::default_cert_filename(rp_id)),
     };
     if out_path.exists() && !force {
         return Err(format!(

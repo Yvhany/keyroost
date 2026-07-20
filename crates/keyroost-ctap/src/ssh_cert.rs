@@ -243,6 +243,24 @@ pub fn to_cert_pub(wire: &[u8]) -> Option<String> {
     Some(format!("{} {}\n", info.key_type, base64_encode(wire)))
 }
 
+/// A safe `-cert.pub` filename derived from an SSH credential's RP id. Every
+/// character outside `[A-Za-z0-9._-]` is replaced with `_`, so the result is
+/// always a single path component — no `/`, `\`, or other separator can
+/// survive, defeating path traversal from a hostile (device-derived) RP id.
+pub fn default_cert_filename(rp_id: &str) -> String {
+    let safe: String = rp_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{safe}-cert.pub")
+}
+
 /// Test fixture shared with large_blobs' classification tests.
 #[cfg(test)]
 pub(crate) mod tests_fixture {
@@ -334,6 +352,16 @@ mod tests {
         assert!(line.ends_with('\n'));
         // And the re-encoded line parses back.
         assert!(parse_text(&line).is_some());
+    }
+
+    #[test]
+    fn default_cert_filename_is_path_safe() {
+        assert_eq!(default_cert_filename("ssh:demo"), "ssh_demo-cert.pub");
+        assert_eq!(default_cert_filename("ssh:"), "ssh_-cert.pub");
+        // No path separator can survive a hostile RP id -> no traversal.
+        let evil = default_cert_filename("ssh:../../etc/passwd");
+        assert!(!evil.contains('/') && !evil.contains('\\'));
+        assert!(evil.ends_with("-cert.pub"));
     }
 
     #[test]
