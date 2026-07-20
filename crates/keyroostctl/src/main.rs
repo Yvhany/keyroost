@@ -1814,6 +1814,51 @@ enum FidoCmd {
         #[command(subcommand)]
         cmd: LargeBlobCmd,
     },
+    /// Enumerate resident SSH credentials and extract a stored OpenSSH
+    /// certificate from a credential's largeBlob to a `-cert.pub` file.
+    SshCert {
+        #[command(subcommand)]
+        cmd: SshCertCmd,
+    },
+}
+
+/// Subcommands for resident SSH credentials (RP IDs of the form `ssh:*`).
+///
+/// A FIDO SSH key may stash its OpenSSH certificate in the FIDO2 large-blob
+/// store, keyed by the credential's per-credential largeBlobKey. These commands
+/// enumerate those credentials (needs a PIN for credential management) and pull
+/// the certificate back out as an `id-cert.pub` file usable by `ssh`.
+#[derive(Subcommand)]
+enum SshCertCmd {
+    /// List resident SSH credentials (ssh:* RP IDs) and whether each has a
+    /// certificate stored in its largeBlob.
+    List {
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Extract an SSH certificate from its largeBlob to a -cert.pub file.
+    Extract {
+        /// RP ID of the SSH credential (e.g. ssh:demo). Required only to
+        /// disambiguate when several SSH credentials are present.
+        #[arg(long)]
+        credential: Option<String>,
+        /// Output file (default: <rp-id-sanitised>-cert.pub).
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
+        /// Overwrite the output file if it exists.
+        #[arg(long)]
+        force: bool,
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
 }
 
 /// Subcommands for the FIDO2 large-blob array.
@@ -5645,6 +5690,7 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             Ok(())
         }
         FidoCmd::LargeBlob { cmd } => run_fido_large_blob(cmd),
+        FidoCmd::SshCert { cmd } => run_fido_ssh_cert(cmd),
     }
 }
 
@@ -5697,6 +5743,185 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
             run_fido_large_blob_clear(path.as_deref(), &pin, *yes)
         }
     }
+}
+
+/// Dispatch for `fido ssh-cert` — list SSH credentials or extract a cert.
+fn run_fido_ssh_cert(cmd: &SshCertCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        SshCertCmd::List {
+            pin_env,
+            pin_stdin,
+            path,
+        } => {
+            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            run_fido_ssh_cert_list(path.as_deref(), &pin)
+        }
+        SshCertCmd::Extract {
+            credential,
+            out,
+            force,
+            pin_env,
+            pin_stdin,
+            path,
+        } => {
+            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            run_fido_ssh_cert_extract(
+                path.as_deref(),
+                &pin,
+                credential.as_deref(),
+                out.as_deref(),
+                *force,
+            )
+        }
+    }
+}
+
+/// The (rp_id, credential) pairs for every resident `ssh:*` credential, paired
+/// with the key's largeBlob array (the certificate bytes live in the array,
+/// keyed by each credential's per-credential largeBlobKey).
+type SshCredEnumeration = (
+    Vec<(String, keyroost_ctap::cred_mgmt::Credential)>,
+    keyroost_ctap::large_blobs::LargeBlobArray,
+);
+
+/// Open a FIDO key, read its largeBlob array, and enumerate every resident
+/// credential under an `ssh:*` relying party. Both halves are needed to tell
+/// whether a credential actually has a decodable certificate stored.
+fn enumerate_ssh_credentials(
+    path: Option<&std::path::Path>,
+    pin: &str,
+) -> Result<SshCredEnumeration, Box<dyn std::error::Error>> {
+    let path = resolve_fido_path(path)?;
+    let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
+    if !init.supports_cbor() {
+        return Err("device is U2F-only; CTAP2 credential management not supported".into());
+    }
+    let info = keyroost_ctap::get_info(&mut dev)?;
+    if info.option("largeBlobs") != Some(true) {
+        return Err("this key does not support the FIDO2 large-blob store".into());
+    }
+    // Read the world-readable largeBlob array BEFORE we borrow the device for
+    // the credential-management session (the manager holds `&mut dev` for its
+    // whole lifetime, so both device users can't be live at once).
+    let array = keyroost_ctap::large_blobs::read(&mut dev, &info)?;
+
+    let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+        &mut dev,
+        pin,
+        &info,
+        keyroost_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT,
+    )?;
+    let mut mgr = keyroost_ctap::cred_mgmt::CredentialManager::new(&mut dev, token, &info)?;
+
+    let mut creds = Vec::new();
+    for rp in mgr.list_relying_parties()? {
+        if !rp.id.starts_with("ssh:") {
+            continue;
+        }
+        // Every other CTAP API hands back the RP id-hash; a rare quirky entry
+        // reports None, in which case we recompute it from the id ourselves.
+        let hash = rp
+            .rp_id_hash
+            .unwrap_or_else(|| keyroost_proto::sha256::sha256(rp.id.as_bytes()));
+        for c in mgr.list_credentials(&hash)? {
+            creds.push((rp.id.clone(), c));
+        }
+    }
+    Ok((creds, array))
+}
+
+fn run_fido_ssh_cert_list(
+    path: Option<&std::path::Path>,
+    pin: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (creds, array) = enumerate_ssh_credentials(path, pin)?;
+    if creds.is_empty() {
+        println!("No resident SSH credentials (ssh:* relying parties) on this key.");
+        return Ok(());
+    }
+    for (rp_id, c) in &creds {
+        let has_cert = c
+            .large_blob_key
+            .as_ref()
+            .and_then(|k| keyroost_ctap::large_blobs::extract_cert_from_entries(k, &array.entries))
+            .is_some();
+        println!(
+            "{}  {}",
+            sanitize_terminal(rp_id),
+            if has_cert {
+                "certificate stored"
+            } else {
+                "no certificate"
+            }
+        );
+    }
+    Ok(())
+}
+
+fn run_fido_ssh_cert_extract(
+    path: Option<&std::path::Path>,
+    pin: &str,
+    credential: Option<&str>,
+    out: Option<&std::path::Path>,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (creds, array) = enumerate_ssh_credentials(path, pin)?;
+    if creds.is_empty() {
+        return Err("no resident SSH credentials (ssh:* relying parties) on this key".into());
+    }
+
+    // Select the SSH credential to extract — fail closed if ambiguous.
+    let choices = || {
+        creds
+            .iter()
+            .map(|(id, _)| sanitize_terminal(id))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let (rp_id, cred) = match credential {
+        Some(want) => creds.iter().find(|(id, _)| id == want).ok_or_else(|| {
+            format!(
+                "no SSH credential with RP ID {}; available: {}",
+                sanitize_terminal(want),
+                choices()
+            )
+        })?,
+        None => {
+            if creds.len() != 1 {
+                return Err(format!(
+                    "several SSH credentials present; pass --credential <rp-id> (one of: {})",
+                    choices()
+                )
+                .into());
+            }
+            &creds[0]
+        }
+    };
+
+    let key = cred
+        .large_blob_key
+        .as_ref()
+        .ok_or("no certificate blob stored for this credential")?;
+    let wire = keyroost_ctap::large_blobs::extract_cert_from_entries(key, &array.entries)
+        .ok_or("no certificate blob stored for this credential")?;
+    let cert_pub = keyroost_ctap::ssh_cert::to_cert_pub(&wire)
+        .ok_or("stored blob is not a valid OpenSSH certificate")?;
+
+    // Resolve the output path (default: <sanitised rp-id>-cert.pub).
+    let out_path = match out {
+        Some(p) => p.to_path_buf(),
+        None => std::path::PathBuf::from(format!("{}-cert.pub", sanitize_terminal(rp_id))),
+    };
+    if out_path.exists() && !force {
+        return Err(format!(
+            "{} already exists; pass --force to overwrite",
+            out_path.display()
+        )
+        .into());
+    }
+    std::fs::write(&out_path, cert_pub.as_bytes())?;
+    println!("Wrote SSH certificate to {}", out_path.display());
+    Ok(())
 }
 
 /// Open a FIDO authenticator and read its large-blob array (no PIN required).
@@ -7091,6 +7316,44 @@ mod cli_tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(args)
+    }
+
+    #[test]
+    fn fido_ssh_cert_extract_grammar() {
+        match parse(&[
+            "keyroostctl",
+            "fido",
+            "ssh-cert",
+            "extract",
+            "--credential",
+            "ssh:demo",
+            "--out",
+            "id-cert.pub",
+            "--force",
+            "--pin-stdin",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Fido {
+                cmd:
+                    FidoCmd::SshCert {
+                        cmd:
+                            SshCertCmd::Extract {
+                                credential,
+                                out,
+                                force,
+                                pin_stdin,
+                                ..
+                            },
+                    },
+            }) => {
+                assert_eq!(credential.as_deref(), Some("ssh:demo"));
+                assert_eq!(out.as_deref(), Some(std::path::Path::new("id-cert.pub")));
+                assert!(force && pin_stdin);
+            }
+            _ => panic!("expected fido ssh-cert extract"),
+        }
     }
 
     #[test]
