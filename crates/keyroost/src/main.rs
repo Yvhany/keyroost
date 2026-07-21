@@ -182,6 +182,14 @@ struct SecurityKeysState {
     /// tab, so a failed read doesn't retry every frame. Reset when the selected
     /// device changes so a different key loads fresh.
     lb_autoloaded: bool,
+    /// SSH certificate extracted by "Save certificate…", parked between the
+    /// background decrypt job and the save dialog resolving. `None` when no
+    /// save is in flight.
+    ssh_cert_pending: Option<PendingSshCert>,
+    /// Result line for the last "Save certificate…" action (extraction error,
+    /// or the saved path plus the parsed cert summary). Shown in the Passkeys
+    /// panel.
+    ssh_cert_status: Option<String>,
 }
 
 #[derive(Default, Clone, Copy, Debug, PartialEq)]
@@ -692,6 +700,39 @@ fn wipe(s: &mut String) {
 /// `if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) { return; }`.
 fn completion_still_valid(captured: Option<&DeviceId>, current: Option<&DeviceId>) -> bool {
     matches!((captured, current), (Some(c), Some(now)) if c == now)
+}
+
+/// Whether a resident credential should offer the "Save certificate…" action.
+/// True only for SSH relying parties (`ssh:*`) that also carry a largeBlob key:
+/// the key is required to decrypt this credential's per-credential largeBlob
+/// entry, so without one there is nothing an extract job could produce.
+/// (Whether a certificate is *actually* stored is only knowable by reading the
+/// device's largeBlob array — that stays in the background job, which reports
+/// "no certificate stored" when the decrypt turns up nothing.)
+fn ssh_cred_offers_cert(rp_id: &str, large_blob_key: Option<&[u8; 32]>) -> bool {
+    rp_id.starts_with("ssh:") && large_blob_key.is_some()
+}
+
+/// One-line human summary of a parsed SSH certificate, shown beside the saved
+/// path after "Save certificate…" succeeds.
+fn ssh_cert_summary(info: &keyroost_ctap::ssh_cert::SshCertInfo) -> String {
+    let kind = if info.cert_type == keyroost_ctap::ssh_cert::CERT_TYPE_USER {
+        "user"
+    } else {
+        "host"
+    };
+    let principals = if info.principals.is_empty() {
+        "(any)".to_string()
+    } else {
+        info.principals.join(", ")
+    };
+    format!(
+        "{} ({kind}) \u{00b7} key id {} \u{00b7} principals {} \u{00b7} {}",
+        info.key_type,
+        info.key_id,
+        principals,
+        keyroost_ctap::ssh_cert::format_validity(info.valid_after, info.valid_before),
+    )
 }
 
 /// Whether the FIDO Settings subview exists for the selected key.
@@ -1621,6 +1662,20 @@ enum FileTarget {
     /// entry index so a second Export click (or a cancelled dialog) can never
     /// mismatch which entry a resolving dialog belongs to.
     LbExport(usize),
+    /// Passkeys tab "Save certificate…" destination for an SSH credential's
+    /// extracted cert. The cert text was decrypted by the background job and
+    /// parked in `security_keys.ssh_cert_pending`; the resolving dialog writes
+    /// it to the chosen path. No payload here (the enum is `Copy`): only one
+    /// save-cert dialog is ever in flight, so the pending text is unambiguous.
+    SshCertSave,
+}
+
+/// An SSH certificate extracted from a credential's largeBlob, waiting for the
+/// user to pick a destination in the save dialog. `summary` is the parsed
+/// one-line description shown next to the saved path on success.
+struct PendingSshCert {
+    cert_pub: String,
+    summary: String,
 }
 
 impl App {
@@ -1731,6 +1786,28 @@ impl App {
                                         }
                                     }
                                 });
+                            }
+                            FileTarget::SshCertSave => {
+                                // The cert text was decrypted by the background
+                                // job and parked here; write it to the chosen
+                                // path. `take` so a re-opened dialog can't rewrite
+                                // a stale cert.
+                                self.security_keys.ssh_cert_status =
+                                    Some(match self.security_keys.ssh_cert_pending.take() {
+                                        None => "Save failed: no certificate was ready \
+                                                 to write"
+                                            .to_string(),
+                                        Some(pending) => {
+                                            match std::fs::write(&path, pending.cert_pub.as_bytes())
+                                            {
+                                                Ok(()) => format!(
+                                                    "Saved certificate to {text}\n{}",
+                                                    pending.summary
+                                                ),
+                                                Err(e) => format!("Save failed: {e}"),
+                                            }
+                                        }
+                                    });
                             }
                         }
                     }
@@ -3418,6 +3495,79 @@ impl App {
         Ok(())
     }
 
+    /// Extract and save the OpenSSH certificate stored in an SSH credential's
+    /// largeBlob. The credential's largeBlob key was captured from the unlocked
+    /// session at click time (the GUI already enumerated it), so — unlike the
+    /// CLI, which starts cold and rebuilds a CredentialManager to fetch the key —
+    /// the job needs no PIN token: reading the world-readable largeBlob array
+    /// takes the device but no auth. On success the parsed cert is parked in
+    /// `ssh_cert_pending` and a save dialog opens, defaulting to a path-safe
+    /// `<rp-id>-cert.pub` filename. PIN only, no touch.
+    fn save_ssh_cert(&mut self, rp_id: String, large_blob_key: [u8; 32]) {
+        let Some(target) = self.selected_fido_target() else {
+            self.security_keys.ssh_cert_status = Some("No FIDO key selected.".into());
+            return;
+        };
+        // Device-bound (KEY-012): only run while the unlocked session still
+        // matches the current selection.
+        if self.fido_session().is_none() {
+            return;
+        }
+        let for_device = self.selected_device.clone();
+        self.spawn_job("Extracting certificate\u{2026}", move || {
+            let result = Self::extract_ssh_cert(&target, &large_blob_key);
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return; // selection changed mid-extract; discard the cert
+                }
+                match result {
+                    Ok(pending) => {
+                        app.security_keys.ssh_cert_pending = Some(pending);
+                        app.security_keys.ssh_cert_status = None;
+                        app.spawn_file_dialog(
+                            FileTarget::SshCertSave,
+                            true,
+                            &[("SSH certificate", &["pub"]), ("All files", &["*"])],
+                            Some(&keyroost_ctap::ssh_cert::default_cert_filename(&rp_id)),
+                        );
+                    }
+                    Err(e) => app.security_keys.ssh_cert_status = Some(e),
+                }
+            })
+        });
+    }
+
+    /// Open the device, read its largeBlob array, and decrypt this credential's
+    /// certificate entry with `large_blob_key`. Returns the `-cert.pub` text plus
+    /// a one-line parsed summary, or a human-readable error.
+    fn extract_ssh_cert(
+        target: &FidoTarget,
+        large_blob_key: &[u8; 32],
+    ) -> Result<PendingSshCert, String> {
+        let (mut dev, cbor, _init) = open_fido(target)?;
+        if !cbor {
+            return Err("device is U2F-only; large blobs are not supported".into());
+        }
+        let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
+        if info.option("largeBlobs") != Some(true) {
+            return Err("this key does not support the FIDO2 large-blob store".into());
+        }
+        // Read the world-readable array BEFORE any credential-management borrow —
+        // matches the CLI's device-ownership ordering (see `enumerate_ssh_credentials`).
+        let array = keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())?;
+        let wire =
+            keyroost_ctap::large_blobs::extract_cert_from_entries(large_blob_key, &array.entries)
+                .ok_or("no certificate is stored for this credential")?;
+        let cert_pub = keyroost_ctap::ssh_cert::to_cert_pub(&wire)
+            .ok_or("stored blob is not a valid OpenSSH certificate")?;
+        // to_cert_pub already parsed the wire, so parse_wire here cannot fail;
+        // fall back to a minimal label rather than erroring if it somehow does.
+        let summary = keyroost_ctap::ssh_cert::parse_wire(&wire)
+            .map(|info| ssh_cert_summary(&info))
+            .unwrap_or_else(|| "OpenSSH certificate".to_string());
+        Ok(PendingSshCert { cert_pub, summary })
+    }
+
     fn submit_change_pin(&mut self) {
         // Check busy *before* consuming the typed PINs (see try_unlock).
         if self.busy() {
@@ -5046,6 +5196,10 @@ impl App {
         self.security_keys.lb_status = None;
         self.security_keys.lb_confirm_delete = None;
         self.security_keys.lb_confirm_clear = false;
+        // SSH-cert extract state is per-key too (KEY-012): drop any parked cert
+        // and the result line so a different key never shows the previous one's.
+        self.security_keys.ssh_cert_pending = None;
+        self.security_keys.ssh_cert_status = None;
         // Fingerprint state is per-key: the cached list, the pending delete /
         // rename, the name draft, and a live enroll wizard must not carry
         // over (KEY-012). A running enroll worker is told to cancel; it
@@ -8705,6 +8859,10 @@ impl App {
             ui.add_space(14.0);
             let mut reload = false;
             let mut delete: Option<Vec<u8>> = None;
+            // Collected in the credential loop (below), applied after the card so
+            // the extract job isn't dispatched while `self` is borrowed by the
+            // cloned rps list: (rp id, credential's largeBlob key).
+            let mut save_cert: Option<(String, [u8; 32])> = None;
             theme::card_frame(p).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -8771,6 +8929,29 @@ impl App {
                                                 .clicked()
                                             {
                                                 delete = Some(c.credential_id.clone());
+                                            }
+                                            // SSH credentials that carry a largeBlob
+                                            // key can hold an OpenSSH certificate;
+                                            // offer to extract + save it. Extraction
+                                            // is device I/O + decrypt, so it runs as a
+                                            // background job (see `save_ssh_cert`).
+                                            if ssh_cred_offers_cert(
+                                                &rp.id,
+                                                c.large_blob_key.as_ref(),
+                                            ) {
+                                                ui.add_space(6.0);
+                                                if theme::button(
+                                                    ui,
+                                                    p,
+                                                    BtnKind::Ghost,
+                                                    "Save certificate\u{2026}",
+                                                )
+                                                .clicked()
+                                                {
+                                                    if let Some(key) = c.large_blob_key {
+                                                        save_cert = Some((rp.id.clone(), key));
+                                                    }
+                                                }
                                             }
                                             ui.add_space(8.0);
                                             ui.vertical(|ui| {
@@ -8852,6 +9033,23 @@ impl App {
             }
             if let Some(id) = delete {
                 self.delete_credential(id);
+            }
+            if let Some((rp_id, key)) = save_cert {
+                self.save_ssh_cert(rp_id, key);
+            }
+            // Result of the last "Save certificate…" (extraction error, or the
+            // saved path plus the parsed cert summary).
+            if let Some(status) = self.security_keys.ssh_cert_status.clone() {
+                ui.add_space(8.0);
+                theme::card_frame(p).show(ui, |ui| {
+                    for line in status.lines() {
+                        ui.label(
+                            egui::RichText::new(line)
+                                .font(theme::f_reg(12.5))
+                                .color(p.txt2),
+                        );
+                    }
+                });
             }
         }
 
@@ -13489,6 +13687,25 @@ mod tests {
             ..Default::default()
         };
         assert!(!fido_settings_available(Some(&u2f_only)));
+    }
+
+    /// The "Save certificate…" action shows only for resident credentials that
+    /// are SSH relying parties (`ssh:*`) AND carry a largeBlob key — the key is
+    /// mandatory to decrypt the per-credential cert entry, so without it there
+    /// is nothing the action could extract.
+    #[test]
+    fn ssh_cred_offers_cert_gates_on_ssh_rp_and_key() {
+        let key = [7u8; 32];
+        // ssh:* with a key → offered.
+        assert!(ssh_cred_offers_cert("ssh:demo", Some(&key)));
+        assert!(ssh_cred_offers_cert("ssh:", Some(&key)));
+        // ssh:* without a key → not offered (nothing to decrypt with).
+        assert!(!ssh_cred_offers_cert("ssh:demo", None));
+        // non-ssh RP → never offered, key or not.
+        assert!(!ssh_cred_offers_cert("example.com", Some(&key)));
+        assert!(!ssh_cred_offers_cert("example.com", None));
+        // A prefix look-alike that isn't the ssh: scheme is not offered.
+        assert!(!ssh_cred_offers_cert("sshy:demo", Some(&key)));
     }
 
     /// Reset is the recovery for a forgotten/blocked PIN and needs no PIN
