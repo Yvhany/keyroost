@@ -5879,13 +5879,28 @@ fn run_fido_ssh_cert_extract(
             .join(", ")
     };
     let (rp_id, cred) = match credential {
-        Some(want) => creds.iter().find(|(id, _)| id == want).ok_or_else(|| {
-            format!(
-                "no SSH credential with RP ID {}; available: {}",
-                sanitize_terminal(want),
-                choices()
-            )
-        })?,
+        Some(want) => {
+            let matches: Vec<&(String, keyroost_ctap::cred_mgmt::Credential)> =
+                creds.iter().filter(|(id, _)| id == want).collect();
+            match matches.len() {
+                0 => {
+                    return Err(format!(
+                        "no SSH credential with RP ID {}; available: {}",
+                        sanitize_terminal(want),
+                        choices()
+                    )
+                    .into());
+                }
+                1 => matches[0],
+                _ => {
+                    return Err(format!(
+                        "multiple credentials share RP id '{}'; cannot disambiguate",
+                        sanitize_terminal(want)
+                    )
+                    .into());
+                }
+            }
+        }
         None => {
             if creds.len() != 1 {
                 return Err(format!(
@@ -5898,12 +5913,19 @@ fn run_fido_ssh_cert_extract(
         }
     };
 
-    let key = cred
-        .large_blob_key
-        .as_ref()
-        .ok_or("no certificate blob stored for this credential")?;
+    let key = cred.large_blob_key.as_ref().ok_or_else(|| {
+        format!(
+            "credential '{}' has no largeBlob key — no certificate is stored for it",
+            sanitize_terminal(rp_id)
+        )
+    })?;
     let wire = keyroost_ctap::large_blobs::extract_cert_from_entries(key, &array.entries)
-        .ok_or("no certificate blob stored for this credential")?;
+        .ok_or_else(|| {
+            format!(
+                "no SSH certificate found in credential '{}'s largeBlob (no matching entry, or the stored blob is not a certificate)",
+                sanitize_terminal(rp_id)
+            )
+        })?;
     let cert_pub = keyroost_ctap::ssh_cert::to_cert_pub(&wire)
         .ok_or("stored blob is not a valid OpenSSH certificate")?;
 

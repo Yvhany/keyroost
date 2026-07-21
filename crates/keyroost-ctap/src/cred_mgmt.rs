@@ -105,7 +105,7 @@ pub struct CredentialUser {
 }
 
 /// One resident credential entry returned by `enumerateCredentials`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Credential {
     /// PublicKeyCredentialDescriptor.id — used as the handle for deletion.
     pub credential_id: Vec<u8>,
@@ -116,6 +116,29 @@ pub struct Credential {
     /// one (present only for credentials created with the largeBlob extension).
     /// Used to decrypt this credential's per-credential largeBlob entry.
     pub large_blob_key: Option<[u8; 32]>,
+}
+
+/// Manual `Debug`: `large_blob_key` is key material (decrypts this
+/// credential's largeBlob entry), so it must never be printed verbatim —
+/// redact it even though nothing `{:?}`-prints a `Credential` today.
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        struct Redacted;
+        impl std::fmt::Debug for Redacted {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "<redacted 32 bytes>")
+            }
+        }
+        f.debug_struct("Credential")
+            .field("credential_id", &self.credential_id)
+            .field("user", &self.user)
+            .field("algorithm", &self.algorithm)
+            .field(
+                "large_blob_key",
+                &self.large_blob_key.as_ref().map(|_| Redacted),
+            )
+            .finish()
+    }
 }
 
 /// Bundle of (device, token, command-code) for issuing credentialManagement

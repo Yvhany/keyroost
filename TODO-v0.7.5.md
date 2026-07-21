@@ -202,6 +202,12 @@ anything big on top:
       `keyroostctl fido ssh-cert extract` (and the GUI), and confirm the
       output -cert.pub is byte-identical to the original — the real
       cross-implementation interop check the round-trip KAT can't provide.
+      Also verify extraction of a cert stored by an OLDER libfido2/fido2-token
+      (pre-~2021), which wrote ZLIB-wrapped (RFC 1950) largeBlob data rather
+      than raw DEFLATE — keyroost's `inflate_raw` accepts raw only, so an
+      old-format blob won't extract. Confirm whether any target keys carry
+      old-format blobs and decide whether to also accept zlib (as libfido2's
+      reader does).
 
 ## PC/SC: load libpcsclite at runtime, degrade gracefully (the real #47 fix)
 
