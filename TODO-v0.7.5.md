@@ -5,6 +5,19 @@ Captured here so they don't get lost. Unchecked = not started.
 
 ## v0.7.7 — new items from the v0.7.6 release run
 
+- [ ] **Full README + Pages documentation audit before the v0.7.7 release.**
+      A lot has shipped since the docs were last swept (factory reset, PIV
+      move-key incl. retired slots, SSH-cert extract, the OATH applet reset,
+      the v0.7.6 fixes), so expect a fair number of stale items. Go through:
+      the root `README.md` (feature list, the CLI command reference / all
+      `keyroostctl` subcommands incl. the new `piv move-key`, `factory-reset`,
+      `fido ssh-cert`, `oath reset`; install instructions incl. the libpcsclite
+      note for tarball/binstall users; the Windows signed-binary framing); and
+      the GitHub **Pages / Learn site** (served from `docs/`). Check for:
+      commands that no longer exist or were renamed, missing new commands,
+      outdated screenshots, version numbers, stale capability claims, and dead
+      links. Cross-check against `cargo run -p keyroostctl -- --help` and the
+      GUI so nothing documented is gone and nothing shipped is undocumented.
 - [ ] **Widen the release-attach retry window in `linux-bundles.yml`.** Both
       attach loops (AppImage and .flatpak) retry 6×20s waiting for release.yml
       to create the GitHub Release; v0.7.6 lost that race by 16 seconds (the
