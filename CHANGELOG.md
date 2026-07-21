@@ -12,6 +12,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the 20 Yubico retired key-management slots (82–95) for key archival /
   rotation. Non-destructive — refuses an occupied destination; the certificate
   stays in the source slot. Requires firmware 5.7+.
+- **Extract an SSH certificate from a FIDO2 key** (`keyroostctl fido ssh-cert
+  extract` and a GUI "Save certificate…" action): pulls the OpenSSH
+  certificate a tool like `fido2-token` stored in a resident SSH credential's
+  largeBlob and writes it as a standard `-cert.pub` file — so the cert travels
+  with the key. Read/extract only; PIN required, no touch.
 
 ## [0.7.6] - 2026-07-17
 

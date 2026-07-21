@@ -463,6 +463,8 @@ keyroostctl list
 keyroostctl fido info
 keyroostctl fido pin-retries
 keyroostctl fido creds-list --pin-stdin        # PIN read from stdin, never argv
+keyroostctl fido ssh-cert list --pin-stdin     # list SSH certs stored in resident credentials
+keyroostctl fido ssh-cert extract -n id --out cert-cert.pub --pin-stdin
 
 # --- OATH over PC/SC ---
 keyroostctl oath list --reader yubikey

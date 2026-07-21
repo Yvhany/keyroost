@@ -197,6 +197,11 @@ anything big on top:
       it's gone from 9D and present in the retired slot, confirm the cert
       stayed in 9D, and that an occupied-destination move is refused. GUI:
       retired-slots section shows the archived key.
+- [ ] **SSH-cert extract, interop proof (v0.7.7):** on the YubiKey 5.7, store
+      a cert with `fido2-token -S -b -n ssh:… cert.pub`, extract it with
+      `keyroostctl fido ssh-cert extract` (and the GUI), and confirm the
+      output -cert.pub is byte-identical to the original — the real
+      cross-implementation interop check the round-trip KAT can't provide.
 
 ## PC/SC: load libpcsclite at runtime, degrade gracefully (the real #47 fix)
 
