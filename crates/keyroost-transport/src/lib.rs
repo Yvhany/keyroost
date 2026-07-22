@@ -1139,6 +1139,37 @@ pub(crate) struct AppletIo {
     pub get_response: fn() -> Vec<u8>,
 }
 
+/// What [`transmit_applet`] should do after one exchange, given the status word.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SwAction {
+    /// Terminal status word — return the accumulated data and this SW.
+    Done,
+    /// `61xx` (SW1 == the applet's `more_data_sw`): more data pending; send
+    /// GET RESPONSE and accumulate the next chunk.
+    MoreData,
+    /// `6Cxx` (ISO 7816-4 "wrong Le"): the card wants the *same* command
+    /// reissued with `Le = xx`. Carries `xx`. No data was returned.
+    WrongLe(u8),
+}
+
+/// Classify a two-byte status word for the applet reassembly loop.
+///
+/// `6Cxx` handling is why a T=0 smart-card reader that passes the raw card
+/// response through (Alcor, SCM, Realtek, …) no longer fails where a reader
+/// that absorbs the Le correction in firmware (the Token2 dual-interface
+/// reader) always worked (issue #84). `61xx` is checked first via the
+/// applet's `more_data_sw`; no applet uses `0x6C` for that, so the order is
+/// unambiguous.
+pub(crate) fn classify_sw(sw1: u8, more_data_sw: u8, sw2: u8) -> SwAction {
+    if sw1 == more_data_sw {
+        SwAction::MoreData
+    } else if sw1 == 0x6C {
+        SwAction::WrongLe(sw2)
+    } else {
+        SwAction::Done
+    }
+}
+
 /// One applet APDU exchange with `61xx`-continuation reassembly, shared by the
 /// OATH, OpenPGP, and PIV sessions (each computes its own sensitivity
 /// predicates). `cmd_sensitive` redacts command bodies from `--debug` traces;
@@ -1154,6 +1185,10 @@ pub(crate) fn transmit_applet(
     resp_sensitive: bool,
 ) -> Result<(Vec<u8>, u16), TransportError> {
     let mut acc = Vec::new();
+    // The original command, kept so a `6Cxx` ("wrong Le") can reissue it with
+    // the corrected length. Zeroizing because a sensitive command (VERIFY,
+    // CHANGE REFERENCE DATA, key import) must not linger on the heap.
+    let original = zeroize::Zeroizing::new(apdu.to_vec());
     let mut to_send = zeroize::Zeroizing::new(apdu.to_vec());
     let mut chunks = 0usize;
     loop {
@@ -1177,24 +1212,71 @@ pub(crate) fn transmit_applet(
             });
         }
         let (data, sw) = resp.split_at(resp.len() - 2);
-        acc.extend_from_slice(data);
         chunks += 1;
-        if acc.len() > MAX_REASSEMBLED_RESPONSE || chunks > MAX_RESPONSE_CHUNKS {
+        if chunks > MAX_RESPONSE_CHUNKS {
             return Err(TransportError::MalformedResponse(
-                "61xx continuation exceeded reassembly limits",
+                "applet continuation exceeded the chunk limit",
             ));
         }
-        if sw[0] == io.more_data_sw {
-            to_send = zeroize::Zeroizing::new((io.get_response)());
-            continue;
+        match classify_sw(sw[0], io.more_data_sw, sw[1]) {
+            SwAction::MoreData => {
+                acc.extend_from_slice(data);
+                if acc.len() > MAX_REASSEMBLED_RESPONSE {
+                    return Err(TransportError::MalformedResponse(
+                        "61xx continuation exceeded the reassembly limit",
+                    ));
+                }
+                to_send = zeroize::Zeroizing::new((io.get_response)());
+            }
+            SwAction::WrongLe(le) => {
+                // `6Cxx`: the card returned no data and wants the *same*
+                // command reissued with `Le = xx`. Some T=0 readers surface
+                // this raw where others correct it in firmware (#84). Discard
+                // any partial accumulation and reissue the original command.
+                acc.clear();
+                to_send =
+                    zeroize::Zeroizing::new(keyroost_proto::apdu::resend_with_le(&original, le));
+            }
+            SwAction::Done => {
+                acc.extend_from_slice(data);
+                return Ok((acc, u16::from_be_bytes([sw[0], sw[1]])));
+            }
         }
-        return Ok((acc, u16::from_be_bytes([sw[0], sw[1]])));
     }
 }
 
 #[cfg(test)]
 mod redaction_tests {
     use super::*;
+
+    /// The applet reassembly loop must distinguish `61xx` (more data),
+    /// `6Cxx` (wrong Le — reissue with the corrected length; issue #84), and
+    /// terminal status words. `61xx` is keyed off the applet's `more_data_sw`.
+    #[test]
+    fn classify_sw_handles_more_data_wrong_le_and_terminal() {
+        // 61xx: SW1 matches the applet's more-data byte (0x61 for all three).
+        assert_eq!(classify_sw(0x61, 0x61, 0x00), SwAction::MoreData);
+        // 6Cxx: wrong Le — carries the correct length to reissue with.
+        assert_eq!(classify_sw(0x6C, 0x61, 0xFF), SwAction::WrongLe(0xFF));
+        assert_eq!(classify_sw(0x6C, 0x61, 0x1D), SwAction::WrongLe(0x1D));
+        // Terminal status words fall through to Done.
+        assert_eq!(classify_sw(0x90, 0x61, 0x00), SwAction::Done); // 9000 OK
+        assert_eq!(classify_sw(0x6A, 0x61, 0x82), SwAction::Done); // 6A82 not found
+        assert_eq!(classify_sw(0x69, 0x61, 0x83), SwAction::Done); // 6983 blocked
+    }
+
+    /// A `6Cxx` on the case-2 GET DATA APDU that OpenPGP `status()` sends
+    /// (`00 CA p1 p2 00`) must reissue the SAME command with the trailing Le
+    /// replaced by `xx` — the exact behavior that unbreaks OpenPGP reads on
+    /// T=0 readers (#84).
+    #[test]
+    fn wrong_le_reissues_get_data_with_corrected_le() {
+        let get_data = keyroost_proto::apdu::build_apdu_get(0x00, 0xCA, 0x00, 0x6E, 0x00);
+        assert_eq!(get_data, vec![0x00, 0xCA, 0x00, 0x6E, 0x00]);
+        // Card answered 6C FF -> reissue with Le = FF, replacing the 00.
+        let reissued = keyroost_proto::apdu::resend_with_le(&get_data, 0xFF);
+        assert_eq!(reissued, vec![0x00, 0xCA, 0x00, 0x6E, 0xFF]);
+    }
 
     /// `TransportError::PublicData` must chain its inner error via
     /// `source()` like the OATH/OpenPGP/PIV parse siblings do, so callers
