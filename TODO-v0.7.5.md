@@ -18,13 +18,13 @@ Captured here so they don't get lost. Unchecked = not started.
       outdated screenshots, version numbers, stale capability claims, and dead
       links. Cross-check against `cargo run -p keyroostctl -- --help` and the
       GUI so nothing documented is gone and nothing shipped is undocumented.
-- [ ] **Widen the release-attach retry window in `linux-bundles.yml`.** Both
+- [x] **Release-attach retry window widened to 20×30s — DONE, on main.** Both
       attach loops (AppImage and .flatpak) retry 6×20s waiting for release.yml
       to create the GitHub Release; v0.7.6 lost that race by 16 seconds (the
       AppImage was left as a workflow artifact until a manual re-run). Stretch
       to ~20×30s — `--clobber` makes waiting free, and ten minutes covers any
       realistic gap between the two workflows' builds and approval gates.
-- [ ] **OATH applet reset (recovery for a forgotten OATH password).** The
+- [x] **OATH applet reset — DONE, on main** (keyroostctl oath reset + GUI reset card + OathSession::factory_reset). The
       capability-gating audit behind the #81 fix found the OATH pane's locked
       view dead-ends at the password prompt, and keyroost implements no OATH
       reset at any layer — so a forgotten password currently means reaching
@@ -48,19 +48,19 @@ These are the defer-grade findings the whole-branch review surfaced; the
 feature shipped without them (none block correctness or the wrong-key-safety
 core). Fold into a follow-up on the factory-reset branch or a later pass.
 
-- [ ] **GUI OTP reset step lacks the #82 HID→CCID fallback the CLI has.**
+- [x] **GUI OTP reset step now has the #82 HID→CCID fallback** (fix/factory-reset-batch).
       In `run_card_reset_step` (crates/keyroost/src/main.rs) the OTP step opens
       only the HID path when present, while the CLI's `open_otp` uses the
       `HidThenReader` same-device fallback. On the quirky #82 firmware the GUI
       factory reset reports OTP `Failed` where the CLI succeeds. Continue-on-
       error still holds; this is a cross-frontend inconsistency, not a wipe
       hazard. Give the GUI step the same fallback.
-- [ ] **CLI factory-reset: `--reader` silently outranks `--device`.** The card
+- [x] **CLI factory-reset now refuses a `--reader` + `--device` conflict** (fix/factory-reset-batch). The card
       steps resolve `reader.or(by_name)`, so passing both contradictorily opens
       the `--reader` key while the banner prints the `--device` serial.
       `resolve_fido_path` already rejects the analogous `--path`+`--device`
       combo; the card path should refuse the conflict too rather than pick one.
-- [ ] **Failed PIV RESET after a successful block isn't spelled out.** When
+- [x] **Failed PIV RESET after a block now says the card is recoverable** (fix/factory-reset-batch). When
       `force_reset` blocks the PIN and PUK but the final RESET then fails, the
       report row says only `PIV failed: <e>`. The card is NOT bricked — that
       exact blocked state is what `keyroostctl piv reset` needs — but the
