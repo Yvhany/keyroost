@@ -639,6 +639,11 @@ pub struct ReaderProbe {
     /// later via [`Session::read_info`]), and security keys carry their serial
     /// in [`ReaderProbe::yubikey_serial`] instead.
     pub serial: Option<String>,
+    /// OpenPGP card manufacturer ID (bytes 8..10 of the AID), when an OpenPGP
+    /// applet was read. Maps to a vendor name via
+    /// `keyroost_openpgp::manufacturer_name` — the card-content vendor signal
+    /// that replaces the reader-name guess (#83).
+    pub openpgp_manufacturer: Option<u16>,
     pub has_oath: bool,
     pub has_openpgp: bool,
     pub has_piv: bool,
@@ -710,6 +715,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                 reader_name,
                 is_molto2: true,
                 serial: None,
+                openpgp_manufacturer: None,
                 has_oath: false,
                 has_openpgp: false,
                 has_piv: false,
@@ -728,6 +734,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             reader_name,
             is_molto2: false,
             serial: None,
+            openpgp_manufacturer: None,
             has_oath: false,
             has_openpgp: false,
             has_piv: false,
@@ -819,21 +826,24 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             // OpenPGP AID. Prefer it so the device header shows the complete serial.
             // Best-effort: SELECT the FIDO applet (ignore its status word, as some
             // PIN+ firmware answers 6A81 yet still switches applets), then GET_INFO.
-            if probe.reader_name.to_ascii_lowercase().contains("token2") {
+            // Token2 full serial via the FIDO applet's GET_INFO (spec §6.10) —
+            // longer than the 4-byte OpenPGP-AID serial. Gate on card content
+            // (the card actually has a FIDO applet), NOT the reader name, so a
+            // Token2 card in a generic reader is read too (#83). Self-
+            // validating: a well-formed `D1 len ascii-hex` parse proves it is a
+            // Token2 device; anything else falls through harmlessly. SELECT is
+            // best-effort (some PIN+ firmware answers 6A81 yet switches applets).
+            if probe.has_fido {
                 let _ = transmit_apdu(
                     &card,
                     &keyroost_token2otp::build_select(&keyroost_token2otp::FIDO_APPLET_AID),
                 );
-                if let Ok((data, s1, s2)) =
-                    transmit_apdu(&card, &keyroost_token2otp::read_serial_request())
-                {
-                    let body = if s1 == 0x61 {
-                        transmit_apdu(&card, &[0x00, 0xC0, 0x00, 0x00, s2])
-                            .map(|(d, _, _)| d)
-                            .unwrap_or(data)
-                    } else {
-                        data
-                    };
+                if let Ok((body, _sw)) = exchange_apdu(
+                    &card,
+                    &keyroost_token2otp::read_serial_request(),
+                    0x61,
+                    || vec![0x00, 0xC0, 0x00, 0x00, 0x00],
+                ) {
                     if let Ok(sn) = keyroost_token2otp::parse_serial(&body) {
                         let hex: String = sn.iter().map(|b| format!("{b:02x}")).collect();
                         if !hex.is_empty() {
@@ -843,40 +853,43 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                             }
                         }
                     } else if trace {
-                        eprintln!("[probe]   token2 serial parse failed");
+                        eprintln!("[probe]   token2 serial parse failed (not a Token2 card)");
                     }
                 }
             }
-            // Fall back to the OpenPGP AID serial (4 bytes) only if the full read
-            // above didn't populate one.
-            if probe.has_openpgp && probe.serial.is_none() {
+            // OpenPGP present: read the AID once. Capture the manufacturer ID
+            // (card-content vendor signal, #83) always; use the embedded
+            // 4-byte serial only as a fallback if a vendor full-serial read
+            // didn't already populate one.
+            if probe.has_openpgp {
                 let _ = transmit_apdu(&card, &keyroost_openpgp::select());
                 let get_aid = [0x00u8, 0xCA, 0x00, 0x4F, 0x00];
-                if let Ok((data, s1, s2)) = transmit_apdu(&card, &get_aid) {
-                    let resp = if s1 == 0x61 {
-                        transmit_apdu(&card, &[0x00, 0xC0, 0x00, 0x00, s2])
-                            .map(|(d, _, _)| d)
-                            .unwrap_or(data)
-                    } else {
-                        data
-                    };
-                    // The response may be the raw 16-byte AID, or wrapped in a
-                    // `4F len ...` TLV. Locate the D2 76 00 01 24 01 prefix.
+                if let Ok((resp, _sw)) =
+                    exchange_apdu(&card, &get_aid, 0x61, || vec![0x00, 0xC0, 0x00, 0x00, 0x00])
+                {
+                    // Response may be the raw AID or a `4F len …` TLV wrapper.
                     let aid = if resp.len() >= 2 && resp[0] == 0x4F {
                         &resp[2..]
                     } else {
                         &resp[..]
                     };
-                    if aid.len() >= 14 && aid[0..6] == [0xD2, 0x76, 0x00, 0x01, 0x24, 0x01] {
+                    probe.openpgp_manufacturer = keyroost_openpgp::aid_manufacturer_id(aid);
+                    if trace {
+                        eprintln!(
+                            "[probe]   openpgp manufacturer -> {:?}",
+                            probe.openpgp_manufacturer
+                        );
+                    }
+                    if probe.serial.is_none()
+                        && aid.len() >= 14
+                        && aid[0..6] == [0xD2, 0x76, 0x00, 0x01, 0x24, 0x01]
+                    {
                         let sn = &aid[10..14];
                         probe.serial =
                             Some(sn.iter().map(|b| format!("{b:02x}")).collect::<String>());
                         if trace {
-                            eprintln!("[probe]   openpgp serial -> {:?}", probe.serial);
+                            eprintln!("[probe]   openpgp serial (aid) -> {:?}", probe.serial);
                         }
-                    } else if trace {
-                        let hex: String = resp.iter().map(|b| format!("{b:02x}")).collect();
-                        eprintln!("[probe]   openpgp AID unparsed: {hex}");
                     }
                 }
             }
@@ -1048,6 +1061,47 @@ fn transmit_apdu(card: &Card, apdu: &[u8]) -> Result<(Vec<u8>, u8, u8), Transpor
     }
     let (data, sw) = resp.split_at(resp.len() - 2);
     Ok((data.to_vec(), sw[0], sw[1]))
+}
+
+/// A body-returning applet exchange for the probe: send `apdu`, follow `61xx`
+/// (GET RESPONSE via `get_response`) and `6Cxx` (reissue the same command with
+/// the corrected Le — the ISO 7816-4 case that a raw T=0 reader surfaces and
+/// broke Token2 serial reads on generic readers, #83/#84), and return
+/// `(data, sw)`. Shares the status-word decision with the session path via
+/// `classify_sw` + `resend_with_le`, so `6Cxx` handling lives in one place.
+fn exchange_apdu(
+    card: &Card,
+    apdu: &[u8],
+    more_data_sw: u8,
+    get_response: fn() -> Vec<u8>,
+) -> Result<(Vec<u8>, u16), TransportError> {
+    let mut acc = Vec::new();
+    let original = apdu.to_vec();
+    let mut to_send = apdu.to_vec();
+    let mut steps = 0usize;
+    loop {
+        let (data, s1, s2) = transmit_apdu(card, &to_send)?;
+        steps += 1;
+        if steps > 32 {
+            return Err(TransportError::MalformedResponse(
+                "applet exchange exceeded the continuation limit",
+            ));
+        }
+        match classify_sw(s1, more_data_sw, s2) {
+            SwAction::MoreData => {
+                acc.extend_from_slice(&data);
+                to_send = get_response();
+            }
+            SwAction::WrongLe(le) => {
+                acc.clear();
+                to_send = keyroost_proto::apdu::resend_with_le(&original, le);
+            }
+            SwAction::Done => {
+                acc.extend_from_slice(&data);
+                return Ok((acc, u16::from_be_bytes([s1, s2])));
+            }
+        }
+    }
 }
 
 pub(crate) fn hex_dump(bytes: &[u8]) -> String {

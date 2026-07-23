@@ -565,6 +565,7 @@ mod tests {
             reader_name: name.into(),
             is_molto2: molto2,
             serial: None,
+            openpgp_manufacturer: None,
             has_oath: oath,
             has_openpgp: pgp,
             has_piv: piv,
