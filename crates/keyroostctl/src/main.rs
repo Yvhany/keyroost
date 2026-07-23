@@ -3839,6 +3839,22 @@ fn resolve_single_device<'a>(
 /// planner order, continue on failure, print a per-step report, and exit
 /// nonzero if anything failed. FIDO2 is last and needs a physical replug +
 /// touch, prompted interactively.
+/// A wipe command must not be handed a contradictory `--reader` and `--device`
+/// at once: the banner would name the `--device`-resolved key while the card
+/// steps opened the `--reader` one. Refuse the combination up front, mirroring
+/// how `resolve_fido_path` rejects `--path` + `--device`.
+fn reader_device_conflict(
+    reader: Option<&str>,
+    device_name: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if reader.is_some() && device_name.is_some() {
+        return Err("pass either --reader or --device, not both (they may name \
+                    different keys, and this wipes the one you didn't mean to)"
+            .into());
+    }
+    Ok(())
+}
+
 fn run_factory_reset(
     reader: Option<&str>,
     yes: bool,
@@ -3859,6 +3875,7 @@ fn run_factory_reset(
     // so a name/`--device` binds exactly like the other commands.
     let devices = keyroost_resolve::enumerate()?;
     let name = SELECTED_KEY_NAME.get().and_then(|o| o.as_deref());
+    reader_device_conflict(reader, name)?;
     let dev = resolve_single_device(&devices, name)?;
     let plan = factory_reset_plan(dev.caps);
     if plan.is_empty() {
@@ -3942,7 +3959,16 @@ fn reset_one_card_applet(
             }
             ResetStep::Piv => {
                 let mut s = open_piv(reader, debug)?;
-                s.force_reset()?;
+                // force_reset blocks the PIN and PUK before RESET; if RESET then
+                // fails the card is NOT bricked — that blocked state is exactly
+                // what `keyroostctl piv reset` recovers from. Spell that out.
+                s.force_reset().map_err(|e| -> Box<dyn std::error::Error> {
+                    format!(
+                        "{e} (if the PIN and PUK became blocked during the attempt, \
+                         the card is not bricked — recover with `keyroostctl piv reset`)"
+                    )
+                    .into()
+                })?;
             }
             ResetStep::Token2Otp => {
                 let mut s = open_otp(OtpTransportArg::Auto, debug)?;
@@ -7627,6 +7653,18 @@ mod cli_tests {
             }) => assert!(!yes),
             _ => panic!("expected oath reset"),
         }
+    }
+
+    #[test]
+    fn factory_reset_refuses_contradictory_reader_and_device() {
+        // Both --reader and --device set is a contradiction on a WIPE command
+        // (the banner would name one key while the card steps opened another);
+        // refuse rather than silently pick one.
+        assert!(reader_device_conflict(Some("Alcor 00"), Some("work-key")).is_err());
+        // Either alone, or neither, is fine.
+        assert!(reader_device_conflict(Some("Alcor 00"), None).is_ok());
+        assert!(reader_device_conflict(None, Some("work-key")).is_ok());
+        assert!(reader_device_conflict(None, None).is_ok());
     }
 
     #[test]

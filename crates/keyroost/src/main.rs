@@ -804,19 +804,49 @@ fn run_card_reset_step(
                 let name = reader.ok_or("no PC/SC reader for the PIV applet")?;
                 let mut s =
                     keyroost_transport::PivSession::open(name).map_err(|e| e.to_string())?;
-                s.force_reset().map_err(|e| e.to_string())?;
+                // force_reset blocks the PIN and PUK before RESET; if RESET then
+                // fails the card is NOT bricked — that blocked state is exactly
+                // what `piv reset` recovers from. Say so rather than a bare fail.
+                s.force_reset().map_err(|e| {
+                    format!(
+                        "{e} (if the PIN and PUK became blocked during the attempt, \
+                         the card is not bricked — recover with `keyroostctl piv reset`)"
+                    )
+                })?;
             }
             ResetStep::Token2Otp => {
                 // The OTP applet lives on the FIDO HID node when present, else on
-                // the PC/SC reader — the same preference the CLI's `open_otp` uses.
-                let mut s = match hid_path {
-                    Some(p) => keyroost_transport::Token2OtpSession::open_hid_path(p, false),
-                    None => {
-                        let name = reader.ok_or("no transport for the OTP applet")?;
-                        keyroost_transport::Token2OtpSession::open_pcsc_reader(name, false)
+                // the PC/SC reader. Mirror the CLI's `HidThenReader` behavior:
+                // try USB-HID first, and on an open failure fall back to the
+                // SAME device's reader — some firmware botches the HID applet
+                // probe while its CCID side works (#82). Without this fallback a
+                // GUI factory reset reported OTP `Failed` where the CLI succeeds.
+                let mut s = match (hid_path, reader) {
+                    (Some(p), reader) => {
+                        match keyroost_transport::Token2OtpSession::open_hid_path(p, false) {
+                            Ok(s) => s,
+                            Err(hid_err) => match reader {
+                                Some(name) => {
+                                    keyroost_transport::Token2OtpSession::open_pcsc_reader(
+                                        name, false,
+                                    )
+                                    .map_err(|e| {
+                                        format!(
+                                            "USB-HID failed ({hid_err}); the same key's \
+                                             reader also failed ({e})"
+                                        )
+                                    })?
+                                }
+                                None => return Err(hid_err.to_string()),
+                            },
+                        }
                     }
-                }
-                .map_err(|e| e.to_string())?;
+                    (None, Some(name)) => {
+                        keyroost_transport::Token2OtpSession::open_pcsc_reader(name, false)
+                            .map_err(|e| e.to_string())?
+                    }
+                    (None, None) => return Err("no transport for the OTP applet".to_string()),
+                };
                 s.erase_all().map_err(|e| e.to_string())?;
             }
             ResetStep::Fido => {}
