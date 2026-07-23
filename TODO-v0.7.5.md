@@ -255,6 +255,12 @@ anything big on top:
       old-format blob won't extract. Confirm whether any target keys carry
       old-format blobs and decide whether to also accept zlib (as libfido2's
       reader does).
+- [ ] **Card-content identity (#83), v0.7.7:** with a Token2 PIN+ smartcard in
+      a GENERIC reader (Alcor/SCM/Realtek), confirm keyroost shows vendor
+      "Token2" and the FULL serial (not the 8-digit one); in the Token2 dual
+      reader it still does; a non-Token2 OpenPGP card (e.g. Nitrokey) shows its
+      correct registry vendor name; a model that rejects GET_INFO over contact
+      falls back to the 8-digit serial with no error.
 
 ## PC/SC: load libpcsclite at runtime, degrade gracefully (the real #47 fix)
 

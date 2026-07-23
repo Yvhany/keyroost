@@ -23,6 +23,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   manufacturer-intended resets; the key stays fully usable. Per-applet resets
   remain available individually.
 
+### Fixed
+- **Smart-card vendor and serial now come from the card, not the reader**
+  ([#83]). A Token2 smartcard in a third-party reader now shows the full
+  device serial (read over any reader, including T=0 readers) and the vendor
+  "Token2" — previously it showed only the 8-digit OpenPGP serial and the
+  reader's name. OpenPGP cards from any vendor now get their correct vendor
+  name via the standard manufacturer-ID registry.
+
 ## [0.7.6] - 2026-07-17
 
 A bug-fix release for three field reports, plus the follow-through on the
@@ -636,6 +644,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#80]: https://github.com/framefilter/keyroost/issues/80
 [#81]: https://github.com/framefilter/keyroost/issues/81
 [#82]: https://github.com/framefilter/keyroost/issues/82
+[#83]: https://github.com/framefilter/keyroost/issues/83
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.7.6...HEAD
 [0.7.6]: https://github.com/framefilter/keyroost/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/framefilter/keyroost/compare/v0.7.4...v0.7.5
