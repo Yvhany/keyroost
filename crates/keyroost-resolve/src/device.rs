@@ -87,6 +87,20 @@ impl Device {
     }
 }
 
+/// The vendor name for a PC/SC-reader device: the OpenPGP manufacturer ID
+/// mapped through the registry when known (card-content identity, #83), else
+/// the first word of the reader name (the pre-existing guess), else "Key".
+fn card_vendor(openpgp_manufacturer: Option<u16>, reader_name: &str) -> String {
+    if let Some(name) = openpgp_manufacturer.and_then(keyroost_openpgp::manufacturer_name) {
+        return name.to_string();
+    }
+    reader_name
+        .split_whitespace()
+        .next()
+        .unwrap_or("Key")
+        .to_string()
+}
+
 /// Map a USB vendor id to a display name; unknown ids fall back to a generic label.
 fn vendor_name(vid: u16) -> &'static str {
     match vid {
@@ -290,11 +304,7 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
         let vendor = if p.yubikey_serial.is_some() {
             "Yubico".to_string()
         } else {
-            p.reader_name
-                .split_whitespace()
-                .next()
-                .unwrap_or("Key")
-                .to_string()
+            card_vendor(p.openpgp_manufacturer, &p.reader_name)
         };
         let model = clean_model(&p.reader_name, &vendor);
         devices.push(Device {
@@ -820,6 +830,24 @@ mod tests {
         assert_eq!(vendor_name(0x1209), "SoloKeys");
         assert_eq!(vendor_name(0x349e), "Token2");
         assert_eq!(vendor_name(0xffff), "Security key");
+    }
+
+    #[test]
+    fn card_vendor_prefers_openpgp_manufacturer_over_reader_name() {
+        // Known manufacturer id -> registry vendor name, regardless of reader.
+        assert_eq!(
+            card_vendor(Some(0x0011), "Alcor Micro Corp. AU9540 00 00"),
+            "Token2"
+        );
+        assert_eq!(
+            card_vendor(Some(0x000F), "SCM Microsystems Inc. reader 00"),
+            "Nitrokey"
+        );
+        // No/unknown manufacturer id -> fall back to the reader-name first word.
+        assert_eq!(card_vendor(None, "Feitian ePass 00"), "Feitian");
+        assert_eq!(card_vendor(Some(0x1234), "SCM Micro 00"), "SCM");
+        // Empty reader name with no manufacturer -> the existing "Key" default.
+        assert_eq!(card_vendor(None, ""), "Key");
     }
 
     #[test]

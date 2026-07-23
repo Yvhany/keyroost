@@ -2031,6 +2031,7 @@ version = "0.7.6"
 dependencies = [
  "keyroost-hid",
  "keyroost-keyring",
+ "keyroost-openpgp",
  "keyroost-proto",
  "keyroost-token2prog",
  "keyroost-transport",
