@@ -35,6 +35,62 @@ use zeroize::Zeroizing;
 /// serial number — but [`select`] addresses the applet with this 6-byte prefix.
 pub const AID_PREFIX: [u8; 6] = [0xD2, 0x76, 0x00, 0x01, 0x24, 0x01];
 
+/// The 2-byte manufacturer ID (big-endian) from an OpenPGP card AID, i.e.
+/// bytes 8..10 of `D2 76 00 01 24 01 <version:2> <manufacturer:2>
+/// <serial:4> 00 00`. `None` when `aid` doesn't begin with [`AID_PREFIX`] or
+/// is shorter than 10 bytes.
+#[must_use]
+pub fn aid_manufacturer_id(aid: &[u8]) -> Option<u16> {
+    if aid.len() < 10 || aid[0..6] != AID_PREFIX {
+        return None;
+    }
+    Some(u16::from_be_bytes([aid[8], aid[9]]))
+}
+
+/// Vendor display name for an OpenPGP manufacturer ID, using the registry
+/// GnuPG's scdaemon publishes (`scd/app-openpgp.c`), so keyroost's vendor
+/// label matches `gpg --card-status`. `None` for unknown IDs and the reserved
+/// test (`0x0000`, `0xFFFF`) and unmanaged-serial (`0xFF00`..=`0xFFFE`)
+/// ranges, so the caller can fall back to another signal.
+#[must_use]
+pub fn manufacturer_name(id: u16) -> Option<&'static str> {
+    let name = match id {
+        0x0001 => "PPC Card Systems",
+        0x0002 => "Prism",
+        0x0003 => "OpenFortress",
+        0x0004 => "Wewid",
+        0x0005 => "ZeitControl",
+        0x0006 => "Yubico",
+        0x0007 => "OpenKMS",
+        0x0008 => "LogoEmail",
+        0x0009 => "Fidesmo",
+        0x000A => "VivoKey",
+        0x000B => "Feitian Technologies",
+        0x000D => "Dangerous Things",
+        0x000E => "Excelsecu",
+        0x000F => "Nitrokey",
+        0x0010 => "NeoPGP",
+        0x0011 => "Token2",
+        0x002A => "Magrathea",
+        0x0042 => "GnuPG e.V.",
+        0x1337 => "Warsaw Hackerspace",
+        0x2342 => "warpzone",
+        0x4354 => "Confidential Technologies",
+        0x4D52 => "Miralium Research",
+        0x5343 => "SSE Carte à puce",
+        0x5443 => "TIF-IT e.V.",
+        0x63AF => "Trustica",
+        0xBA53 => "c-base e.V.",
+        0xBD0E => "Paranoidlabs",
+        0xCA05 => "Atos CardOS",
+        0xF1D0 => "CanoKeys",
+        0xF517 => "FSIJ",
+        0xF5EC => "F-Secure",
+        _ => return None, // unknown, test (0x0000/0xFFFF), or unmanaged range
+    };
+    Some(name)
+}
+
 // ---------------------------------------------------------------------------
 // Instruction bytes
 // ---------------------------------------------------------------------------
@@ -2516,5 +2572,45 @@ mod tests {
         outer.extend_from_slice(&mid);
         let tlvs = parse_tlvs(&outer).unwrap();
         assert_eq!(find_nested(&tlvs, 0xC5), Some(&[0xAA, 0xBB][..]));
+    }
+}
+
+#[cfg(test)]
+mod manufacturer_tests {
+    use super::*;
+
+    #[test]
+    fn aid_manufacturer_id_extracts_bytes_8_9() {
+        // D2 76 00 01 24 01 | 03 04 (version) | 00 11 (Token2) | AA BB CC DD (serial) | 00 00
+        let aid = [
+            0xD2, 0x76, 0x00, 0x01, 0x24, 0x01, 0x03, 0x04, 0x00, 0x11, 0xAA, 0xBB, 0xCC, 0xDD,
+            0x00, 0x00,
+        ];
+        assert_eq!(aid_manufacturer_id(&aid), Some(0x0011));
+        // Yubico example: manufacturer 00 06.
+        let mut yk = aid;
+        yk[8] = 0x00;
+        yk[9] = 0x06;
+        assert_eq!(aid_manufacturer_id(&yk), Some(0x0006));
+        // Wrong prefix -> None.
+        let mut bad = aid;
+        bad[0] = 0x00;
+        assert_eq!(aid_manufacturer_id(&bad), None);
+        // Too short (no manufacturer bytes) -> None.
+        assert_eq!(aid_manufacturer_id(&aid[..9]), None);
+    }
+
+    #[test]
+    fn manufacturer_name_maps_registry_and_rejects_special_ranges() {
+        assert_eq!(manufacturer_name(0x0011), Some("Token2"));
+        assert_eq!(manufacturer_name(0x0006), Some("Yubico"));
+        assert_eq!(manufacturer_name(0x0005), Some("ZeitControl"));
+        assert_eq!(manufacturer_name(0x000F), Some("Nitrokey"));
+        assert_eq!(manufacturer_name(0xF1D0), Some("CanoKeys"));
+        // Unknown, test, and unmanaged-S/N ranges -> None (caller falls back).
+        assert_eq!(manufacturer_name(0x1234), None);
+        assert_eq!(manufacturer_name(0x0000), None); // test card
+        assert_eq!(manufacturer_name(0xFFFF), None); // test card
+        assert_eq!(manufacturer_name(0xFF42), None); // unmanaged S/N range
     }
 }
