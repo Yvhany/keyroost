@@ -1090,6 +1090,11 @@ fn exchange_apdu(
         match classify_sw(s1, more_data_sw, s2) {
             SwAction::MoreData => {
                 acc.extend_from_slice(&data);
+                if acc.len() > MAX_REASSEMBLED_RESPONSE {
+                    return Err(TransportError::MalformedResponse(
+                        "applet exchange exceeded the reassembly limit",
+                    ));
+                }
                 to_send = get_response();
             }
             SwAction::WrongLe(le) => {
