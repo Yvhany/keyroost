@@ -73,8 +73,9 @@ pub fn ccid_readers_if_needed(devices: &[HidDevice]) -> Vec<YubiKeyCcid> {
 
 /// Match a YubiKey HID device to one of the CCID-read serials. Prefers an exact
 /// USB-topology match (bus + address), so two connected YubiKeys are never
-/// confused; falls back to the unambiguous single-reader case. Never guesses
-/// among several readers — returns `None` instead, which is the safe outcome.
+/// confused; falls back to the unambiguous single-reader case only when the HID
+/// node reports no topology at all. Never guesses among several readers —
+/// returns `None` instead, which is the safe outcome.
 pub fn ccid_serial_for(d: &HidDevice, readers: &[YubiKeyCcid]) -> Option<String> {
     if !needs_ccid_serial(d) {
         return None;
@@ -87,6 +88,14 @@ pub fn ccid_serial_for(d: &HidDevice, readers: &[YubiKeyCcid]) -> Option<String>
         {
             return r.serial.clone();
         }
+    }
+    // A node that reported its own bus/address and still matched nothing has
+    // positive evidence it is a *different* physical device, so the
+    // single-reader fallback would hand it another key's serial. Only backends
+    // that report no topology whatsoever (usb_bus is None — hidapi on Windows
+    // and macOS) may take that fallback, or correlation breaks there entirely.
+    if d.usb_bus.is_some() {
+        return None;
     }
     match with_serial.as_slice() {
         [only] => only.serial.clone(),
@@ -178,6 +187,17 @@ mod tests {
             reader(None, None, "27717893"),
         ];
         let d = yubikey("/dev/hidraw16", None, None);
+        assert_eq!(ccid_serial_for(&d, &readers), None);
+    }
+
+    #[test]
+    fn reported_topology_that_matches_nothing_never_falls_back() {
+        // A FIDO-only YubiKey sitting next to a *different* key's reader: the HID
+        // node reports its own bus/address and matches none of them, which is
+        // positive evidence they are different devices. Taking the single-reader
+        // fallback here would stamp the other key's serial onto this one.
+        let readers = [reader(Some(9), Some(53), "37806840")];
+        let d = yubikey("/dev/hidraw20", Some(9), Some(60));
         assert_eq!(ccid_serial_for(&d, &readers), None);
     }
 

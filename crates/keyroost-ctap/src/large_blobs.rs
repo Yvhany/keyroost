@@ -520,11 +520,34 @@ pub(crate) fn gcm_decrypt(
         .ok()
 }
 
+/// Host-side ceiling on the inflated plaintext of a single largeBlob entry.
+///
+/// `origSize` is chosen by the authenticator, so without a ceiling of our own
+/// the key decides how much work and memory the host spends inflating — and
+/// `cred_mgmt` will happily hand us one entry per credential. The array-level
+/// valve in [`read()`] bounds the *compressed* side (64 KiB), but DEFLATE
+/// expands, so it does not bound this side at all.
+///
+/// 1 MiB is far above anything an honest entry can hold: authenticators
+/// advertise `maxSerializedLargeBlobArray` in the low kilobytes (spec floor
+/// 1024 bytes, typical keys 1–4 KiB for the *whole* array), and the payload
+/// we actually decode — an OpenSSH certificate — is ~2 KB. Even a 4 KiB entry
+/// of pathologically compressible data would have to hit a 256:1 ratio to
+/// reach this cap, so no legitimate blob is rejected; a hostile key is capped
+/// at ~1 MiB per credential instead of the ~70 MB the compressed valve allows.
+const MAX_BLOB_PLAINTEXT: usize = 1024 * 1024;
+
 /// Raw-DEFLATE inflate (RFC 1951 — NOT zlib-wrapped) of the decrypted
-/// plaintext, bounded by `orig_size`. Returns None on malformed input or when
-/// the inflated length does not equal `orig_size`.
+/// plaintext, bounded by `orig_size`. Returns None when `orig_size` exceeds
+/// [`MAX_BLOB_PLAINTEXT`] (checked before any decompression runs), on
+/// malformed input, or when the inflated length does not equal `orig_size`.
 pub(crate) fn inflate_raw(compressed: &[u8], orig_size: u64) -> Option<Vec<u8>> {
     let limit = usize::try_from(orig_size).ok()?;
+    // Clamp against our own ceiling BEFORE handing the size to the
+    // decompressor — the device does not get to pick how much we allocate.
+    if limit > MAX_BLOB_PLAINTEXT {
+        return None;
+    }
     // The RAW (non-zlib) limited inflate. `decompress_to_vec_with_limit` is
     // raw DEFLATE with a size cap; the `_zlib` variants expect a zlib header,
     // which the largeBlob plaintext does NOT have.
@@ -608,6 +631,47 @@ mod tests {
         assert_eq!(inflate_raw(&[0xff, 0x00, 0x13, 0x37], 100), None);
         // A declared orig_size the inflated data doesn't match → None.
         assert_eq!(inflate_raw(&compressed, (data.len() + 1) as u64), None);
+    }
+
+    #[test]
+    fn inflate_raw_rejects_orig_size_above_ceiling() {
+        // Genuinely valid DEFLATE that really does inflate to ceiling+1: the
+        // rejection can only come from the ceiling check, not from the
+        // after-the-fact length comparison. Highly compressible, so building
+        // the fixture is cheap.
+        let oversize = vec![0u8; MAX_BLOB_PLAINTEXT + 1];
+        let compressed = miniz_oxide::deflate::compress_to_vec(&oversize, 6);
+        assert_eq!(inflate_raw(&compressed, oversize.len() as u64), None);
+
+        // Exactly at the ceiling still works, so the bound is inclusive and
+        // nothing legitimate sits on the wrong side of it.
+        let at_limit = vec![0u8; MAX_BLOB_PLAINTEXT];
+        let compressed_at = miniz_oxide::deflate::compress_to_vec(&at_limit, 6);
+        assert_eq!(
+            inflate_raw(&compressed_at, at_limit.len() as u64).map(|v| v.len()),
+            Some(MAX_BLOB_PLAINTEXT)
+        );
+
+        // An absurd device-claimed size is refused without allocating for it.
+        assert_eq!(inflate_raw(&compressed, u64::MAX), None);
+        assert_eq!(inflate_raw(&compressed, 4 * 1024 * 1024 * 1024), None);
+    }
+
+    #[test]
+    fn inflate_raw_accepts_a_realistic_ssh_certificate() {
+        // The payload this path actually decodes: a real OpenSSH certificate,
+        // raw-DEFLATE compressed exactly as fido2-token stores it. Must round
+        // trip unaffected by the ceiling.
+        let cert_pub = crate::ssh_cert::tests_fixture::FIXTURE_CERT_PUB;
+        let (_, wire) = crate::ssh_cert::parse_text(cert_pub.trim()).unwrap();
+        assert!(wire.len() < MAX_BLOB_PLAINTEXT);
+        let compressed = miniz_oxide::deflate::compress_to_vec(&wire, 6);
+        assert_eq!(
+            inflate_raw(&compressed, wire.len() as u64).as_deref(),
+            Some(&wire[..])
+        );
+        // And a size mismatch on that same legitimate blob is still refused.
+        assert_eq!(inflate_raw(&compressed, (wire.len() - 1) as u64), None);
     }
 
     fn sample_entry(seed: u8) -> LargeBlobEntry {

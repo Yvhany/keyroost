@@ -90,6 +90,10 @@ pub enum TransportError {
     /// The OpenPGP applet rejected the supplied PIN. `tries_remaining` is the
     /// count the card reported (`63 Cx`), or `None` when blocked / unknown.
     OpenPgpPinRejected { tries_remaining: Option<u8> },
+    /// A deliberately-wrong guess in the factory-reset blocking loop was
+    /// *accepted*: it happened to be the card's live PW1/PW3. The counter never
+    /// decrements for a correct PIN, so that password can't be blocked this way.
+    OpenPgpPinGuessAccepted,
     /// A PIV applet response could not be parsed.
     PivParse(keyroost_piv::ParseError),
     /// No PIV applet is present on the selected card (`SW 6A82` on SELECT).
@@ -111,6 +115,19 @@ pub enum TransportError {
     /// PIV reset refused by the card: the PIN and PUK must both be blocked
     /// before the applet allows a factory reset (`SW 6983`).
     PivResetNotAllowed,
+    /// A forced PIV factory reset was refused before it started: the card does
+    /// not answer the vendor extensions that carry the RESET instruction, so
+    /// blocking its PIN and PUK (which the forced path does deliberately) would
+    /// have no way back.
+    PivForceResetUnsupported,
+    /// A forced PIV factory reset stopped part-way: a blocking loop hit its
+    /// attempt cap without the card reporting the credential blocked, so RESET
+    /// was never sent. Carries the state the card is actually in.
+    PivForceResetIncomplete(&'static str),
+    /// A deliberately-wrong PUK guess in the forced factory reset was
+    /// *accepted*: RESET RETRY COUNTER really ran, so the card's PIN was
+    /// rewritten to a known value and unblocked.
+    PivPukGuessAccepted,
     /// A PIV operation needs a newer firmware than the card reports. Carries the
     /// human-readable operation that was attempted.
     PivFirmwareTooOld(&'static str),
@@ -200,6 +217,13 @@ impl fmt::Display for TransportError {
             } => {
                 write!(f, "OpenPGP PIN rejected (PIN may be blocked)")
             }
+            TransportError::OpenPgpPinGuessAccepted => write!(
+                f,
+                "the factory reset's throwaway guess turned out to be this card's \
+                 real OpenPGP password, so the retry counter never moved and the \
+                 password cannot be blocked this way. Change the card's PW1/PW3 \
+                 and run the factory reset again."
+            ),
             TransportError::PivParse(e) => write!(f, "PIV response parse error: {}", e),
             TransportError::NoPivApplet => write!(f, "no PIV applet on this card"),
             TransportError::PivManagementAuthFailed => {
@@ -230,6 +254,24 @@ impl fmt::Display for TransportError {
                     "PIV reset refused: the PIN and PUK must both be blocked first"
                 )
             }
+            TransportError::PivForceResetUnsupported => write!(
+                f,
+                "this card does not implement the RESET instruction a forced \
+                 factory reset depends on (it is a vendor extension, not part of \
+                 the PIV standard). Getting there means deliberately blocking the \
+                 PIN and the PUK, and on this card nothing could unblock them \
+                 afterwards, so keyroost will not do it. A card like this has to \
+                 be reset by whoever issued it."
+            ),
+            TransportError::PivForceResetIncomplete(state) => write!(f, "{}", state),
+            TransportError::PivPukGuessAccepted => write!(
+                f,
+                "the factory reset's throwaway PUK guess turned out to be this \
+                 card's real PUK, so the card unblocked the PIN and set it to \
+                 123456 instead of counting a failed attempt. Change that PIN \
+                 (`keyroostctl piv change-pin`) before running the factory reset \
+                 again."
+            ),
             TransportError::PivFirmwareTooOld(op) => {
                 write!(f, "{}", op)
             }
@@ -1050,7 +1092,13 @@ fn read_yubikey_serial(card: &Card) -> Result<String, TransportError> {
 
 /// Transmit one raw APDU, returning `(payload, sw1, sw2)`.
 fn transmit_apdu(card: &Card, apdu: &[u8]) -> Result<(Vec<u8>, u8, u8), TransportError> {
-    let mut buf = [0u8; 256];
+    // Sized like the session loop's buffer. 256 is *not* enough: a full
+    // short-form chunk is 256 data bytes plus SW1/SW2, and pcsc fails the
+    // whole transmit with `InsufficientBuffer` rather than truncating — which
+    // `answers()` would then report as "applet absent" for a key that is
+    // present. 258 is the strict minimum; 4096 keeps both transmit paths
+    // consistent and costs nothing (stack-local, per call).
+    let mut buf = [0u8; 4096];
     let resp = card.transmit(apdu, &mut buf)?;
     if resp.len() < 2 {
         return Err(TransportError::ShortResponse {
@@ -1076,7 +1124,6 @@ fn exchange_apdu(
     get_response: fn() -> Vec<u8>,
 ) -> Result<(Vec<u8>, u16), TransportError> {
     let mut acc = Vec::new();
-    let original = apdu.to_vec();
     let mut to_send = apdu.to_vec();
     let mut steps = 0usize;
     loop {
@@ -1087,24 +1134,24 @@ fn exchange_apdu(
                 "applet exchange exceeded the continuation limit",
             ));
         }
-        match classify_sw(s1, more_data_sw, s2) {
-            SwAction::MoreData => {
-                acc.extend_from_slice(&data);
+        match advance_exchange(
+            more_data_sw,
+            get_response,
+            &to_send,
+            &data,
+            s1,
+            s2,
+            &mut acc,
+        ) {
+            Continuation::Send(next) => {
                 if acc.len() > MAX_REASSEMBLED_RESPONSE {
                     return Err(TransportError::MalformedResponse(
                         "applet exchange exceeded the reassembly limit",
                     ));
                 }
-                to_send = get_response();
+                to_send = next;
             }
-            SwAction::WrongLe(le) => {
-                acc.clear();
-                to_send = keyroost_proto::apdu::resend_with_le(&original, le);
-            }
-            SwAction::Done => {
-                acc.extend_from_slice(&data);
-                return Ok((acc, u16::from_be_bytes([s1, s2])));
-            }
+            Continuation::Done => return Ok((acc, u16::from_be_bytes([s1, s2]))),
         }
     }
 }
@@ -1229,6 +1276,62 @@ pub(crate) fn classify_sw(sw1: u8, more_data_sw: u8, sw2: u8) -> SwAction {
     }
 }
 
+/// The next move of the applet reassembly loop, from [`advance_exchange`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Continuation {
+    /// Terminal status word — `acc` now holds the complete response.
+    Done,
+    /// Send this APDU next and keep reassembling.
+    Send(Vec<u8>),
+}
+
+/// Advance the applet reassembly state machine by one exchange: accumulate
+/// whatever came back and decide what to send next.
+///
+/// Pure bookkeeping shared by the probe path ([`exchange_apdu`]) and the
+/// session path ([`transmit_applet`]) so both react to a status word
+/// identically — and so the `61xx`/`6Cxx` interplay is testable without a card.
+///
+/// * `61xx` — append the chunk, then ask for exactly the `xx` bytes the card
+///   says are pending by putting them in the GET RESPONSE's Le (`xx == 0`
+///   meaning 256, the short-form convention). Asking blindly for 256 is what
+///   makes a card that validates Le answer `6Cxx` mid-read.
+/// * `6Cxx` — no data came back, so `acc` is left alone and the command that
+///   was *actually* sent is reissued with the corrected Le. Restarting the
+///   caller's original command instead would discard the bytes read so far and
+///   re-run a command with side effects (PIV GENERATE ASYMMETRIC KEY PAIR
+///   mints a fresh key pair on every reissue). For the first exchange the two
+///   are the same command, so nothing changes there.
+/// * anything else — terminal; append the chunk and stop.
+///
+/// The caller owns the iteration and reassembly caps: every response, `6Cxx`
+/// included, costs one step there, so a card that answers `6Cxx` forever still
+/// terminates. Re-correcting the Le never grows the APDU either — the corrected
+/// command already ends in Le, so the byte is replaced rather than appended.
+pub(crate) fn advance_exchange(
+    more_data_sw: u8,
+    get_response: fn() -> Vec<u8>,
+    to_send: &[u8],
+    data: &[u8],
+    sw1: u8,
+    sw2: u8,
+    acc: &mut Vec<u8>,
+) -> Continuation {
+    match classify_sw(sw1, more_data_sw, sw2) {
+        SwAction::MoreData => {
+            acc.extend_from_slice(data);
+            Continuation::Send(keyroost_proto::apdu::resend_with_le(&get_response(), sw2))
+        }
+        SwAction::WrongLe(le) => {
+            Continuation::Send(keyroost_proto::apdu::resend_with_le(to_send, le))
+        }
+        SwAction::Done => {
+            acc.extend_from_slice(data);
+            Continuation::Done
+        }
+    }
+}
+
 /// One applet APDU exchange with `61xx`-continuation reassembly, shared by the
 /// OATH, OpenPGP, and PIV sessions (each computes its own sensitivity
 /// predicates). `cmd_sensitive` redacts command bodies from `--debug` traces;
@@ -1244,10 +1347,10 @@ pub(crate) fn transmit_applet(
     resp_sensitive: bool,
 ) -> Result<(Vec<u8>, u16), TransportError> {
     let mut acc = Vec::new();
-    // The original command, kept so a `6Cxx` ("wrong Le") can reissue it with
-    // the corrected length. Zeroizing because a sensitive command (VERIFY,
-    // CHANGE REFERENCE DATA, key import) must not linger on the heap.
-    let original = zeroize::Zeroizing::new(apdu.to_vec());
+    // The command currently in flight — the caller's APDU, then a GET RESPONSE
+    // or an Le-corrected reissue of either. Zeroizing because a sensitive
+    // command (VERIFY, CHANGE REFERENCE DATA, key import) must not linger on
+    // the heap.
     let mut to_send = zeroize::Zeroizing::new(apdu.to_vec());
     let mut chunks = 0usize;
     loop {
@@ -1277,29 +1380,24 @@ pub(crate) fn transmit_applet(
                 "applet continuation exceeded the chunk limit",
             ));
         }
-        match classify_sw(sw[0], io.more_data_sw, sw[1]) {
-            SwAction::MoreData => {
-                acc.extend_from_slice(data);
+        match advance_exchange(
+            io.more_data_sw,
+            io.get_response,
+            &to_send,
+            data,
+            sw[0],
+            sw[1],
+            &mut acc,
+        ) {
+            Continuation::Send(next) => {
                 if acc.len() > MAX_REASSEMBLED_RESPONSE {
                     return Err(TransportError::MalformedResponse(
                         "61xx continuation exceeded the reassembly limit",
                     ));
                 }
-                to_send = zeroize::Zeroizing::new((io.get_response)());
+                to_send = zeroize::Zeroizing::new(next);
             }
-            SwAction::WrongLe(le) => {
-                // `6Cxx`: the card returned no data and wants the *same*
-                // command reissued with `Le = xx`. Some T=0 readers surface
-                // this raw where others correct it in firmware (#84). Discard
-                // any partial accumulation and reissue the original command.
-                acc.clear();
-                to_send =
-                    zeroize::Zeroizing::new(keyroost_proto::apdu::resend_with_le(&original, le));
-            }
-            SwAction::Done => {
-                acc.extend_from_slice(data);
-                return Ok((acc, u16::from_be_bytes([sw[0], sw[1]])));
-            }
+            Continuation::Done => return Ok((acc, u16::from_be_bytes([sw[0], sw[1]]))),
         }
     }
 }
@@ -1335,6 +1433,156 @@ mod redaction_tests {
         // Card answered 6C FF -> reissue with Le = FF, replacing the 00.
         let reissued = keyroost_proto::apdu::resend_with_le(&get_data, 0xFF);
         assert_eq!(reissued, vec![0x00, 0xCA, 0x00, 0x6E, 0xFF]);
+    }
+
+    /// The GET RESPONSE the reassembly loop builds, matching the shape every
+    /// applet's builder produces: case 2, `Le = 00`.
+    fn test_get_response() -> Vec<u8> {
+        vec![0x00, 0xC0, 0x00, 0x00, 0x00]
+    }
+
+    /// The Le correction must be applied to the command that was *actually*
+    /// sent, and never overwrite a body byte: a case-2 APDU (header + Le) has
+    /// its trailing Le replaced, a case-3 APDU (header + Lc + data) gets the Le
+    /// appended.
+    #[test]
+    fn resend_with_le_replaces_case2_le_and_appends_to_case3_body() {
+        use keyroost_proto::apdu::resend_with_le;
+        // Case 2 — the GET RESPONSE of a continuation.
+        assert_eq!(
+            resend_with_le(&test_get_response(), 0x08),
+            vec![0x00, 0xC0, 0x00, 0x00, 0x08]
+        );
+        // Case 3 — PIV GENERATE ASYMMETRIC KEY PAIR (RSA-2048, slot 9A). The
+        // last byte is the algorithm ID, not an Le; replacing it would ask the
+        // card to generate a different key.
+        let generate = vec![0x00, 0x47, 0x00, 0x9A, 0x05, 0xAC, 0x03, 0x80, 0x01, 0x07];
+        let mut expected = generate.clone();
+        expected.push(0x20);
+        assert_eq!(resend_with_le(&generate, 0x20), expected);
+    }
+
+    /// A `6Cxx` answered to the GET RESPONSE in the middle of a multi-chunk
+    /// read must re-ask for the pending bytes and KEEP the accumulated data.
+    /// Restarting the caller's command instead would drop the chunks read so
+    /// far and re-run a side-effecting command (PIV key generation) on every
+    /// iteration until the chunk cap fired.
+    #[test]
+    fn wrong_le_mid_read_reasks_get_response_and_keeps_acc() {
+        let generate = vec![0x00, 0x47, 0x00, 0x9A, 0x05, 0xAC, 0x03, 0x80, 0x01, 0x07];
+        let mut acc = Vec::new();
+
+        // 1. The card answers the command with 16 bytes and "16 more pending":
+        //    the continuation asks for exactly those 16, not a blind 256.
+        let step = advance_exchange(
+            0x61,
+            test_get_response,
+            &generate,
+            &[0xAA; 16],
+            0x61,
+            0x10,
+            &mut acc,
+        );
+        let get_resp_16 = vec![0x00, 0xC0, 0x00, 0x00, 0x10];
+        assert_eq!(step, Continuation::Send(get_resp_16.clone()));
+        assert_eq!(acc.len(), 16);
+
+        // 2. The card rejects that Le with `6C 08` (no data). The retry targets
+        //    the GET RESPONSE — not `generate` — and `acc` survives untouched.
+        let step = advance_exchange(
+            0x61,
+            test_get_response,
+            &get_resp_16,
+            &[],
+            0x6C,
+            0x08,
+            &mut acc,
+        );
+        let get_resp_8 = vec![0x00, 0xC0, 0x00, 0x00, 0x08];
+        assert_eq!(step, Continuation::Send(get_resp_8.clone()));
+        assert_ne!(step, Continuation::Send(generate.clone()));
+        assert_eq!(acc, vec![0xAA; 16]);
+
+        // 3. The corrected GET RESPONSE completes the object: 16 + 8 bytes.
+        let step = advance_exchange(
+            0x61,
+            test_get_response,
+            &get_resp_8,
+            &[0xBB; 8],
+            0x90,
+            0x00,
+            &mut acc,
+        );
+        assert_eq!(step, Continuation::Done);
+        assert_eq!(acc.len(), 24);
+        assert_eq!(&acc[16..], &[0xBB; 8]);
+    }
+
+    /// `6Cxx` on the *first* exchange still reissues the caller's own command —
+    /// the behavior that unbroke reads on T=0 readers (#84) is unchanged,
+    /// because there the command in flight *is* the original.
+    #[test]
+    fn wrong_le_on_first_exchange_reissues_the_callers_command() {
+        let get_data = vec![0x00, 0xCA, 0x00, 0x6E, 0x00];
+        let mut acc = Vec::new();
+        let step = advance_exchange(
+            0x61,
+            test_get_response,
+            &get_data,
+            &[],
+            0x6C,
+            0xFF,
+            &mut acc,
+        );
+        assert_eq!(step, Continuation::Send(vec![0x00, 0xCA, 0x00, 0x6E, 0xFF]));
+        assert!(acc.is_empty());
+    }
+
+    /// `61 00` means 256 bytes pending, the short-form Le convention — the
+    /// continuation keeps `Le = 00` rather than inventing a length.
+    #[test]
+    fn more_data_with_zero_hint_asks_for_256() {
+        let mut acc = Vec::new();
+        let step = advance_exchange(
+            0x61,
+            test_get_response,
+            &[0x00, 0xA4, 0x04, 0x00, 0x00],
+            &[0x01, 0x02],
+            0x61,
+            0x00,
+            &mut acc,
+        );
+        assert_eq!(step, Continuation::Send(test_get_response()));
+        assert_eq!(acc, vec![0x01, 0x02]);
+    }
+
+    /// A card that answers `6Cxx` forever must not grow the APDU: every retry
+    /// replaces the Le of a command that already ends in one, so the reissue
+    /// is length-stable and the caller's per-response step cap is what stops
+    /// the loop.
+    #[test]
+    fn repeated_wrong_le_retries_are_length_stable() {
+        let mut acc = Vec::new();
+        let mut to_send = vec![0x00, 0x47, 0x00, 0x9A, 0x05, 0xAC, 0x03, 0x80, 0x01, 0x07];
+        for round in 0..8u8 {
+            let Continuation::Send(next) = advance_exchange(
+                0x61,
+                test_get_response,
+                &to_send,
+                &[],
+                0x6C,
+                round + 1,
+                &mut acc,
+            ) else {
+                panic!("6Cxx must ask for a retry");
+            };
+            to_send = next;
+            // First round appends the Le to the case-3 body (11 bytes); every
+            // later round replaces it.
+            assert_eq!(to_send.len(), 11);
+            assert_eq!(*to_send.last().unwrap(), round + 1);
+        }
+        assert!(acc.is_empty());
     }
 
     /// `TransportError::PublicData` must chain its inner error via

@@ -118,6 +118,31 @@ pub struct Credential {
     pub large_blob_key: Option<[u8; 32]>,
 }
 
+impl Credential {
+    /// Wipe the largeBlobKey in place. Split out of [`Drop`] so the wipe
+    /// itself is unit-testable (observing freed memory would need `unsafe`,
+    /// which the workspace forbids). The `Option` keeps its `Some`/`None`
+    /// shape; only the key bytes are cleared.
+    fn scrub_key(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(key) = self.large_blob_key.as_mut() {
+            key.zeroize();
+        }
+    }
+}
+
+/// The largeBlobKey is key material, like the pinUvAuthToken and the PIN
+/// shared secrets this crate already scrubs — clear it (and every clone's
+/// copy) on drop instead of releasing it to the allocator intact. A manual
+/// `Drop` rather than a wrapper type keeps the public field an
+/// `Option<[u8; 32]>`; nothing in the tree moves fields out of a
+/// `Credential`, which `Drop` would otherwise forbid.
+impl Drop for Credential {
+    fn drop(&mut self) {
+        self.scrub_key();
+    }
+}
+
 /// Manual `Debug`: `large_blob_key` is key material (decrypts this
 /// credential's largeBlob entry), so it must never be printed verbatim —
 /// redact it even though nothing `{:?}`-prints a `Credential` today.
@@ -138,6 +163,41 @@ impl std::fmt::Debug for Credential {
                 &self.large_blob_key.as_ref().map(|_| Redacted),
             )
             .finish()
+    }
+}
+
+/// A decoded enumerateCredentials response, held only as long as the parse
+/// needs it. The decoder's `Value::Bytes` copy of the largeBlobKey is as much
+/// key material as the field it feeds, so the wrapper wipes it on drop —
+/// including on the early-return paths where the response is never parsed.
+struct CredResponse(Value);
+
+impl std::ops::Deref for CredResponse {
+    type Target = Value;
+    fn deref(&self) -> &Value {
+        &self.0
+    }
+}
+
+impl Drop for CredResponse {
+    fn drop(&mut self) {
+        scrub_large_blob_key(&mut self.0);
+    }
+}
+
+/// Clear the `largeBlobKey` (0x0B) bytes of a decoded response map in place.
+/// Scoped to this one response key on purpose: a blanket wipe of every
+/// `cbor::Value::Bytes` would touch every CBOR response in the crate.
+fn scrub_large_blob_key(v: &mut Value) {
+    use zeroize::Zeroize;
+    if let Value::Map(entries) = v {
+        for (k, val) in entries.iter_mut() {
+            if k.as_uint() == Some(RESP_LARGE_BLOB_KEY) {
+                if let Value::Bytes(bytes) = val {
+                    bytes.zeroize();
+                }
+            }
+        }
     }
 }
 
@@ -226,8 +286,11 @@ impl<'a, T: CtapTransport> CredentialManager<'a, T> {
             Value::UInt(PARAM_RP_ID_HASH),
             Value::Bytes(rp_id_hash.to_vec()),
         )]);
+        // Every response below is wrapped in `CredResponse`: the parsed
+        // `Credential` takes its own copy of the largeBlobKey, so the decoded
+        // response's copy is wiped the moment the wrapper goes out of scope.
         let first = match self.dispatch(SUB_ENUMERATE_CREDS_BEGIN, Some(params)) {
-            Ok(v) => v,
+            Ok(v) => CredResponse(v),
             Err(CtapError::StatusCode(CTAP2_ERR_NO_CREDENTIALS)) => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
@@ -239,7 +302,7 @@ impl<'a, T: CtapTransport> CredentialManager<'a, T> {
         let mut out = Vec::with_capacity(total.min(1024));
         out.push(parse_credential(&first)?);
         while out.len() < total {
-            let v = self.dispatch(SUB_ENUMERATE_CREDS_NEXT, None)?;
+            let v = CredResponse(self.dispatch(SUB_ENUMERATE_CREDS_NEXT, None)?);
             out.push(parse_credential(&v)?);
         }
         Ok(out)
@@ -261,20 +324,20 @@ impl<'a, T: CtapTransport> CredentialManager<'a, T> {
     }
 
     fn dispatch(&mut self, sub: u8, params: Option<Value>) -> Result<Value, CtapError> {
+        use zeroize::Zeroize;
         let request = self.build_request(sub, params.as_ref());
         let mut payload = Vec::with_capacity(request.len() + 1);
         payload.push(self.cmd_code);
         payload.extend_from_slice(&request);
-        let resp = self.dev.transact(CTAPHID_CBOR, &payload)?;
-        let (status, body) = resp.split_first().ok_or(CtapError::EmptyResponse)?;
-        if *status != 0 {
-            return Err(CtapError::StatusCode(*status));
-        }
-        if body.is_empty() {
-            return Ok(Value::Map(Vec::new()));
-        }
-        let (value, _) = cbor::decode(body)?;
-        Ok(value)
+        // enumerateCredentials answers carry the credential's largeBlobKey in
+        // the clear, so the raw wire buffer holds key material too. The decode
+        // borrows from it and hands back an owned `Value`, so wipe the buffer
+        // as soon as the decode is done; routing the decode through a helper
+        // keeps every early-return path in front of the wipe.
+        let mut resp = self.dev.transact(CTAPHID_CBOR, &payload)?;
+        let decoded = decode_response(&resp);
+        resp.zeroize();
+        decoded
     }
 
     fn build_request(&self, sub: u8, params: Option<&Value>) -> Vec<u8> {
@@ -301,6 +364,21 @@ impl<'a, T: CtapTransport> CredentialManager<'a, T> {
         ));
         cbor::encode(&Value::Map(entries))
     }
+}
+
+/// Split the CTAP status byte off a raw response and decode the CBOR body.
+/// Separate from [`CredentialManager::dispatch`] so the caller can wipe the
+/// wire buffer on every path, success or error.
+fn decode_response(resp: &[u8]) -> Result<Value, CtapError> {
+    let (status, body) = resp.split_first().ok_or(CtapError::EmptyResponse)?;
+    if *status != 0 {
+        return Err(CtapError::StatusCode(*status));
+    }
+    if body.is_empty() {
+        return Ok(Value::Map(Vec::new()));
+    }
+    let (value, _) = cbor::decode(body)?;
+    Ok(value)
 }
 
 fn field_uint(v: &Value, key: u64) -> Option<u64> {
@@ -757,5 +835,106 @@ mod tests {
         ]);
         let parsed = parse_credential(&cred_no_blob_key).unwrap();
         assert_eq!(parsed.large_blob_key, None);
+    }
+
+    #[test]
+    fn credential_scrub_clears_the_large_blob_key() {
+        // What `Drop for Credential` runs. Observing the freed allocation
+        // itself would need `unsafe` (forbidden workspace-wide), so the wipe
+        // is asserted on the value the destructor operates on.
+        let mut cred = Credential {
+            credential_id: vec![0xAB; 32],
+            user: CredentialUser::default(),
+            algorithm: Some(-7),
+            large_blob_key: Some([0x5A; 32]),
+        };
+        cred.scrub_key();
+        assert_eq!(cred.large_blob_key, Some([0u8; 32]));
+
+        // A credential without a key must survive the same call untouched.
+        let mut none = Credential {
+            credential_id: vec![0xCD; 16],
+            user: CredentialUser::default(),
+            algorithm: None,
+            large_blob_key: None,
+        };
+        none.scrub_key();
+        assert_eq!(none.large_blob_key, None);
+        assert_eq!(none.credential_id, vec![0xCD; 16]);
+    }
+
+    #[test]
+    fn scrub_clears_the_decoded_responses_key_copy() {
+        // What `Drop for CredResponse` runs: the decoder's own copy of the
+        // largeBlobKey is wiped, and nothing else in the response is.
+        let mut resp = Value::Map(vec![
+            (Value::UInt(RESP_TOTAL_CREDS), Value::UInt(1)),
+            (
+                Value::UInt(RESP_CREDENTIAL_ID),
+                Value::Map(vec![(
+                    Value::Text("id".into()),
+                    Value::Bytes(vec![0xAB; 32]),
+                )]),
+            ),
+            (
+                Value::UInt(RESP_LARGE_BLOB_KEY),
+                Value::Bytes(vec![0x5A; 32]),
+            ),
+        ]);
+        scrub_large_blob_key(&mut resp);
+        // `Vec::zeroize` wipes the bytes *and* the capacity tail, then
+        // truncates, so the entry is left empty rather than 32 zeros.
+        assert_eq!(
+            resp.get_uint_key(RESP_LARGE_BLOB_KEY).unwrap().as_bytes(),
+            Some(&[][..])
+        );
+        let cred_desc = resp.get_uint_key(RESP_CREDENTIAL_ID).unwrap();
+        let id = cred_desc
+            .as_map()
+            .unwrap()
+            .iter()
+            .find_map(|(k, v)| (k.as_text() == Some("id")).then_some(v))
+            .unwrap();
+        assert_eq!(id.as_bytes(), Some(&[0xABu8; 32][..]));
+        assert_eq!(field_uint(&resp, RESP_TOTAL_CREDS), Some(1));
+        // A response with no 0x0B entry is left alone.
+        let mut no_key = Value::Map(vec![(Value::UInt(RESP_TOTAL_CREDS), Value::UInt(3))]);
+        scrub_large_blob_key(&mut no_key);
+        assert_eq!(field_uint(&no_key, RESP_TOTAL_CREDS), Some(3));
+    }
+
+    #[test]
+    fn enumeration_returns_the_key_despite_the_buffer_wipe() {
+        // The wire buffer and the decoded response are both scrubbed on this
+        // path; the parsed credential must still carry the key, i.e. the
+        // wipes are sequenced after the decode and after the parse.
+        let key = [0x5Au8; 32];
+        let entry = Value::Map(vec![
+            (
+                Value::UInt(RESP_USER),
+                Value::Map(vec![(
+                    Value::Text("id".into()),
+                    Value::Bytes(vec![1, 2, 3]),
+                )]),
+            ),
+            (
+                Value::UInt(RESP_CREDENTIAL_ID),
+                Value::Map(vec![(
+                    Value::Text("id".into()),
+                    Value::Bytes(vec![0xAB; 32]),
+                )]),
+            ),
+            (Value::UInt(RESP_LARGE_BLOB_KEY), Value::Bytes(key.to_vec())),
+            (Value::UInt(RESP_TOTAL_CREDS), Value::UInt(1)),
+        ]);
+        let mut dev = ScriptedTransport {
+            responses: vec![ok_cbor(&entry)],
+        };
+        let info = info_with("credMgmt");
+        let mut mgr = CredentialManager::new(&mut dev, fake_token(), &info).unwrap();
+        let creds = mgr.list_credentials(&[0x11; 32]).unwrap();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].large_blob_key, Some(key));
+        assert_eq!(creds[0].credential_id, vec![0xAB; 32]);
     }
 }

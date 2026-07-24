@@ -182,10 +182,15 @@ struct SecurityKeysState {
     /// tab, so a failed read doesn't retry every frame. Reset when the selected
     /// device changes so a different key loads fresh.
     lb_autoloaded: bool,
-    /// SSH certificate extracted by "Save certificate…", parked between the
-    /// background decrypt job and the save dialog resolving. `None` when no
-    /// save is in flight.
-    ssh_cert_pending: Option<PendingSshCert>,
+    /// SSH certificates extracted by "Save certificate…", parked between the
+    /// background decrypt job and the save dialog resolving, keyed by the
+    /// request id its `FileTarget::SshCertSave` carries. A map rather than a
+    /// single slot because nothing stops two save dialogs being open at once
+    /// (the busy guard is released before the extract job's apply closure
+    /// runs, and the dialogs are non-modal): with one shared slot the first
+    /// dialog answered wrote whichever certificate happened to be parked.
+    /// Empty when no save is in flight.
+    ssh_cert_pending: std::collections::HashMap<u64, PendingSshCert>,
     /// Result line for the last "Save certificate…" action (extraction error,
     /// or the saved path plus the parsed cert summary). Shown in the Passkeys
     /// panel.
@@ -302,6 +307,11 @@ struct ResetArm {
     /// mode a fresh path must match these — so plugging in a *different*
     /// model while a reset is armed doesn't get it reset by mistake.
     target_ids: Option<(u16, u16)>,
+    /// The selection the arm was set under. An armed ceremony belongs to one
+    /// key, so every surface that speaks for it — the dialog's "now unplug the
+    /// key" prompt above all — has to check that this is still the key on
+    /// screen before saying anything.
+    for_device: Option<DeviceId>,
     /// FIDO HID paths present at the previous poll, to diff against (path mode).
     prev_paths: Vec<std::path::PathBuf>,
     /// True once the armed key has been unplugged; the next fresh insertion then
@@ -761,18 +771,97 @@ fn factory_reset_confirm_summary(
         .join(", ");
     let mut msg = format!(
         "Factory-reset {model} (serial {serial})?\n\nWipes: {applets}.\nEvery \
-         credential, code, key, and PIN is erased. The key stays fully usable."
+         credential, code, key, and PIN is erased. Each applet that completes \
+         comes back in factory condition, ready to set up again."
     );
     if plan.contains(&ResetStep::Piv) {
+        // Don't promise the key "stays fully usable": the PIV path blocks the
+        // PIN and PUK on purpose, so a wipe that stops between the blocking and
+        // the RESET leaves that applet locked. The step report says which.
         msg.push_str(
             "\n\nPIV: the PIN and PUK are intentionally blocked, then the applet \
-             is wiped (the standard reset path).",
+             is wiped (the standard reset path). If the wipe stops after the \
+             blocking, PIV stays locked until a reset finishes \u{2014} the report \
+             below the button says what state it's in.",
         );
     }
     if plan.contains(&ResetStep::Fido) {
         msg.push_str("\n\nFinishes with a step to unplug the key, plug it back in, and touch it.");
     }
     msg
+}
+
+/// One line of the factory-reset report pane.
+///
+/// Card applets resolve on the worker and arrive as finished
+/// [`StepReport`](keyroost_resolve::StepReport)s. FIDO can't: its wipe is
+/// handed to the armed reset dialog, which needs a replug and a touch, so its
+/// row is seeded as `FidoPending` and only becomes a `Step` once that ceremony
+/// answers. `StepOutcome` has no pending state — it lives in the shared
+/// resolver crate the CLI consumes too — so the waiting state is modelled
+/// here. Without this row a failed or abandoned FIDO finale left a report that
+/// listed only the wiped card applets, reading as a completed whole-device
+/// wipe while the passkeys and PIN were still on the key.
+enum FactoryResetRow {
+    /// A step that has answered, wiped or failed.
+    Step(keyroost_resolve::StepReport),
+    /// FIDO2 was in the plan and the replug + touch ceremony hasn't answered.
+    FidoPending,
+}
+
+/// How a report line should be painted. Keeps the wording pure (testable
+/// without a frame) while the renderer owns the palette lookup.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowTone {
+    /// The step finished as asked.
+    Done,
+    /// Nothing went wrong, but the step hasn't happened yet.
+    Waiting,
+    /// The step did not wipe what it was supposed to.
+    Bad,
+    /// The step wasn't part of this run.
+    Muted,
+}
+
+/// The text and tone for one factory-reset report line.
+fn factory_reset_row_line(row: &FactoryResetRow) -> (String, RowTone) {
+    use keyroost_resolve::StepOutcome;
+    match row {
+        FactoryResetRow::FidoPending => (
+            format!(
+                "{}  not wiped yet \u{2014} waiting for the unplug, replug, and touch",
+                keyroost_resolve::ResetStep::Fido.label()
+            ),
+            RowTone::Waiting,
+        ),
+        FactoryResetRow::Step(r) => match &r.outcome {
+            StepOutcome::Wiped => (format!("{}  wiped", r.step.label()), RowTone::Done),
+            StepOutcome::Failed(e) => (format!("{}  failed: {e}", r.step.label()), RowTone::Bad),
+            StepOutcome::Skipped => (format!("{}  skipped", r.step.label()), RowTone::Muted),
+        },
+    }
+}
+
+/// Fold the FIDO finale's outcome into the factory-reset report, replacing the
+/// row seeded when the card sweep handed off. A FIDO reset that isn't part of
+/// a factory-reset run (the standalone "Reset key" button) finds no FIDO row
+/// and leaves the report untouched.
+///
+/// An already-answered FIDO row is replaced too, not just a pending one: the
+/// report invites a retry after a failure, the retry runs against the same
+/// selection (so nothing clears the report in between), and a row still
+/// reading "failed" after a wipe that succeeded tells the user their passkeys
+/// and PIN survived on a key that is actually empty. The latest outcome wins.
+fn resolve_fido_reset_row(rows: &mut [FactoryResetRow], outcome: keyroost_resolve::StepOutcome) {
+    if let Some(row) = rows.iter_mut().find(|r| match r {
+        FactoryResetRow::FidoPending => true,
+        FactoryResetRow::Step(r) => r.step == keyroost_resolve::ResetStep::Fido,
+    }) {
+        *row = FactoryResetRow::Step(keyroost_resolve::StepReport {
+            step: keyroost_resolve::ResetStep::Fido,
+            outcome,
+        });
+    }
 }
 
 /// Run one non-FIDO applet reset off the UI thread, mapping the result to a
@@ -804,15 +893,11 @@ fn run_card_reset_step(
                 let name = reader.ok_or("no PC/SC reader for the PIV applet")?;
                 let mut s =
                     keyroost_transport::PivSession::open(name).map_err(|e| e.to_string())?;
-                // force_reset blocks the PIN and PUK before RESET; if RESET then
-                // fails the card is NOT bricked — that blocked state is exactly
-                // what `piv reset` recovers from. Say so rather than a bare fail.
-                s.force_reset().map_err(|e| {
-                    format!(
-                        "{e} (if the PIN and PUK became blocked during the attempt, \
-                         the card is not bricked — recover with `keyroostctl piv reset`)"
-                    )
-                })?;
+                // force_reset's failures now name the state the card is actually
+                // in (refused before anything was blocked / stopped part-way /
+                // the throwaway PUK guess was accepted), so pass them through
+                // rather than appending a guess about recovery.
+                s.force_reset().map_err(|e| e.to_string())?;
             }
             ResetStep::Token2Otp => {
                 // The OTP applet lives on the FIDO HID node when present, else on
@@ -1700,7 +1785,7 @@ struct App {
     /// was opened for (KEY-008 posture). None unless the modal is open.
     factory_reset_confirm: Option<DeviceId>,
     /// Live per-step report while a factory reset runs (empty when idle).
-    factory_reset_report: Vec<keyroost_resolve::StepReport>,
+    factory_reset_report: Vec<FactoryResetRow>,
     /// Remaining scans in the current burst. A single scan races slow-to-
     /// register readers (the Molto2's CCID interface appears in pcscd a beat
     /// after the USB device), so startup and every hotplug schedule several
@@ -1762,6 +1847,11 @@ struct App {
         FileTarget,
         std::sync::mpsc::Receiver<Option<std::path::PathBuf>>,
     )>,
+    /// Monotonic id handed to each "Save certificate…" request so its dialog
+    /// and its parked certificate stay paired. Never reset (not even on a
+    /// selection change): an id must not be reused while a dialog opened for
+    /// the previous key is still on screen.
+    ssh_cert_next_id: u64,
 }
 
 /// Which path text field a resolved file-chooser result should populate. Keeps
@@ -1784,9 +1874,10 @@ enum FileTarget {
     /// Passkeys tab "Save certificate…" destination for an SSH credential's
     /// extracted cert. The cert text was decrypted by the background job and
     /// parked in `security_keys.ssh_cert_pending`; the resolving dialog writes
-    /// it to the chosen path. No payload here (the enum is `Copy`): only one
-    /// save-cert dialog is ever in flight, so the pending text is unambiguous.
-    SshCertSave,
+    /// it to the chosen path. Carries the request id that keys the parked
+    /// certificate — same reason `LbExport` carries an index: two save dialogs
+    /// can be open at once, and each must resolve to its own certificate.
+    SshCertSave(u64),
 }
 
 /// An SSH certificate extracted from a credential's largeBlob, waiting for the
@@ -1795,6 +1886,18 @@ enum FileTarget {
 struct PendingSshCert {
     cert_pub: String,
     summary: String,
+}
+
+/// Take the certificate a resolving "Save certificate…" dialog is for out of
+/// the parked-certificate map. Keyed by the dialog's request id, so two saves
+/// in flight each get their own certificate instead of racing for one slot;
+/// `None` when this dialog's certificate is gone (the selection changed, so
+/// `clear_device_state` dropped it).
+fn take_pending_cert(
+    pending: &mut std::collections::HashMap<u64, PendingSshCert>,
+    id: u64,
+) -> Option<PendingSshCert> {
+    pending.remove(&id)
 }
 
 impl App {
@@ -1906,36 +2009,50 @@ impl App {
                                     }
                                 });
                             }
-                            FileTarget::SshCertSave => {
+                            FileTarget::SshCertSave(id) => {
                                 // The cert text was decrypted by the background
-                                // job and parked here; write it to the chosen
-                                // path. `take` so a re-opened dialog can't rewrite
-                                // a stale cert.
-                                self.security_keys.ssh_cert_status =
-                                    Some(match self.security_keys.ssh_cert_pending.take() {
-                                        None => "Save failed: no certificate was ready \
-                                                 to write"
-                                            .to_string(),
-                                        Some(pending) => {
-                                            match std::fs::write(&path, pending.cert_pub.as_bytes())
-                                            {
-                                                Ok(()) => format!(
-                                                    "Saved certificate to {text}\n{}",
-                                                    pending.summary
-                                                ),
-                                                Err(e) => format!("Save failed: {e}"),
-                                            }
+                                // job and parked under this dialog's id; take
+                                // *that* one and write it to the chosen path.
+                                let pending =
+                                    take_pending_cert(&mut self.security_keys.ssh_cert_pending, id);
+                                self.security_keys.ssh_cert_status = Some(match pending {
+                                    None => "Save failed: no certificate was ready \
+                                             to write"
+                                        .to_string(),
+                                    Some(pending) => {
+                                        match std::fs::write(&path, pending.cert_pub.as_bytes()) {
+                                            Ok(()) => format!(
+                                                "Saved certificate to {text}\n{}",
+                                                pending.summary
+                                            ),
+                                            Err(e) => format!("Save failed: {e}"),
                                         }
-                                    });
+                                    }
+                                });
                             }
                         }
+                    } else {
+                        // Cancelled: drop whatever payload was waiting on this
+                        // dialog so it can't be written by a later one.
+                        self.discard_file_target(target);
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => i += 1,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.pending_files.remove(i);
+                    let (target, _) = self.pending_files.remove(i);
+                    self.discard_file_target(target);
                 }
             }
+        }
+    }
+
+    /// Drop the payload a dialog was holding when it produced no path — the
+    /// user cancelled, or the helper thread went away. Only save-certificate
+    /// dialogs park anything; without this a cancelled save would leave the
+    /// extracted certificate in the map for the rest of the session.
+    fn discard_file_target(&mut self, target: FileTarget) {
+        if let FileTarget::SshCertSave(id) = target {
+            self.security_keys.ssh_cert_pending.remove(&id);
         }
     }
 }
@@ -3620,9 +3737,14 @@ impl App {
     /// CLI, which starts cold and rebuilds a CredentialManager to fetch the key —
     /// the job needs no PIN token: reading the world-readable largeBlob array
     /// takes the device but no auth. On success the parsed cert is parked in
-    /// `ssh_cert_pending` and a save dialog opens, defaulting to a path-safe
-    /// `<rp-id>-cert.pub` filename. PIN only, no touch.
-    fn save_ssh_cert(&mut self, rp_id: String, large_blob_key: [u8; 32]) {
+    /// `ssh_cert_pending` under this request's id and a save dialog carrying
+    /// the same id opens, defaulting to a path-safe `<rp-id>-cert.pub`
+    /// filename. PIN only, no touch.
+    ///
+    /// The largeBlob key is carried `Zeroizing` so the copy moved into the job
+    /// (and the one dropped on an early return) doesn't leave 32 bytes of key
+    /// material in freed memory — same treatment as the typed PINs.
+    fn save_ssh_cert(&mut self, rp_id: String, large_blob_key: zeroize::Zeroizing<[u8; 32]>) {
         let Some(target) = self.selected_fido_target() else {
             self.security_keys.ssh_cert_status = Some("No FIDO key selected.".into());
             return;
@@ -3632,6 +3754,11 @@ impl App {
         if self.fido_session().is_none() {
             return;
         }
+        // Pair this request with its dialog up front: a second "Save
+        // certificate…" click gets its own id, so whichever dialog the user
+        // answers first still writes its own certificate.
+        let id = self.ssh_cert_next_id;
+        self.ssh_cert_next_id = self.ssh_cert_next_id.wrapping_add(1);
         let for_device = self.selected_device.clone();
         self.spawn_job("Extracting certificate\u{2026}", move || {
             let result = Self::extract_ssh_cert(&target, &large_blob_key);
@@ -3641,10 +3768,10 @@ impl App {
                 }
                 match result {
                     Ok(pending) => {
-                        app.security_keys.ssh_cert_pending = Some(pending);
+                        app.security_keys.ssh_cert_pending.insert(id, pending);
                         app.security_keys.ssh_cert_status = None;
                         app.spawn_file_dialog(
-                            FileTarget::SshCertSave,
+                            FileTarget::SshCertSave(id),
                             true,
                             &[("SSH certificate", &["pub"]), ("All files", &["*"])],
                             Some(&keyroost_ctap::ssh_cert::default_cert_filename(&rp_id)),
@@ -3801,12 +3928,86 @@ impl App {
         self.selected_device().and_then(|d| d.hid_path.clone())
     }
 
+    /// Fold a finished FIDO reset into the app, bound to the key the reset was
+    /// dispatched for. Lifted out of `submit_reset_path`'s apply closure so the
+    /// device-binding rule is exercisable without a key in hand; the guard is
+    /// this function's first statement, which is what the closure's convention
+    /// (see [`completion_still_valid`]) asks for.
+    ///
+    /// `for_device` is the selection at dispatch. The factory-reset report is
+    /// app-global state that `on_device_selected` re-points at whatever key is
+    /// selected now, so an unbound write paints one key's wipe under another
+    /// key's name — the worst possible lie for this pane. A completion that
+    /// outlives its selection is dropped, and said out loud in the log: the
+    /// wipe did happen, and no report on screen can honestly show it.
+    fn apply_reset_path_outcome(
+        app: &mut App,
+        for_device: Option<&DeviceId>,
+        result: Result<(), String>,
+    ) {
+        if !completion_still_valid(for_device, app.selected_device.as_ref()) {
+            // Selection changed mid-reset; don't paint A's outcome under B.
+            let note = match &result {
+                Ok(()) => "a security key finished its FIDO2 reset after the selection moved on \
+                           \u{2014} its passkeys and PIN are wiped. The report on screen belongs \
+                           to the key selected now, so it does not show that wipe."
+                    .to_string(),
+                Err(e) => format!(
+                    "a security key's FIDO2 reset failed after the selection moved on \
+                     \u{2014} its passkeys and PIN are still on it: {e}"
+                ),
+            };
+            app.log(Severity::Warn, note);
+            return;
+        }
+        match result {
+            Ok(()) => {
+                app.security_keys.session = None;
+                app.security_keys.info = None;
+                app.security_keys.error = None;
+                // When this reset was a factory reset's finale, record it —
+                // the Overview report is where the user is looking.
+                resolve_fido_reset_row(
+                    &mut app.factory_reset_report,
+                    keyroost_resolve::StepOutcome::Wiped,
+                );
+                // Re-read info so the PIN status reflects the wipe.
+                app.fetch_selected_info();
+            }
+            Err(e) => {
+                let msg = if e.contains("NOT_ALLOWED") || e.contains("0x30") {
+                    "This key refused the reset. Most security keys (YubiKey \
+                     included) only allow a FIDO reset within about 10 seconds \
+                     of being plugged in. Unplug the key, plug it back in, then \
+                     click \u{201C}Reset key\u{201D} again right away."
+                        .to_string()
+                } else {
+                    format!("reset failed: {e}")
+                };
+                // `security_keys.error` is painted only in the FIDO2 and PIN
+                // panes; a factory reset leaves the user on Overview, so the
+                // failure has to land in the report too or the wipe looks
+                // complete when the passkeys and PIN survived.
+                resolve_fido_reset_row(
+                    &mut app.factory_reset_report,
+                    keyroost_resolve::StepOutcome::Failed(msg.clone()),
+                );
+                app.security_keys.error = Some(msg);
+            }
+        }
+    }
+
     /// Wipe the FIDO key at `path` (authenticatorReset). Runs on the worker
     /// thread — the card needs a touch within ~30s, which the worker keeps off
     /// the UI frame. Used by the armed-reset flow, which targets the
     /// just-reconnected key rather than the (now stale) selection. On success
     /// the cached session and CTAP info are cleared.
     fn submit_reset_path(&mut self, path: std::path::PathBuf) -> bool {
+        // The ceremony is device-bound like every other dispatcher: the key
+        // being wiped is the one selected when the arm was set (selecting
+        // another key disarms), and the outcome may only be written under that
+        // selection.
+        let for_device = self.selected_device.clone();
         self.spawn_job("Resetting key\u{2026} (touch now)", move || {
             let result = (|| -> Result<(), String> {
                 // A just-replugged node (especially on a fresh port) can take a
@@ -3825,26 +4026,8 @@ impl App {
                 let mut dev = dev.ok_or_else(|| "could not open key".to_string())?;
                 keyroost_ctap::reset(&mut dev).map_err(|e| e.to_string())
             })();
-            Box::new(move |app: &mut App| match result {
-                Ok(()) => {
-                    app.security_keys.session = None;
-                    app.security_keys.info = None;
-                    app.security_keys.error = None;
-                    // Re-read info so the PIN status reflects the wipe.
-                    app.fetch_selected_info();
-                }
-                Err(e) => {
-                    let msg = if e.contains("NOT_ALLOWED") || e.contains("0x30") {
-                        "This key refused the reset. Most security keys (YubiKey \
-                         included) only allow a FIDO reset within about 10 seconds \
-                         of being plugged in. Unplug the key, plug it back in, then \
-                         click \u{201C}Reset key\u{201D} again right away."
-                            .to_string()
-                    } else {
-                        format!("reset failed: {e}")
-                    };
-                    app.security_keys.error = Some(msg);
-                }
+            Box::new(move |app: &mut App| {
+                App::apply_reset_path_outcome(app, for_device.as_ref(), result)
             })
         })
     }
@@ -4486,9 +4669,14 @@ impl App {
                         }
                     }
                 }
-                app.factory_reset_report = reports;
-                // Hand the FIDO finale to the tested armed-reset flow.
+                app.factory_reset_report = reports.into_iter().map(FactoryResetRow::Step).collect();
+                // Hand the FIDO finale to the tested armed-reset flow. Seed its
+                // report row first: the ceremony can fail (no touch in time) or
+                // be abandoned, and the pane must not read as a finished wipe
+                // until FIDO actually answers — that outcome is routed to
+                // `security_keys.error`, which the Overview tab never paints.
                 if ends_in_fido {
+                    app.factory_reset_report.push(FactoryResetRow::FidoPending);
                     app.security_keys.reset = ResetDialog {
                         open: true,
                         ..Default::default()
@@ -4525,7 +4713,13 @@ impl App {
         let mut window_open = true;
         let mut arm = false;
         let mut cancel = false;
-        let waiting = self.reset_arm.is_some();
+        // Device-scoped, not app-global: this dialog may belong to a different
+        // key than the armed one, and telling the user to "unplug the key, then
+        // plug it back in" under the wrong key's name invites a replug that
+        // fires someone else's wipe.
+        let waiting = self.reset_arm.as_ref().is_some_and(|arm| {
+            completion_still_valid(arm.for_device.as_ref(), self.selected_device.as_ref())
+        });
         egui::Window::new("Reset security key?")
             .collapsible(false)
             .resizable(false)
@@ -4594,44 +4788,68 @@ impl App {
                 }
             });
         if arm {
-            // Snapshot the current FIDO keys so the poll can tell when ours
-            // leaves and a fresh one arrives. Prefer the armed key's HID serial
-            // (port-independent), then the resolver's effective (CCID) serial;
-            // refuse to arm with neither — a replugged key we can't re-identify
-            // must not be matched by "first same-model path" (KEY-005).
-            let target_path = self.selected_fido_hid_path();
-            let devices = Self::fido_devices();
-            let target = target_path
-                .as_ref()
-                .and_then(|p| devices.iter().find(|d| &d.path == p));
-            let target_serial = target.and_then(|d| d.serial.clone());
-            let target_ids = target.map(|d| d.ids);
-            let target_effective_serial = self
-                .selected_device()
-                .map(|d| d.serial.clone())
-                .filter(|s| !s.is_empty());
-            if target_serial.is_none() && target_effective_serial.is_none() {
-                self.security_keys.reset = ResetDialog::default();
-                self.log(
-                    Severity::Err,
-                    "this key exposes no serial to re-identify it by after a replug, \
-                     so the armed reset can't safely target it \u{2014} not armed. \
-                     Use `keyroostctl fido reset` within ~10 s of plugging the key in instead.",
-                );
-            } else {
-                self.reset_arm = Some(ResetArm {
-                    target_serial,
-                    target_path,
-                    target_ids,
-                    target_effective_serial,
-                    prev_paths: devices.into_iter().map(|d| d.path).collect(),
-                    saw_removal: false,
-                });
-            }
+            self.arm_fido_reset();
         } else if cancel || !window_open {
             // Cancel button, or the window's [x] close.
             self.security_keys.reset = ResetDialog::default();
             self.reset_arm = None;
+            // If this dialog was a factory reset's FIDO finale, say so in the
+            // report rather than leaving a row that reads as still in progress.
+            resolve_fido_reset_row(
+                &mut self.factory_reset_report,
+                keyroost_resolve::StepOutcome::Failed(
+                    "cancelled \u{2014} the passkeys and PIN are still on this key".into(),
+                ),
+            );
+        }
+    }
+
+    /// Arm the reset: snapshot the current FIDO keys so the poll can tell when
+    /// ours leaves and a fresh one arrives. Prefer the armed key's HID serial
+    /// (port-independent), then the resolver's effective (CCID) serial; refuse
+    /// to arm with neither — a replugged key we can't re-identify must not be
+    /// matched by "first same-model path" (KEY-005).
+    fn arm_fido_reset(&mut self) {
+        let target_path = self.selected_fido_hid_path();
+        let devices = Self::fido_devices();
+        let target = target_path
+            .as_ref()
+            .and_then(|p| devices.iter().find(|d| &d.path == p));
+        let target_serial = target.and_then(|d| d.serial.clone());
+        let target_ids = target.map(|d| d.ids);
+        let target_effective_serial = self
+            .selected_device()
+            .map(|d| d.serial.clone())
+            .filter(|s| !s.is_empty());
+        if target_serial.is_none() && target_effective_serial.is_none() {
+            self.security_keys.reset = ResetDialog::default();
+            let msg = "not armed \u{2014} this key exposes no serial to re-identify it by after \
+                       a replug, so the armed reset can't safely target it. Run `keyroostctl \
+                       fido reset --yes` within ~10 s of plugging the key in instead."
+                .to_string();
+            self.log(Severity::Err, msg.clone());
+            // The dialog just vanished and the log panel is collapsed by
+            // default, so neither surface is guaranteed to be read. Land the
+            // refusal where the user is looking as well: the report row
+            // (Overview) when this was a factory reset's finale, and
+            // `security_keys.error` (the FIDO2 pane the standalone Reset button
+            // lives on) either way. Leaving the seeded row pending would ask
+            // for a replug-and-touch ceremony that is never coming.
+            resolve_fido_reset_row(
+                &mut self.factory_reset_report,
+                keyroost_resolve::StepOutcome::Failed(msg.clone()),
+            );
+            self.security_keys.error = Some(msg);
+        } else {
+            self.reset_arm = Some(ResetArm {
+                target_serial,
+                target_path,
+                target_ids,
+                target_effective_serial,
+                for_device: self.selected_device.clone(),
+                prev_paths: devices.into_iter().map(|d| d.path).collect(),
+                saw_removal: false,
+            });
         }
     }
 
@@ -5442,9 +5660,11 @@ impl App {
         self.security_keys.lb_status = None;
         self.security_keys.lb_confirm_delete = None;
         self.security_keys.lb_confirm_clear = false;
-        // SSH-cert extract state is per-key too (KEY-012): drop any parked cert
+        // SSH-cert extract state is per-key too (KEY-012): drop any parked certs
         // and the result line so a different key never shows the previous one's.
-        self.security_keys.ssh_cert_pending = None;
+        // A dialog still open for the old key then resolves to "no certificate
+        // was ready to write" rather than the new key's cert.
+        self.security_keys.ssh_cert_pending.clear();
         self.security_keys.ssh_cert_status = None;
         // Fingerprint state is per-key: the cached list, the pending delete /
         // rename, the name draft, and a live enroll wizard must not carry
@@ -5493,6 +5713,19 @@ impl App {
         self.oath.confirm_delete = None;
         self.openpgp.cred_modal = None;
         self.security_keys.reset = ResetDialog::default();
+        // …and so is the *armed* ceremony behind that dialog. An arm outlives
+        // its dialog otherwise (nothing else clears it once the dialog is gone),
+        // and it is entirely invisible: the poll keeps running, so replugging
+        // the key it was armed for wipes it with the user looking at another
+        // key — and the outcome would land in whatever report is on screen.
+        // An armed ceremony must not outlive the selection it was armed for.
+        if self.reset_arm.take().is_some() {
+            self.log(
+                Severity::Warn,
+                "the armed reset was cancelled \u{2014} selecting another key ends the ceremony. \
+                 Re-open \u{201C}Reset key\u{201D} on the key you want to wipe.",
+            );
+        }
         self.factory_reset_report.clear();
         self.oath_tried = false;
         self.piv_tried = false;
@@ -8633,7 +8866,8 @@ impl App {
                             ui.label(
                                 egui::RichText::new(format!(
                                     "Resets every applet on this key ({}) to factory state. \
-                                     The key stays fully usable.",
+                                     Each step reports on its own \u{2014} anything that \
+                                     doesn't complete is listed below.",
                                     plan.iter()
                                         .map(|s| s.label())
                                         .collect::<Vec<_>>()
@@ -8646,17 +8880,13 @@ impl App {
                             // outcome afterwards, until the selection changes).
                             if !self.factory_reset_report.is_empty() {
                                 ui.add_space(8.0);
-                                for r in &self.factory_reset_report {
-                                    let (text, color) = match &r.outcome {
-                                        keyroost_resolve::StepOutcome::Wiped => {
-                                            (format!("{}  wiped", r.step.label()), p.ok)
-                                        }
-                                        keyroost_resolve::StepOutcome::Failed(e) => {
-                                            (format!("{}  failed: {e}", r.step.label()), p.err)
-                                        }
-                                        keyroost_resolve::StepOutcome::Skipped => {
-                                            (format!("{}  skipped", r.step.label()), p.txt3)
-                                        }
+                                for row in &self.factory_reset_report {
+                                    let (text, tone) = factory_reset_row_line(row);
+                                    let color = match tone {
+                                        RowTone::Done => p.ok,
+                                        RowTone::Waiting => p.warn,
+                                        RowTone::Bad => p.err,
+                                        RowTone::Muted => p.txt3,
                                     };
                                     ui.label(
                                         egui::RichText::new(text)
@@ -9184,7 +9414,9 @@ impl App {
             // Collected in the credential loop (below), applied after the card so
             // the extract job isn't dispatched while `self` is borrowed by the
             // cloned rps list: (rp id, credential's largeBlob key).
-            let mut save_cert: Option<(String, [u8; 32])> = None;
+            // The largeBlob key is key material: carry it zeroizing from the
+            // moment it leaves the credential listing.
+            let mut save_cert: Option<(String, zeroize::Zeroizing<[u8; 32]>)> = None;
             theme::card_frame(p).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -9271,7 +9503,10 @@ impl App {
                                                 .clicked()
                                                 {
                                                     if let Some(key) = c.large_blob_key {
-                                                        save_cert = Some((rp.id.clone(), key));
+                                                        save_cert = Some((
+                                                            rp.id.clone(),
+                                                            zeroize::Zeroizing::new(key),
+                                                        ));
                                                     }
                                                 }
                                             }
@@ -13980,6 +14215,404 @@ mod tests {
         // PIV disclosure and FIDO replug note are present.
         assert!(msg.contains("PIN and PUK"));
         assert!(msg.to_lowercase().contains("unplug"));
+        // The summary must not promise an outcome the PIV path can't guarantee:
+        // that path blocks the PIN and PUK before the wipe.
+        assert!(!msg.contains("stays fully usable"));
+    }
+
+    /// Two "Save certificate…" dialogs can be open at once (the busy guard is
+    /// released before the extract job's apply closure runs, and the dialogs
+    /// are not modal). Each must resolve to the certificate it was opened for —
+    /// with the previous single global slot, whichever dialog was answered
+    /// first wrote whatever cert happened to be parked.
+    #[test]
+    fn concurrent_save_cert_dialogs_resolve_to_their_own_certificates() {
+        let mut pending = std::collections::HashMap::new();
+        pending.insert(
+            7,
+            PendingSshCert {
+                cert_pub: "alice-cert".into(),
+                summary: "alice".into(),
+            },
+        );
+        pending.insert(
+            8,
+            PendingSshCert {
+                cert_pub: "bob-cert".into(),
+                summary: "bob".into(),
+            },
+        );
+
+        // Answer alice's dialog (opened first) while bob's is still open.
+        let alice = take_pending_cert(&mut pending, 7).expect("alice's cert is parked");
+        assert_eq!(alice.cert_pub, "alice-cert");
+        // Bob's is untouched and still resolves to bob's cert.
+        let bob = take_pending_cert(&mut pending, 8).expect("bob's cert is still parked");
+        assert_eq!(bob.cert_pub, "bob-cert");
+        // Each id resolves once; a re-run dialog reports "nothing to write"
+        // rather than picking up a neighbour's certificate.
+        assert!(take_pending_cert(&mut pending, 7).is_none());
+        assert!(pending.is_empty());
+    }
+
+    /// A cancelled save must drop only its own parked certificate.
+    #[test]
+    fn cancelled_save_cert_dialog_drops_only_its_own_certificate() {
+        let mut app = App::default();
+        for (id, name) in [(1u64, "alice"), (2, "bob")] {
+            app.security_keys.ssh_cert_pending.insert(
+                id,
+                PendingSshCert {
+                    cert_pub: format!("{name}-cert"),
+                    summary: name.into(),
+                },
+            );
+        }
+        app.discard_file_target(FileTarget::SshCertSave(1));
+        assert!(!app.security_keys.ssh_cert_pending.contains_key(&1));
+        assert_eq!(
+            app.security_keys
+                .ssh_cert_pending
+                .get(&2)
+                .map(|c| c.cert_pub.as_str()),
+            Some("bob-cert")
+        );
+        // A target that parks nothing is a no-op.
+        app.discard_file_target(FileTarget::PivExport);
+        assert_eq!(app.security_keys.ssh_cert_pending.len(), 1);
+    }
+
+    /// The whole-device factory reset hands its FIDO step to the armed reset
+    /// dialog, whose outcome only reaches `security_keys.error` — a pane the
+    /// user isn't on. The seeded row keeps the report honest: it reads as not
+    /// wiped until the ceremony answers, then flips to wiped or failed.
+    #[test]
+    fn factory_reset_fido_row_tracks_the_finale() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let seeded = || {
+            vec![
+                FactoryResetRow::Step(StepReport {
+                    step: ResetStep::Oath,
+                    outcome: StepOutcome::Wiped,
+                }),
+                FactoryResetRow::FidoPending,
+            ]
+        };
+
+        // Seeded: FIDO reads as outstanding, never as wiped.
+        let mut rows = seeded();
+        let (text, tone) = factory_reset_row_line(&rows[1]);
+        assert!(text.starts_with("FIDO2"), "{text}");
+        assert!(text.contains("not wiped yet"), "{text}");
+        assert_eq!(tone, RowTone::Waiting);
+
+        // The touch landed.
+        resolve_fido_reset_row(&mut rows, StepOutcome::Wiped);
+        assert_eq!(
+            factory_reset_row_line(&rows[1]),
+            ("FIDO2  wiped".to_string(), RowTone::Done)
+        );
+        // The card steps are untouched by the finale.
+        assert_eq!(
+            factory_reset_row_line(&rows[0]),
+            ("OATH  wiped".to_string(), RowTone::Done)
+        );
+
+        // No touch in time / the key refused: the row says so.
+        let mut rows = seeded();
+        resolve_fido_reset_row(&mut rows, StepOutcome::Failed("no touch".into()));
+        let (text, tone) = factory_reset_row_line(&rows[1]);
+        assert_eq!(text, "FIDO2  failed: no touch");
+        assert_eq!(tone, RowTone::Bad);
+
+        // A standalone "Reset key" (no factory reset in flight) must not invent
+        // a report row.
+        let mut plain = vec![FactoryResetRow::Step(StepReport {
+            step: ResetStep::Oath,
+            outcome: StepOutcome::Wiped,
+        })];
+        resolve_fido_reset_row(&mut plain, StepOutcome::Wiped);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(
+            factory_reset_row_line(&plain[0]),
+            ("OATH  wiped".to_string(), RowTone::Done)
+        );
+    }
+
+    /// A FIDO row that has already answered must not freeze that answer. The
+    /// report invites a retry after a failed wipe and nothing clears it in
+    /// between — the selection is unchanged across the replug, so the report
+    /// survives — meaning a row still reading "failed" after a retry that
+    /// succeeded tells the user their passkeys and PIN are on a key that is
+    /// actually empty. The latest outcome has to win.
+    #[test]
+    fn factory_reset_fido_row_retry_supersedes_the_earlier_outcome() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let mut rows = vec![
+            FactoryResetRow::Step(StepReport {
+                step: ResetStep::Piv,
+                outcome: StepOutcome::Wiped,
+            }),
+            FactoryResetRow::FidoPending,
+        ];
+
+        // First attempt: no touch in time.
+        resolve_fido_reset_row(&mut rows, StepOutcome::Failed("no touch".into()));
+        assert_eq!(factory_reset_row_line(&rows[1]).1, RowTone::Bad);
+
+        // The user re-plugs, retries, and the wipe lands.
+        resolve_fido_reset_row(&mut rows, StepOutcome::Wiped);
+        assert_eq!(
+            factory_reset_row_line(&rows[1]),
+            ("FIDO2  wiped".to_string(), RowTone::Done)
+        );
+        assert_eq!(rows.len(), 2, "the retry must not append a second FIDO row");
+        assert_eq!(
+            factory_reset_row_line(&rows[0]),
+            ("PIV  wiped".to_string(), RowTone::Done),
+            "the card sweep's rows are the finale's business to leave alone"
+        );
+
+        // Still nothing invented when no FIDO row exists — an empty report
+        // (standalone "Reset key" with no factory reset ever run) stays empty,
+        // and a report of card steps only keeps exactly those steps.
+        let mut empty: Vec<FactoryResetRow> = Vec::new();
+        resolve_fido_reset_row(&mut empty, StepOutcome::Wiped);
+        assert!(empty.is_empty());
+        let mut cards = vec![FactoryResetRow::Step(StepReport {
+            step: ResetStep::OpenPgp,
+            outcome: StepOutcome::Failed("blocked".into()),
+        })];
+        resolve_fido_reset_row(&mut cards, StepOutcome::Wiped);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(
+            factory_reset_row_line(&cards[0]),
+            ("OpenPGP  failed: blocked".to_string(), RowTone::Bad)
+        );
+    }
+
+    /// Refusing to arm (KEY-005: no serial to re-identify the key by after a
+    /// replug) ends the run — the dialog closes and no reset is ever sent. The
+    /// seeded FIDO row has to resolve too, or the report sits forever on
+    /// "waiting for the unplug, replug, and touch", asking for a ceremony that
+    /// is never coming, with the only explanation buried in a log panel that is
+    /// collapsed by default.
+    #[test]
+    fn refusing_to_arm_resolves_the_pending_fido_row() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let mut app = App::default();
+        app.security_keys.reset = ResetDialog {
+            open: true,
+            ..Default::default()
+        };
+        app.factory_reset_report = vec![
+            FactoryResetRow::Step(StepReport {
+                step: ResetStep::Oath,
+                outcome: StepOutcome::Wiped,
+            }),
+            FactoryResetRow::FidoPending,
+        ];
+
+        // Nothing selected: no HID serial and no effective serial, which is the
+        // refusal branch (the same state a key that exposes neither lands in).
+        app.arm_fido_reset();
+
+        assert!(
+            app.reset_arm.is_none(),
+            "a key we can't re-identify must never arm"
+        );
+        assert!(!app.security_keys.reset.open, "the dialog is dismissed");
+        let (text, tone) = factory_reset_row_line(&app.factory_reset_report[1]);
+        assert_eq!(tone, RowTone::Bad, "{text}");
+        assert!(
+            !text.contains("not wiped yet"),
+            "the row must not stay pending: {text}"
+        );
+        assert!(text.contains("not armed"), "{text}");
+        assert!(
+            text.contains("keyroostctl fido reset --yes"),
+            "the row carries the way out: {text}"
+        );
+        // …and the same wording reaches a surface that isn't the collapsed log
+        // panel for a standalone reset, which has no report row at all.
+        assert!(
+            app.security_keys
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("not armed")),
+            "{:?}",
+            app.security_keys.error
+        );
+        assert!(app.log.iter().any(|l| l.text.contains("not armed")));
+    }
+
+    /// The FIDO finale is the one step that survives the job that started it:
+    /// it waits for a replug, so its outcome can arrive long after dispatch.
+    /// The report pane it writes into is app-global, re-pointed at whatever key
+    /// is selected now — so an outcome that arrives for key A must never touch
+    /// a report belonging to key B. Green "FIDO2 wiped" under B while B's
+    /// passkeys and PIN are untouched is the worst line this pane can print.
+    #[test]
+    fn a_fido_reset_outcome_cannot_land_on_another_key() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let a: DeviceId = "serial:AAA".into();
+        let b: DeviceId = "serial:BBB".into();
+        let seeded = |app: &mut App| {
+            app.selected_device = Some(b.clone());
+            app.security_keys.error = None;
+            app.factory_reset_report = vec![
+                FactoryResetRow::Step(StepReport {
+                    step: ResetStep::Piv,
+                    outcome: StepOutcome::Wiped,
+                }),
+                FactoryResetRow::FidoPending,
+            ];
+        };
+        let mut app = App::default();
+
+        // A's ceremony finishes with A wiped while B is on screen, mid-run.
+        seeded(&mut app);
+        App::apply_reset_path_outcome(&mut app, Some(&a), Ok(()));
+        let (text, tone) = factory_reset_row_line(&app.factory_reset_report[1]);
+        assert_eq!(
+            tone,
+            RowTone::Waiting,
+            "B's FIDO row must stay pending: {text}"
+        );
+        assert!(text.contains("not wiped yet"), "{text}");
+
+        // …and the failure direction is no better: B's pane must not show A's
+        // error, which would send the user replugging the wrong key.
+        seeded(&mut app);
+        App::apply_reset_path_outcome(&mut app, Some(&a), Err("no touch".into()));
+        assert_eq!(
+            factory_reset_row_line(&app.factory_reset_report[1]).1,
+            RowTone::Waiting
+        );
+        assert!(
+            app.security_keys.error.is_none(),
+            "{:?}",
+            app.security_keys.error
+        );
+
+        // An unbound completion (nothing captured, nothing selected) fails
+        // closed too, rather than acting on whatever happens to be there.
+        seeded(&mut app);
+        App::apply_reset_path_outcome(&mut app, None, Ok(()));
+        assert_eq!(
+            factory_reset_row_line(&app.factory_reset_report[1]).1,
+            RowTone::Waiting
+        );
+        app.selected_device = None;
+        App::apply_reset_path_outcome(&mut app, Some(&a), Ok(()));
+        assert_eq!(
+            factory_reset_row_line(&app.factory_reset_report[1]).1,
+            RowTone::Waiting
+        );
+
+        // The wipe still happened, so it can't pass in silence: no report on
+        // screen can honestly show it, which leaves the log.
+        assert!(
+            app.log
+                .iter()
+                .filter(|l| l.text.contains("passkeys and PIN are wiped"))
+                .count()
+                >= 1,
+            "a wipe that lands off-screen must still be recorded"
+        );
+        assert!(app.log.iter().any(|l| l.text.contains("still on it")));
+    }
+
+    /// The device guard must not cost the normal flow its outcome: the same key
+    /// is selected throughout the replug (rescans are suppressed while a reset
+    /// is armed), so the report has to record the wipe — and a retry after a
+    /// failure still has to be able to correct the earlier row.
+    #[test]
+    fn a_same_device_fido_outcome_is_recorded_and_a_retry_supersedes_it() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let a: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(a.clone()),
+            factory_reset_report: vec![
+                FactoryResetRow::Step(StepReport {
+                    step: ResetStep::Oath,
+                    outcome: StepOutcome::Wiped,
+                }),
+                FactoryResetRow::FidoPending,
+            ],
+            ..Default::default()
+        };
+
+        // First attempt: the key refused (outside its ~10 s window). The row
+        // says so, and the FIDO2 pane carries the way out.
+        App::apply_reset_path_outcome(&mut app, Some(&a), Err("CTAP2_ERR_NOT_ALLOWED".into()));
+        let (text, tone) = factory_reset_row_line(&app.factory_reset_report[1]);
+        assert_eq!(tone, RowTone::Bad, "{text}");
+        assert!(text.contains("refused the reset"), "{text}");
+        assert!(
+            app.security_keys
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("refused the reset")),
+            "{:?}",
+            app.security_keys.error
+        );
+
+        // The retry lands: the row must be corrected, not appended to, or the
+        // report claims passkeys survived on a key that is actually empty.
+        App::apply_reset_path_outcome(&mut app, Some(&a), Ok(()));
+        assert_eq!(
+            factory_reset_row_line(&app.factory_reset_report[1]),
+            ("FIDO2  wiped".to_string(), RowTone::Done)
+        );
+        assert_eq!(app.factory_reset_report.len(), 2);
+        assert_eq!(
+            factory_reset_row_line(&app.factory_reset_report[0]),
+            ("OATH  wiped".to_string(), RowTone::Done),
+            "the card sweep's rows are the finale's business to leave alone"
+        );
+        assert!(
+            app.security_keys.error.is_none(),
+            "the retry clears the error"
+        );
+        // Nothing was dropped on the floor, so nothing to warn about.
+        assert!(!app
+            .log
+            .iter()
+            .any(|l| l.text.contains("selection moved on")));
+    }
+
+    /// An armed ceremony belongs to the key it was armed for. Selecting another
+    /// key drops the dialog, so the arm behind it would go on polling with no
+    /// UI at all — and fire on the replug of a key the user has moved off.
+    #[test]
+    fn selecting_another_key_disarms_the_reset() {
+        let mut app = App::default();
+        app.selected_device = Some("serial:AAA".into());
+        app.reset_arm = Some(ResetArm {
+            target_serial: Some("AAA".into()),
+            target_path: None,
+            target_ids: None,
+            target_effective_serial: Some("AAA".into()),
+            for_device: app.selected_device.clone(),
+            prev_paths: Vec::new(),
+            saw_removal: true,
+        });
+
+        app.select_device("serial:BBB".into());
+
+        assert!(
+            app.reset_arm.is_none(),
+            "an arm must not outlive the selection it was armed for"
+        );
+        // The user was told to unplug and replug; the ceremony ending has to be
+        // visible somewhere, or the replug just does nothing forever.
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.text.contains("the armed reset was cancelled")),
+            "the cancelled ceremony must be reported"
+        );
     }
 
     /// #81: the Settings tab (home of the only Reset path) must exist for any

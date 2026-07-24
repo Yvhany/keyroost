@@ -10,11 +10,15 @@
 
 #[cfg(windows)]
 fn main() {
-    // Re-run when the icon changes (regenerate it with
-    // packaging/icons/gen-ico.py after editing the hicolor PNGs).
-    println!("cargo:rerun-if-changed=../../packaging/icons/keyroost.ico");
+    // The icon lives INSIDE this crate on purpose: cargo only packages files
+    // under the package root, so a path like `../../packaging/...` would be
+    // missing from the published .crate and `cargo install keyroost` would
+    // fail at the panic below. Regenerate it with packaging/icons/gen-ico.py
+    // after editing the hicolor PNGs — that script writes straight to here,
+    // so this stays the single copy.
+    println!("cargo:rerun-if-changed=assets/keyroost.ico");
     let mut res = winresource::WindowsResource::new();
-    res.set_icon("../../packaging/icons/keyroost.ico");
+    res.set_icon("assets/keyroost.ico");
     // FileVersion/ProductVersion default to CARGO_PKG_VERSION; fill in the
     // human-facing strings Explorer shows in Properties → Details.
     res.set("ProductName", "keyroost");

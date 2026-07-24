@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Pack the hicolor PNGs into packaging/icons/keyroost.ico (stdlib only).
+"""Pack the hicolor PNGs into crates/keyroost/assets/keyroost.ico (stdlib only).
 
 Windows Vista+ reads PNG-compressed ICO entries directly, so the .ico is
 just an ICONDIR index over the existing hicolor PNGs — no re-encoding, no
 imaging dependency. Re-run after changing the PNG set and commit the result;
 `build.rs` in crates/keyroost embeds the .ico into keyroost.exe.
+
+The output deliberately lands inside the `keyroost` crate rather than next to
+this script: cargo packages only files under the package root, so an .ico kept
+here would be absent from the published .crate and every `cargo install` on
+Windows would fail. This is the only copy — nothing under packaging/ mirrors it.
 """
 
 import struct
@@ -12,9 +17,10 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+REPO = ROOT.parent.parent  # packaging/icons -> packaging -> repo root
 APP_ID = "io.github.framefilter.keyroost"
 SIZES = [16, 24, 32, 48, 64, 128, 256]  # 512 exceeds the ICO size field
-OUT = ROOT / "keyroost.ico"
+OUT = REPO / "crates" / "keyroost" / "assets" / "keyroost.ico"
 
 
 def main() -> None:

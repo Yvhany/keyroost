@@ -181,6 +181,120 @@ fn has_fido_hid_sibling(p: &ReaderProbe, hids: &[&HidDevice]) -> bool {
     }
 }
 
+/// True when a reader plausibly belongs to a Yubico key: it answered the YubiKey
+/// serial applet, or its name carries the YubiKey hint. Every non-Molto2 reader
+/// is a *possible* CCID sibling, but only these are candidates for the
+/// topology-free fallback — an unrelated reader (a built-in laptop slot, a PIV
+/// card in a generic reader) is never a Yubico key's own reader.
+fn is_yubico_reader(c: &YubiKeyCcid) -> bool {
+    c.serial.is_some() || c.reader_name.to_ascii_lowercase().contains("yubikey")
+}
+
+/// True when `reader` may still be bound by this HID node. A reader belongs to
+/// exactly one physical device, so once a node has claimed it only a node at the
+/// *same* USB bus+address — another interface of that very device — may share
+/// it. Without this, two keys fuse into one row whose card operations go to one
+/// device and whose FIDO operations go to another.
+fn reader_is_bindable(
+    claimed: &std::collections::HashMap<String, (Option<u8>, Option<u8>)>,
+    reader: &str,
+    hid: &HidDevice,
+) -> bool {
+    match claimed.get(reader) {
+        None => true,
+        Some(&(bus, addr)) => bus.is_some() && bus == hid.usb_bus && addr == hid.usb_address,
+    }
+}
+
+/// The reader this HID node shares a USB bus+address with — the strongest
+/// correlation signal available, and unambiguous even with several same-vendor
+/// keys plugged in (#51). `None` when either side reports no topology.
+fn reader_by_topology<'a>(probes: &'a [ReaderProbe], hid: &HidDevice) -> Option<&'a ReaderProbe> {
+    probes.iter().filter(|p| !p.is_molto2).find(|p| {
+        p.usb_bus.is_some() && p.usb_bus == hid.usb_bus && p.usb_address == hid.usb_address
+    })
+}
+
+/// The reader this HID node can only *guess* at, by vendor: for Yubico the sole
+/// plausible YubiKey reader, otherwise the sole reader whose name carries the
+/// node's vendor word. Callers must have established that no topology match was
+/// possible — a node that reported its own bus+address and matched nothing has
+/// positive evidence it is a different physical device and must never guess.
+fn reader_by_vendor(
+    probes: &[ReaderProbe],
+    yk_readers: &[YubiKeyCcid],
+    hid: &HidDevice,
+) -> Option<String> {
+    if hid.vendor_id == crate::VID_YUBICO {
+        let cands: Vec<&YubiKeyCcid> = yk_readers.iter().filter(|c| is_yubico_reader(c)).collect();
+        return match cands.as_slice() {
+            [only] => Some(only.reader_name.clone()),
+            _ => None,
+        };
+    }
+    let vt = vendor_name(hid.vendor_id).to_ascii_lowercase();
+    let matches: Vec<&str> = probes
+        .iter()
+        .filter(|p| !p.is_molto2)
+        .map(|p| p.reader_name.as_str())
+        .filter(|r| r.to_ascii_lowercase().contains(&vt))
+        .collect();
+    match matches.as_slice() {
+        [only] => Some((*only).to_string()),
+        _ => None,
+    }
+}
+
+/// Decide which reader (if any) each FIDO HID node owns, by *strength of
+/// evidence* rather than enumeration order. Returns one entry per node, parallel
+/// to `hids`.
+///
+/// Pass 1 hands every reader to the node that matches it on exact USB
+/// bus+address. Pass 2 lets the vendor guess take only what pass 1 left over, so
+/// a weak name-only match can never claim a reader ahead of the node that proved
+/// it is that reader's own sibling — which is how card operations ended up on one
+/// physical key while FIDO operations went to another, under a single row.
+///
+/// Deterministic: both passes walk `hids` and `probes` in slice order; the
+/// `claimed` map is only ever looked up by key, never iterated.
+fn bind_readers(
+    hids: &[&HidDevice],
+    probes: &[ReaderProbe],
+    yk_readers: &[YubiKeyCcid],
+) -> Vec<Option<String>> {
+    let mut bound: Vec<Option<String>> = vec![None; hids.len()];
+    // Readers already bound, keyed by reader name and carrying the claiming
+    // node's USB topology (see `reader_is_bindable`).
+    let mut claimed: std::collections::HashMap<String, (Option<u8>, Option<u8>)> =
+        std::collections::HashMap::new();
+
+    for (i, hid) in hids.iter().enumerate() {
+        if let Some(p) = reader_by_topology(probes, hid) {
+            if reader_is_bindable(&claimed, &p.reader_name, hid) {
+                claimed.insert(p.reader_name.clone(), (hid.usb_bus, hid.usb_address));
+                bound[i] = Some(p.reader_name.clone());
+            }
+        }
+    }
+
+    for (i, hid) in hids.iter().enumerate() {
+        // Already paired on hard evidence, or it reported its own bus/address and
+        // matched no reader — positive evidence it is a different physical
+        // device. Only backends that report no topology at all (usb_bus is None —
+        // hidapi on Windows and macOS) may guess, or correlation breaks there.
+        if bound[i].is_some() || hid.usb_bus.is_some() {
+            continue;
+        }
+        if let Some(name) = reader_by_vendor(probes, yk_readers, hid)
+            .filter(|n| reader_is_bindable(&claimed, n, hid))
+        {
+            claimed.insert(name.clone(), (hid.usb_bus, hid.usb_address));
+            bound[i] = Some(name);
+        }
+    }
+    bound
+}
+
 /// Correlate FIDO-HID nodes and PC/SC reader probes into one device per physical
 /// key. Pure: all I/O is done by the caller ([`enumerate`]). The `hids` slice may
 /// contain non-FIDO nodes; they are filtered here.
@@ -322,58 +436,13 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
         });
     }
 
-    // --- 3. Merge FIDO HID nodes into their physical key.
+    // --- 3. Merge FIDO HID nodes into their physical key. Reader ownership is
+    // settled up front by strength of evidence, not enumeration order.
+    let bound = bind_readers(&hids, probes, &yk_readers);
     for (i, hid) in hids.iter().enumerate() {
         let serial = serials.get(i).cloned().flatten().unwrap_or_default();
         let is_token2 = hid.vendor_id == keyroost_proto::USB_VID;
-
-        let reader_name: Option<String> = if hid.vendor_id == crate::VID_YUBICO {
-            yk_readers
-                .iter()
-                .find(|c| {
-                    c.usb_bus == hid.usb_bus
-                        && c.usb_address == hid.usb_address
-                        && c.usb_bus.is_some()
-                })
-                .or_else(|| {
-                    let only: Vec<_> = yk_readers.iter().collect();
-                    if only.len() == 1 {
-                        Some(only[0])
-                    } else {
-                        None
-                    }
-                })
-                .map(|c| c.reader_name.clone())
-        } else {
-            // Match this HID to its reader by USB topology (bus+address) first.
-            // That is unambiguous even with several same-vendor keys plugged in
-            // (#51: two Token2 PIN+ keys each have a reader whose name contains
-            // "Token2", so the vendor-name heuristic below matches both and gives
-            // up, leaving the HID unmerged and the key duplicated). Fall back to a
-            // unique vendor-name match only when topology is unavailable.
-            probes
-                .iter()
-                .filter(|p| !p.is_molto2)
-                .find(|p| {
-                    p.usb_bus.is_some()
-                        && p.usb_bus == hid.usb_bus
-                        && p.usb_address == hid.usb_address
-                })
-                .map(|p| p.reader_name.clone())
-                .or_else(|| {
-                    let vt = vendor_name(hid.vendor_id);
-                    let matches: Vec<&str> = probes
-                        .iter()
-                        .filter(|p| !p.is_molto2)
-                        .map(|p| p.reader_name.as_str())
-                        .filter(|r| r.to_ascii_lowercase().contains(&vt.to_ascii_lowercase()))
-                        .collect();
-                    match matches.as_slice() {
-                        [only] => Some((*only).to_string()),
-                        _ => None,
-                    }
-                })
-        };
+        let reader_name: Option<String> = bound.get(i).cloned().flatten();
 
         let existing = devices.iter_mut().find(|d| {
             d.kind == DeviceKind::Key
@@ -961,6 +1030,312 @@ mod tests {
         assert!(devs[0].caps.has(Caps::FIDO2));
         assert!(!devs[0].caps.has(Caps::OTP));
         assert_eq!(devs[0].vendor, "Nitrokey");
+    }
+
+    #[test]
+    fn yubikey_with_reader_and_fido_only_yubico_key_stay_distinct() {
+        // A full YubiKey (reader + HID) next to a FIDO-only Security Key by
+        // Yubico. The second node reports its own bus/address and matches no
+        // reader — it must NOT adopt the YubiKey's reader "because there is only
+        // one". Merging them put the Security Key's hid_path on the YubiKey's
+        // row, so every FIDO operation (PIN entry, creds-list, creds-delete)
+        // landed on a key the user never selected.
+        let probes = [probe(
+            "Yubico YubiKey OTP+FIDO+CCID 00 00",
+            false,
+            true,
+            false,
+            false,
+            Some("11111111"),
+            Some(9),
+            Some(16),
+        )];
+        let hids = [
+            hid(0x1050, 0x0407, "/dev/hidraw17", None, Some(9), Some(16)),
+            hid(0x1050, 0x0406, "/dev/hidraw18", None, Some(9), Some(20)),
+        ];
+        let devs = correlate(&hids, &probes, &Keyring::default());
+        assert_eq!(devs.len(), 2, "two physical keys must stay two devices");
+        let card = devs
+            .iter()
+            .find(|d| d.reader.is_some())
+            .expect("the YubiKey keeps its reader");
+        assert_eq!(card.serial, "11111111");
+        assert_eq!(
+            card.hid_path.as_deref(),
+            Some(std::path::Path::new("/dev/hidraw17")),
+            "the reader-backed row must carry its OWN FIDO node"
+        );
+        let fido_only = devs
+            .iter()
+            .find(|d| d.reader.is_none())
+            .expect("the FIDO-only key stands alone");
+        assert_eq!(
+            fido_only.hid_path.as_deref(),
+            Some(std::path::Path::new("/dev/hidraw18"))
+        );
+        assert!(
+            fido_only.serial.is_empty(),
+            "the FIDO-only key must not inherit the other key's CCID serial"
+        );
+    }
+
+    #[test]
+    fn fido_only_yubico_key_never_adopts_an_unrelated_reader() {
+        // A FIDO-only Yubico key plus one unrelated reader holding a PIV card.
+        // Collapsing them hid the card behind the key's row and bypassed the
+        // CLI's "several keys are connected, select one" refusal, so a
+        // factory-reset ran against a card the user never selected.
+        let unrelated = probe(
+            "Alcor Micro AU9540 00 00",
+            false,
+            false,
+            false,
+            true,
+            None,
+            Some(9),
+            Some(30),
+        );
+        // Topology reported and unmatched.
+        let devs = correlate(
+            &[hid(
+                0x1050,
+                0x0406,
+                "/dev/hidraw18",
+                None,
+                Some(9),
+                Some(20),
+            )],
+            std::slice::from_ref(&unrelated),
+            &Keyring::default(),
+        );
+        assert_eq!(devs.len(), 2, "an unrelated reader is not this key's");
+        // Same again with no topology at all (the Windows/macOS HID backend):
+        // the vendor plausibility check alone must still keep them apart.
+        let devs = correlate(
+            &[hid(0x1050, 0x0406, "/dev/hidraw18", None, None, None)],
+            std::slice::from_ref(&unrelated),
+            &Keyring::default(),
+        );
+        assert_eq!(
+            devs.len(),
+            2,
+            "a non-Yubico reader is never a Yubico key's fallback candidate"
+        );
+    }
+
+    #[test]
+    fn yubikey_without_reported_topology_still_merges() {
+        // hidapi on Windows and macOS reports no bus/address at all, so the
+        // single-candidate fallback is the ONLY correlation signal there. One
+        // key, one Yubico reader: they must still merge into one device.
+        let probes = [probe(
+            "Yubico YubiKey OTP+FIDO+CCID 00 00",
+            false,
+            true,
+            false,
+            false,
+            Some("11111111"),
+            None,
+            None,
+        )];
+        let hids = [hid(0x1050, 0x0407, "/dev/hidraw17", None, None, None)];
+        let devs = correlate(&hids, &probes, &Keyring::default());
+        assert_eq!(
+            devs.len(),
+            1,
+            "correlation must still work without topology"
+        );
+        assert_eq!(devs[0].serial, "11111111");
+        assert!(devs[0].caps.has(Caps::FIDO2) && devs[0].caps.has(Caps::OATH));
+        assert!(devs[0].transport.contains("FIDO HID"));
+    }
+
+    /// The reproduction shape for the reader-theft regression: one key that has
+    /// both a reader and a FIDO node (bus 2 / address 7), and a second key of the
+    /// *same vendor* that is FIDO-only (bus 2 / address 5). The reader's name
+    /// carries the vendor word, so the FIDO-only node matches it by name — but it
+    /// reported topology and matched no reader, which is positive evidence it is a
+    /// different device. Returned as `(reader-backed row, FIDO-only row)`.
+    fn nitrokey_pair(fido_only_first: bool) -> (Device, Device) {
+        let probes = [probe(
+            "Nitrokey 3 [CCID/ICCD Interface] 00 00",
+            false,
+            true,
+            false,
+            false,
+            None,
+            Some(2),
+            Some(7),
+        )];
+        let mut sibling = hid(0x20a0, 0x42b2, "/dev/hidraw4", None, Some(2), Some(7));
+        sibling.product_name = "Nitrokey 3".into();
+        let mut fido_only = hid(0x20a0, 0x42b2, "/dev/hidraw3", None, Some(2), Some(5));
+        fido_only.product_name = "Nitrokey 3".into();
+        let hids = if fido_only_first {
+            [fido_only, sibling]
+        } else {
+            [sibling, fido_only]
+        };
+        let devs = correlate(&hids, &probes, &Keyring::default());
+        assert_eq!(devs.len(), 2, "two physical keys must stay two devices");
+        let card = devs
+            .iter()
+            .find(|d| d.reader.is_some())
+            .expect("the CCID key keeps its reader")
+            .clone();
+        let alone = devs
+            .iter()
+            .find(|d| d.reader.is_none())
+            .expect("the FIDO-only key stands alone")
+            .clone();
+        (card, alone)
+    }
+
+    #[test]
+    fn exact_topology_wins_the_reader_in_either_enumeration_order() {
+        // A weak name-only guess must never claim a reader ahead of the node that
+        // proves, by exact USB bus+address, that it is that reader's own sibling.
+        // Binding first-come-first-served made the answer depend on enumeration
+        // order: card operations went to one physical key and FIDO operations to
+        // another, silently, under a single row.
+        for fido_only_first in [true, false] {
+            let (card, alone) = nitrokey_pair(fido_only_first);
+            assert_eq!(
+                card.hid_path.as_deref(),
+                Some(std::path::Path::new("/dev/hidraw4")),
+                "the reader-backed row must carry its OWN FIDO node \
+                 (fido_only_first = {fido_only_first})"
+            );
+            assert_eq!(
+                alone.hid_path.as_deref(),
+                Some(std::path::Path::new("/dev/hidraw3")),
+                "the FIDO-only key keeps its own node (fido_only_first = {fido_only_first})"
+            );
+            assert!(card.caps.has(Caps::OATH) && card.caps.has(Caps::FIDO2));
+            assert!(!alone.caps.has(Caps::OATH));
+        }
+    }
+
+    #[test]
+    fn token2_fido_only_key_never_steals_a_sibling_readers_row() {
+        // Same shape with Token2 keys, whose reader names also carry the vendor
+        // word — and where a mixed row would send the OTP applet to one key and
+        // the FIDO reset to another.
+        for fido_only_first in [true, false] {
+            let probes = [probe(
+                "Token2 PIN+ Bio 00 00",
+                false,
+                true,
+                false,
+                false,
+                None,
+                Some(1),
+                Some(2),
+            )];
+            let sibling = hid(
+                keyroost_proto::USB_VID,
+                0x0031,
+                "/dev/hidraw1",
+                None,
+                Some(1),
+                Some(2),
+            );
+            let fido_only = hid(
+                keyroost_proto::USB_VID,
+                0x0013,
+                "/dev/hidraw2",
+                None,
+                Some(1),
+                Some(5),
+            );
+            let hids = if fido_only_first {
+                [fido_only, sibling]
+            } else {
+                [sibling, fido_only]
+            };
+            let devs = correlate(&hids, &probes, &Keyring::default());
+            assert_eq!(devs.len(), 2, "two physical keys must stay two devices");
+            let card = devs
+                .iter()
+                .find(|d| d.reader.is_some())
+                .expect("reader row");
+            assert_eq!(
+                card.hid_path.as_deref(),
+                Some(std::path::Path::new("/dev/hidraw1")),
+                "the reader-backed row must carry its OWN FIDO node \
+                 (fido_only_first = {fido_only_first})"
+            );
+            let alone = devs
+                .iter()
+                .find(|d| d.reader.is_none())
+                .expect("FIDO-only row");
+            assert_eq!(
+                alone.hid_path.as_deref(),
+                Some(std::path::Path::new("/dev/hidraw2"))
+            );
+        }
+    }
+
+    #[test]
+    fn non_yubico_key_without_reported_topology_still_merges() {
+        // The Windows/macOS HID backend reports no bus/address, so the vendor-name
+        // fallback is the only correlation signal there. One key, one reader whose
+        // name carries the vendor word: they must still merge into one device.
+        let probes = [probe(
+            "Nitrokey 3 [CCID/ICCD Interface] 00 00",
+            false,
+            true,
+            false,
+            false,
+            None,
+            None,
+            None,
+        )];
+        let mut h = hid(0x20a0, 0x42b2, "/dev/hidraw3", None, None, None);
+        h.product_name = "Nitrokey 3".into();
+        let devs = correlate(&[h], &probes, &Keyring::default());
+        assert_eq!(
+            devs.len(),
+            1,
+            "correlation must still work without topology"
+        );
+        assert_eq!(
+            devs[0].hid_path.as_deref(),
+            Some(std::path::Path::new("/dev/hidraw3"))
+        );
+        assert!(devs[0].caps.has(Caps::FIDO2) && devs[0].caps.has(Caps::OATH));
+        assert!(devs[0].transport.contains("FIDO HID"));
+    }
+
+    #[test]
+    fn two_hid_nodes_never_bind_the_same_reader() {
+        // Two Yubico FIDO nodes with no reported topology and a single reader:
+        // the reader belongs to exactly one of them, so the second node must be
+        // refused rather than fused into the same row.
+        let probes = [probe(
+            "Yubico YubiKey OTP+FIDO+CCID 00 00",
+            false,
+            true,
+            false,
+            false,
+            Some("11111111"),
+            None,
+            None,
+        )];
+        let hids = [
+            hid(0x1050, 0x0407, "/dev/hidraw17", None, None, None),
+            hid(0x1050, 0x0406, "/dev/hidraw18", None, None, None),
+        ];
+        let devs = correlate(&hids, &probes, &Keyring::default());
+        assert_eq!(
+            devs.iter().filter(|d| d.reader.is_some()).count(),
+            1,
+            "the reader may be claimed once"
+        );
+        let paths: std::collections::HashSet<_> =
+            devs.iter().filter_map(|d| d.hid_path.clone()).collect();
+        assert_eq!(paths.len(), 2, "each FIDO node keeps its own hidraw node");
     }
 }
 

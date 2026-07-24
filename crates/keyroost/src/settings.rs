@@ -280,10 +280,18 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Serialises every test that touches `XDG_CONFIG_HOME`. Cargo runs a
+    /// crate's tests as threads in ONE process, so an env mutation is visible
+    /// to every other test while it is in effect — a reader of env-derived
+    /// state races the mutator just as surely as a second mutator would.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn settings_path_is_config_dir_plus_settings_json() {
         // The GUI settings file must live in the SAME directory keyroost-keyring
-        // resolves for keys.json — proven by delegation, no env mutation.
+        // resolves for keys.json — proven by delegation, no env mutation. It
+        // still takes the guard: `config_dir()` reads `XDG_CONFIG_HOME`.
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         match keyroost_keyring::config_dir() {
             Some(dir) => assert_eq!(config_path(), Some(dir.join("settings.json"))),
             None => assert_eq!(config_path(), None),
@@ -293,10 +301,11 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn config_path_follows_xdg_config_home() {
-        // NOTE: this test MUTATES process env. It must not run concurrently with
-        // any other env-mutating test in this crate; it is currently the only
-        // one. The GUI crate is edition 2021, where `std::env::set_var` is safe
-        // (not `unsafe`), so no `unsafe` block is needed.
+        // NOTE: this test MUTATES process env, so it holds ENV_GUARD for the
+        // whole window in which the override is live. The GUI crate is edition
+        // 2021, where `std::env::set_var` is safe (not `unsafe`), so no
+        // `unsafe` block is needed.
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", "/tmp/keyroost-xdg-cfg");
         let got = config_path();

@@ -42,6 +42,27 @@ Captured here so they don't get lost. Unchecked = not started.
       whether the HID path should recognize it directly — vendor input first,
       no empirical probing (the Solo 2 HOTP lesson).
 
+- [x] **Security review of everything since v0.7.6 — DONE**
+      (`fix/security-review-v0.7.7`). Multi-agent adversarial pass over
+      `v0.7.6..main` (crypto, destructive-op guards, APDU parsing, panic
+      safety, secret handling, identity/build), then a second pass over the
+      fix branch itself for defects introduced by the fixes. The SSH-cert
+      crypto came back clean — GCM tag verified before use, AAD per CTAP 2.1,
+      every SSH length prefix bounds-checked, all TLV parsers overflow-safe,
+      no new `unsafe`, no secret in argv, redaction intact on the new APDU
+      paths. Everything found was in the destructive-operation logic and
+      device identification; all of it is fixed on this branch (see the
+      CHANGELOG Security section).
+      Two follow-ups deliberately left out of scope, both pre-existing:
+      - `crates/keyroost-ctap/src/ctap_pcsc.rs:193` — the second GET RESPONSE
+        on the CTAP NFC chaining path still sends a fixed `Le = 00` instead of
+        using the `61xx` length hint, the same shape as the transport bug
+        fixed here.
+      - The post-replug reinsert matcher identifies a key by serial. Every
+        OnlyKey unit ships the *same* serial (`1000000000`), so when OnlyKey
+        support lands (#37) the matcher would accept a different OnlyKey as
+        "the same key". Must be handled as part of that work, not after.
+
 ### Factory-reset fix-later batch (from the `feat/factory-reset` final review)
 
 These are the defer-grade findings the whole-branch review surfaced; the
@@ -183,7 +204,11 @@ become our-exact-bytes + signature with nothing injected).
 - [x] Done (v0.7.7): `winresource` build-dep host-gated to Windows in the
       `keyroost` crate; `packaging/icons/gen-ico.py` (stdlib) packs the
       hicolor PNGs into the committed multi-resolution
-      `packaging/icons/keyroost.ico`, embedded via `build.rs`.
+      `crates/keyroost/assets/keyroost.ico`, embedded via `build.rs`. The icon
+      lives under the crate root, not `packaging/`, because cargo packages only
+      files beneath the package root — a path reaching outside it is absent
+      from the crates.io tarball and fails the Windows resource compile on
+      `cargo install`.
 - [x] VS_VERSION_INFO embedded alongside (ProductName / FileDescription /
       OriginalFilename; versions track CARGO_PKG_VERSION).
 - [ ] Verify on a Windows build that the icon shows in Explorer/taskbar

@@ -20,10 +20,79 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Factory reset (all applets):** one action — `keyroostctl factory-reset`
   and a card on the GUI device Overview tab — resets every resettable applet
   on a key (OATH, OpenPGP, PIV, Token2 OTP, then FIDO2). Uses only
-  manufacturer-intended resets; the key stays fully usable. Per-applet resets
-  remain available individually.
+  manufacturer-intended resets, and every applet that completes comes back in
+  factory condition. Each step reports its own outcome, so anything that does
+  not finish is named rather than folded into an overall "done". Per-applet
+  resets remain available individually.
+
+### Security
+- **A forced PIV reset now refuses cards it could not put back together.**
+  Wiping a PIV card whose PIN is unknown works by deliberately blocking the
+  PIN and then the PUK, and only then sending a reset instruction — which is a
+  vendor extension that standards-only PIV cards (issued corporate or
+  government badges, for instance) do not implement. On such a card both
+  counters were spent and the reset never arrived, leaving it recoverable only
+  by whoever issued it. keyroost now checks for that extension *before*
+  touching either counter and refuses outright.
+- **Two connected keys can no longer be shown as one.** When a security key's
+  USB position did not match any card reader, keyroost could guess that a
+  reader belonging to a *different* key was its own, merging two physical keys
+  into a single row. Card operations then went to one key while FIDO
+  operations — PIN entry, credential deletion, reset — went to the other. Both
+  the guess and the ordering bug that could still mispair a key have been
+  fixed, and one key can no longer disappear from the list.
+- **Factory reset's throwaway PIN/PUK guesses are now random.** They were
+  fixed constants that were themselves valid credentials, so a card whose real
+  PUK happened to match had its PIN silently reset to a value published in the
+  source while the wipe never ran. A guess that is accepted is now a hard error
+  that names the resulting PIN and tells you to change it.
+- **The CLI factory reset now verifies that the key you plugged back in is the
+  key you confirmed.** Previously it reset whatever key was present after the
+  replug prompt, so inserting a different key from a drawer of identical ones
+  wiped that one instead. The GUI already had this guard.
+- **A malicious or faulty security key can no longer make keyroost decompress
+  unbounded data.** Reading an SSH certificate out of largeBlob storage took
+  its size limit from a value the key itself supplied; there is now a host-side
+  ceiling checked before any decompression runs.
+- **Per-credential largeBlob keys are wiped from memory** after use, in all
+  three places they were held.
 
 ### Fixed
+- **`cargo install keyroost` on Windows.** The Windows icon lived outside the
+  published crate, so it was absent from the crates.io package and the build
+  aborted. Nothing already released was affected — this would have first
+  broken on the next release.
+- **A card asking for a corrected length mid-transfer no longer restarts the
+  whole command.** On strict readers this could re-run the original operation
+  up to thousands of times — for `piv generate-key` that meant generating a
+  fresh key pair each time — before failing with an unrelated-sounding error.
+  Partial responses are now continued rather than discarded.
+- **Reading a full-length card response no longer reports the applet as
+  absent.** The probe's buffer had no room for the two status bytes, so a
+  maximum-size response failed and the GUI hid a tab for a key that was there.
+- **Factory reset can complete on keys that expose no serial number.** The
+  new replug check refused them outright, which for a FIDO-only key meant the
+  command could never succeed. Such a key is now accepted when it is
+  unambiguously the only one connected, and refused the moment a second key
+  is visible.
+- **A blocked PUK no longer stops a factory reset short.** The blocking step
+  used a fixed attempt cap instead of the card's real PUK retry count, so a
+  card configured with more retries was left with its PIN blocked and nothing
+  wiped.
+- **Reset reports now tell the truth about the FIDO step.** The GUI summary
+  omitted it entirely, so a FIDO reset that failed, was cancelled, or was
+  never armed still read as a completed wipe; a later success could not
+  correct an earlier failure; and an outcome could be painted onto a
+  *different* key's report if the selection changed mid-ceremony.
+- **Saving two SSH certificates at once no longer writes the wrong one.**
+  Leaving one "Save certificate…" dialog open and starting another wrote the
+  second certificate to the first one's filename.
+- **Error messages no longer suggest commands that cannot run.** Several hints
+  printed a command without its required `--yes`, or without its subcommand
+  group, so following them verbatim failed — including the PIV recovery hint
+  shown at exactly the moment it needs to work first try. The PIV hint also no
+  longer claims a card is recoverable when the card has refused the reset with
+  both credentials already blocked.
 - **Smart-card vendor and serial now come from the card, not the reader**
   ([#83]). A Token2 smartcard in a third-party reader now shows the full
   device serial (read over any reader, including T=0 readers) and the vendor

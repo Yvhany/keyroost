@@ -509,12 +509,10 @@ impl OpenPgpSession {
             },
             _ => (15, 15),
         };
-        // A guess that cannot be a real PIN (PINs are >= 6 / 8 digits). Looping
-        // until the card reports blocked (6983) guards against the count being
-        // stale; the trailing guesses past zero just keep returning 6983.
-        let bogus = b"00000000";
-        self.block_pin(pgp::PW1_OTHER, bogus, pw1_tries);
-        self.block_pin(pgp::PW3_ADMIN, bogus, pw3_tries);
+        // Looping until the card reports blocked (6983) guards against the count
+        // being stale; the trailing guesses past zero just keep returning 6983.
+        self.block_pin(pgp::PW1_OTHER, pw1_tries)?;
+        self.block_pin(pgp::PW3_ADMIN, pw3_tries)?;
 
         let (_, sw) = self.transmit_full(&pgp::terminate_df())?;
         ok_or_apdu("openpgp terminate df", sw)?;
@@ -525,14 +523,27 @@ impl OpenPgpSession {
     /// Exhaust a PIN's retry counter with wrong guesses so it becomes blocked.
     /// Sends up to `max_tries + 1` attempts, stopping early once the card reports
     /// the PIN blocked (`6983`). Best-effort: transmit errors abort the loop.
-    fn block_pin(&mut self, pw_ref: u8, bogus: &[u8], max_tries: u8) {
+    ///
+    /// The guesses come fresh from the host RNG rather than a compiled-in
+    /// constant: a card whose password happened to equal that constant answered
+    /// `9000` every iteration, so the counter never moved and PW1 stayed
+    /// unblocked while PW3 blocked — leaving the applet unadministrable. A guess
+    /// that *is* accepted is now a hard error instead of a silent no-op.
+    fn block_pin(&mut self, pw_ref: u8, max_tries: u8) -> Result<(), TransportError> {
+        let mut previous: Option<Zeroizing<Vec<u8>>> = None;
         for _ in 0..max_tries.saturating_add(1) {
-            match self.transmit_full(&pgp::verify(pw_ref, bogus)) {
+            let guess =
+                crate::piv::random_credential_guess(previous.as_ref().map(|g| g.as_slice()))?;
+            let apdu = Zeroizing::new(pgp::verify(pw_ref, &guess));
+            match self.transmit_full(&apdu) {
+                Ok((_, pgp::SW_OK)) => return Err(TransportError::OpenPgpPinGuessAccepted),
                 Ok((_, 0x6983)) => break, // blocked
                 Ok(_) => {}
                 Err(_) => break,
             }
+            previous = Some(guess);
         }
+        Ok(())
     }
 
     /// Transmit one APDU and reassemble a response the card splits across `61xx`

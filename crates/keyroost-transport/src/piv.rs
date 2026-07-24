@@ -23,6 +23,80 @@ fn block_attempts_cap(reported: Option<u8>) -> u32 {
     reported.map(u32::from).unwrap_or(10).min(20) + 2
 }
 
+/// A throwaway 8-ASCII-digit credential for the loops that deliberately block a
+/// PIN/PUK during a factory reset, drawn fresh from the host RNG and never equal
+/// to `previous`.
+///
+/// Eight digits is a legal PIV **and** OpenPGP credential (both store 6–8
+/// bytes), so the card evaluates the attempt and decrements its counter instead
+/// of rejecting it on length. Drawing it fresh matters: any constant compiled in
+/// here is also a value a card may legitimately hold, and this source is
+/// published — a "wrong" guess that turns out to be right consumes no try at
+/// all, and on the PUK path it rewrites the PIN. `previous` is excluded because
+/// some applets refuse an unchanged credential without counting the attempt.
+/// Shared with the OpenPGP applet's factory reset.
+pub(crate) fn random_credential_guess(
+    previous: Option<&[u8]>,
+) -> Result<Zeroizing<Vec<u8>>, TransportError> {
+    let mut raw = Zeroizing::new([0u8; GUESS_LEN]);
+    // No fallback to a constant: a factory reset that can't draw fresh entropy
+    // has to stop, not go back to guessing something predictable.
+    getrandom::getrandom(&mut raw[..]).map_err(|_| TransportError::HostRngFailed)?;
+    Ok(credential_guess_from(&raw, previous))
+}
+
+/// Length of a blocking-loop guess, in ASCII digits.
+const GUESS_LEN: usize = 8;
+
+/// The deterministic half of [`random_credential_guess`]: fold raw entropy into
+/// ASCII digits, then step off `previous` if the draw happened to collide with
+/// it. (Split out so the collision path is testable without stubbing the RNG.)
+fn credential_guess_from(raw: &[u8; GUESS_LEN], previous: Option<&[u8]>) -> Zeroizing<Vec<u8>> {
+    let mut guess = Zeroizing::new(Vec::with_capacity(GUESS_LEN));
+    for byte in raw.iter() {
+        guess.push(b'0' + byte % 10);
+    }
+    // A repeat is astronomically unlikely but would waste an attempt on an
+    // applet that ignores an unchanged credential; bump the last digit rather
+    // than re-rolling so this can never spin.
+    if previous == Some(guess.as_slice()) {
+        let last = GUESS_LEN - 1;
+        guess[last] = b'0' + (guess[last] - b'0' + 1) % 10;
+    }
+    guess
+}
+
+/// Re-map an error raised by the final RESET step of [`PivSession::force_reset`]
+/// onto what the card is actually left holding.
+///
+/// By that point the PIN and the PUK are deliberately blocked, so a card that
+/// *refuses* RESET is a card keyroost can no longer finish: the single-applet
+/// `piv reset` sends the identical instruction and gets the identical refusal.
+/// Only refusals are rewritten — a transport fault (card pulled, reader gone)
+/// is not the card saying no, and re-running the reset is still right there.
+fn map_reset_stage_error(e: TransportError) -> TransportError {
+    match e {
+        // 6983 (RESET not allowed), 6982 (security status not satisfied), and
+        // the labelled catch-all that carries 6D00/6A81 from a card with no
+        // such instruction: every way the card can answer "no" to RESET.
+        TransportError::PivResetNotAllowed
+        | TransportError::PivSecurityNotSatisfied
+        | TransportError::Apdu {
+            label: "piv reset", ..
+        } => TransportError::PivForceResetIncomplete(
+            "the PIN and the PUK are now both blocked, but the card refused the \
+             RESET instruction, so the PIV applet was NOT wiped. Its keys and \
+             certificates are still on the card and there is no keyroost command \
+             that can finish this — `keyroostctl piv reset` sends the very \
+             instruction the card just refused. The PIV part of the card is \
+             unusable until whoever issued or made it resets it with their own \
+             tooling. Any non-PIV applets on the same key (FIDO, OATH, OpenPGP) \
+             are unaffected.",
+        ),
+        other => other,
+    }
+}
+
 /// A read-only snapshot of a PIV application's state.
 #[derive(Debug, Clone)]
 pub struct PivStatus {
@@ -514,19 +588,33 @@ impl PivSession {
     /// keeps requiring an already-blocked card (that path is a user who knows the
     /// card is blocked, not one asking us to block it).
     pub fn force_reset(&mut self) -> Result<(), TransportError> {
-        // Wrong values that satisfy the 6–8 byte length rule so the card actually
-        // evaluates (and decrements) rather than rejecting on length. The real
-        // PIN/PUK is never these, so each attempt consumes exactly one try.
-        const WRONG_A: &[u8] = b"00000000";
-        const WRONG_B: &[u8] = b"99999999";
+        // The PIN a successful PUK guess would leave behind: RESET RETRY COUNTER
+        // rewrites the PIN when it succeeds, so this has to be a value we can
+        // name back to the user (see PivPukGuessAccepted) rather than something
+        // random nobody could recover. The PIV default is the friendliest choice.
+        const RECOVERY_PIN: &[u8] = b"123456";
+
+        // RESET (INS FB) is a vendor extension — SP 800-73-4 defines no such
+        // instruction, so a standards-only card answers 6D00/6A81 and there is
+        // no way back from the blocked PIN and PUK this path deliberately
+        // creates. GET VERSION and GET SERIAL come from the same extension
+        // family, so a card that answers neither is exactly the card that must
+        // be refused. Decide here, before the first wrong VERIFY: afterwards the
+        // damage is already done.
+        let st = self.status()?;
+        if st.version.is_none() && st.serial.is_none() {
+            return Err(TransportError::PivForceResetUnsupported);
+        }
 
         // 1. Block the PIN.
-        let pin_tries = self.status().ok().and_then(|s| s.pin_retries);
         let mut blocked = false;
-        for i in 0..block_attempts_cap(pin_tries) {
-            let guess = if i % 2 == 0 { WRONG_A } else { WRONG_B };
-            match self.verify_pin(guess) {
-                Ok(()) => { /* absurd: the wrong PIN "worked"; keep going */ }
+        let mut previous: Option<Zeroizing<Vec<u8>>> = None;
+        for _ in 0..block_attempts_cap(st.pin_retries) {
+            let guess = random_credential_guess(previous.as_ref().map(|g| g.as_slice()))?;
+            match self.verify_pin(&guess) {
+                // The guess matched the live PIN: VERIFY changes nothing, it just
+                // costs us an attempt that didn't decrement. Draw another.
+                Ok(()) => {}
                 Err(TransportError::PivPinRejected {
                     tries_remaining: Some(0),
                 }) => {
@@ -536,20 +624,37 @@ impl PivSession {
                 Err(TransportError::PivPinRejected { .. }) => {}
                 Err(e) => return Err(e),
             }
+            previous = Some(guess);
         }
         if !blocked {
-            return Err(TransportError::MalformedResponse(
-                "PIV PIN would not block after the attempt cap",
+            return Err(TransportError::PivForceResetIncomplete(
+                "the PIV PIN would not report itself blocked within the attempt cap, \
+                 so the card was NOT wiped — its keys and certificates are still \
+                 there and its PIN retry counter has been spent down. Re-run the \
+                 factory reset to finish.",
             ));
         }
 
         // 2. Block the PUK (via unblock-pin, whose wrong PUK decrements the PUK
-        //    counter). new_pin is irrelevant — the unblock never succeeds.
+        //    counter). Size the loop from the card's real PUK count — `piv
+        //    set-retries` can raise it past the default cap, and a loop that
+        //    stops short leaves the PIN blocked and the card un-wiped. GET
+        //    METADATA is firmware 5.3+, so `None` (the conservative default)
+        //    stays the fallback.
+        let puk_tries = self
+            .metadata(piv::PIN_REF_PUK)
+            .and_then(|m| m.retries)
+            .map(|(remaining, _total)| remaining);
         let mut puk_blocked = false;
-        for i in 0..block_attempts_cap(None) {
-            let guess = if i % 2 == 0 { WRONG_A } else { WRONG_B };
-            match self.unblock_pin(guess, b"00000000") {
-                Ok(()) => {}
+        let mut previous: Option<Zeroizing<Vec<u8>>> = None;
+        for _ in 0..block_attempts_cap(puk_tries) {
+            let guess = random_credential_guess(previous.as_ref().map(|g| g.as_slice()))?;
+            match self.unblock_pin(&guess, RECOVERY_PIN) {
+                // The guess *was* the PUK, so RESET RETRY COUNTER really ran: the
+                // PIN is now RECOVERY_PIN and unblocked. That is a card-state
+                // change the user has to be told about, and on cards that restore
+                // the retry counter on success the loop would never end.
+                Ok(()) => return Err(TransportError::PivPukGuessAccepted),
                 Err(TransportError::PivPinRejected {
                     tries_remaining: Some(0),
                 }) => {
@@ -559,15 +664,23 @@ impl PivSession {
                 Err(TransportError::PivPinRejected { .. }) => {}
                 Err(e) => return Err(e),
             }
+            previous = Some(guess);
         }
         if !puk_blocked {
-            return Err(TransportError::MalformedResponse(
-                "PIV PUK would not block after the attempt cap",
+            return Err(TransportError::PivForceResetIncomplete(
+                "the PIV PUK would not report itself blocked within the attempt cap. \
+                 The PIN is now blocked but the card was NOT wiped — re-run the \
+                 factory reset to finish, or unblock the PIN with the PUK if you \
+                 know it.",
             ));
         }
 
-        // 3. Both blocked — RESET now succeeds.
-        self.reset()
+        // 3. Both blocked — RESET should now succeed. If the card refuses it
+        //    anyway (the capability pre-check passes on either GET VERSION or
+        //    GET SERIAL, so a card can clear it and still have no RESET), say
+        //    so honestly: this is the one exit that leaves a card nothing here
+        //    can rescue.
+        self.reset().map_err(map_reset_stage_error)
     }
 
     /// Whether `slot` holds a certificate (GET DATA), and its size if so.
@@ -800,5 +913,96 @@ mod tests {
         assert_eq!(block_attempts_cap(None), 12);
         // A pathological huge count is clamped so the loop can't run away.
         assert_eq!(block_attempts_cap(Some(200)), 22);
+        // A raised PUK count (set-retries allows more than the old hardcoded 12)
+        // still outlasts the card.
+        assert_eq!(block_attempts_cap(Some(15)), 17);
+    }
+
+    #[test]
+    fn credential_guess_is_eight_digits_and_varies() {
+        let mut previous: Option<Zeroizing<Vec<u8>>> = None;
+        for _ in 0..64 {
+            let guess = random_credential_guess(previous.as_ref().map(|g| g.as_slice())).unwrap();
+            // 8 bytes keeps it inside the 6-8 range PIV and OpenPGP store, so
+            // the card evaluates it instead of rejecting it on length.
+            assert_eq!(guess.len(), 8);
+            assert!(guess.iter().all(u8::is_ascii_digit));
+            // Never the same twice running: an applet that ignores an unchanged
+            // credential would not count the attempt.
+            assert_ne!(previous.as_ref().map(|g| g.to_vec()), Some(guess.to_vec()));
+            previous = Some(guess);
+        }
+    }
+
+    #[test]
+    fn credential_guess_steps_off_a_collision() {
+        // Entropy that maps straight onto "01234567".
+        let raw = [0u8, 1, 2, 3, 4, 5, 6, 7];
+        assert_eq!(credential_guess_from(&raw, None).as_slice(), b"01234567");
+        // Same draw, but that's what we just sent: last digit moves on.
+        assert_eq!(
+            credential_guess_from(&raw, Some(b"01234567")).as_slice(),
+            b"01234568"
+        );
+        // The bump wraps rather than running past '9'.
+        let nines = [9u8; 8];
+        assert_eq!(
+            credential_guess_from(&nines, Some(b"99999999")).as_slice(),
+            b"99999990"
+        );
+    }
+
+    #[test]
+    fn reset_refusals_report_an_unrecoverable_card() {
+        // Every way the card can answer "no" to RESET, once the PIN and PUK are
+        // already blocked: 6983, 6982, and the labelled catch-all a card with no
+        // RESET instruction lands in (6D00 / 6A81).
+        for e in [
+            TransportError::PivResetNotAllowed,
+            TransportError::PivSecurityNotSatisfied,
+            TransportError::Apdu {
+                label: "piv reset",
+                sw1: 0x6D,
+                sw2: 0x00,
+            },
+            TransportError::Apdu {
+                label: "piv reset",
+                sw1: 0x6A,
+                sw2: 0x81,
+            },
+        ] {
+            let mapped = map_reset_stage_error(e);
+            assert!(matches!(mapped, TransportError::PivForceResetIncomplete(_)));
+            let text = mapped.to_string();
+            // The message has to say what is true and never point back at the
+            // command that just failed.
+            assert!(text.contains("NOT wiped"));
+            assert!(text.contains("no keyroost command"));
+            assert!(!text.contains("re-run"));
+        }
+    }
+
+    #[test]
+    fn transport_faults_at_reset_are_left_alone() {
+        // A card that stopped answering is not a card refusing RESET — the wipe
+        // may still be finishable, so these must pass through unchanged.
+        for e in [
+            TransportError::ShortResponse {
+                label: "piv",
+                got: 1,
+                expected_min: 2,
+            },
+            TransportError::MalformedResponse("applet continuation exceeded the chunk limit"),
+            // A label from some other command can only mean an error that did
+            // not originate at the RESET step.
+            TransportError::Apdu {
+                label: "piv pin/puk",
+                sw1: 0x6A,
+                sw2: 0x81,
+            },
+        ] {
+            let before = e.to_string();
+            assert_eq!(map_reset_stage_error(e).to_string(), before);
+        }
     }
 }
