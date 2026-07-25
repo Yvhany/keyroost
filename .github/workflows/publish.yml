@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to fan out (e.g. v0.4.0)"
+        description: "Release tag to fan out (e.g. vX.Y.Z)"
         required: true
 
 permissions:

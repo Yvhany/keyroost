@@ -2,15 +2,20 @@
 
 This document is for the first time you connect a real Molto2 to keyroost. The
 goal is to surface any wire-format mismatch quickly and with actionable output.
-Run each step in order; the riskier writes come last and target an isolated
-slot (#99).
+Run each step in order. Steps 1, 2 and 4 are read-only; step 3 onwards writes to
+the device, and step 6 writes several slots at once. One recovery path inside
+step 3 — `molto reset` — wipes the entire device; it appears out of risk order
+because it is the only way past a forgotten customer key.
 
 If anything in steps 1–3 doesn't look right, save the full `--debug` output
 and we'll diff it against the expected format in `docs/PROTOCOL.md`.
 
-> **Safe slot.** Steps 4 onwards write to **profile #99**. If you've already
-> programmed #99 for real, pick another slot you're willing to overwrite and
-> substitute it in every `--profile 99` below.
+> **Safe slots.** Step 3 onwards writes to the device. Steps 3 and 5 target
+> **profile #99**; step 6 bulk-imports starting at **#95** and fills consecutive
+> slots from there — one per entry in your export, so a 3-entry file writes
+> #95, #96 and #97. If you've already programmed anything in #95–#99 for real,
+> pick a range you're willing to overwrite and substitute it in every
+> `--profile 99` / `--start 95` below.
 
 ## Prerequisites
 
@@ -44,6 +49,11 @@ keyroostctl --list-readers
 - *No reader matching "TOKEN2"* but other readers shown — paste the full output. We can widen the matcher.
 - *Empty list* — confirm with `pcsc_scan` (Linux) that PC/SC sees any reader at all. If not, it's a system-level USB / udev problem, not a keyroost one.
 
+**Faster than any of the above:** `keyroostctl doctor` checks the PC/SC service,
+enumerates readers, tests FIDO HID node access, and verifies udev rules in one
+pass. It is read-only and touches no key. Run it first if step 1 surprises you,
+and paste its output rather than guessing which of the branches above applies.
+
 ## Step 2: Read serial and time (no auth required)
 
 ```bash
@@ -53,8 +63,8 @@ keyroostctl --debug molto info
 **Expected stderr** (something like — the actual hex is device-dependent):
 
 ```
->      get info (serial + time) >> 80 41 00 00 00
-<      get info (serial + time) << XX XX XX 08 41 42 43 44 45 46 47 48 XX XX 65 4F 12 34 90 00
+> get info (serial + time) >> 80 41 00 00 00
+< get info (serial + time) << XX XX XX 08 41 42 43 44 45 46 47 48 XX XX 65 4F 12 34 90 00
 ```
 
 …followed by the parsed output on stdout:
@@ -69,7 +79,7 @@ device UTC:    1699999284 (epoch)
 2. The 4th byte (the length field) should be reasonable — typically `08`.
 3. The UTC time on stdout should be roughly the device's clock (compare to a watch; close enough for a write-only device).
 
-**If the parsed serial looks garbled or the time is nonsensical** the response layout in `read_info()` is wrong. Paste the full `--debug` line and the parsed output and we'll fix the offsets in `crates/keyroost-transport/src/lib.rs`.
+**If the parsed serial looks garbled or the time is nonsensical** the assumed response layout is wrong. Paste the full `--debug` line and the parsed output and we'll fix the offsets in `keyroost_proto::commands::parse_info` (`crates/keyroost-proto/src/commands.rs`) — `Session::read_info` in the transport only transmits and delegates to it.
 
 ## Step 3: Authenticate with the default customer key
 
@@ -86,7 +96,7 @@ This will print four `>` / `<` lines on stderr — `get info`, `get challenge`, 
 2. `answer challenge` response: just `90 00` (no data).
 3. `set title` response: just `90 00`.
 
-**If `answer challenge` returns `63 NN`:** the customer key on your device isn't the factory default. Try whatever key you set, via `--key-ascii` (text) or `--key` (hex). If you've forgotten it: `keyroostctl molto reset --yes` does **not** require the customer key (it's a plain CLA `0x80` command); it will wipe every profile and reset the key back to `TOKEN2MOLTO1-KEY`. The device will return `SW 90 60` and display a confirmation prompt — press the up-arrow on the device to commit the reset.
+**If `answer challenge` returns `63 CN`:** the customer key on your device isn't the factory default. The low nibble `N` is the number of tries left before the device locks. Try whatever key you set, via `--key-ascii` (text) or `--key` (hex). **Only if you've forgotten it** — and accepting that this is the most destructive command in this runbook — `keyroostctl molto reset --yes` does **not** require the customer key (it's a plain CLA `0x80` command): it wipes **every one of the 100 profiles** and resets the key back to `TOKEN2MOLTO1-KEY`. The device returns `SW 90 60` and displays a confirmation prompt — press the up-arrow on the device to commit the reset.
 
 **If `set title` returns anything other than `90 00`:** capture the SW bytes. That's the most likely place for a MAC computation mismatch. The SW will be specific (e.g. `69 82` = security status not satisfied, `6A 80` = wrong data) and will tell us where to look.
 
@@ -105,6 +115,14 @@ keyroostctl --debug molto --key-ascii TOKEN2MOLTO1-KEY \
 ```
 
 This writes seed + title + config in one authenticated session.
+
+> **Expected stderr here:** keyroost warns that you're programming a seed under
+> the factory-default customer key, which is public, so anyone who captures the
+> USB traffic can decrypt the seed. That's correct and expected during bring-up
+> with a throwaway secret — it is a nudge, not a failure, and the write
+> proceeds. Rotate the key with `keyroostctl molto customer-key` before
+> programming anything real. The same warning appears in step 6 (it fires for
+> `seed`, `import` and `import-file`, but not for step 3's `title`).
 
 To verify the device actually generates correct codes, paste the same URI into
 any standard authenticator (Google Authenticator, Aegis, Bitwarden) and
@@ -150,9 +168,14 @@ runbook validates that layer against real hardware. Each step is read-only or,
 where state-changing, clearly marked. Run it against a **disposable test key**,
 not your daily-driver authenticator.
 
-> **Reset to recover.** A factory reset returns a FIDO key to a fully
-> functional fresh state; nothing in this runbook can brick the device — at
-> worst you re-enter the commissioning PIN.
+> **Reset to recover — FIDO only.** A FIDO2 factory reset returns the key to a
+> fully functional fresh state; nothing in *this* runbook can brick the device —
+> at worst you re-enter the commissioning PIN. That guarantee does not extend to
+> the card applets: `keyroostctl factory-reset` also sweeps OATH, OpenPGP, PIV
+> and Token2 OTP, and a *forced* PIV reset on a card with no vendor RESET
+> instruction can leave the PIN and PUK blocked. keyroost refuses that case up
+> front rather than blocking credentials it cannot then clear, but the card
+> applets are not covered by the sentence above.
 
 ### Prerequisites
 
@@ -178,10 +201,14 @@ ls -l /dev/hidraw*
 keyroostctl list
 ```
 
-**Expected:** one line under "FIDO HID devices" per inserted authenticator,
-showing path, VID:PID, usage page `f1d0:0001`, and a model string. With
-multiple keys plugged in you'll get one line each — every subsequent
-`fido-*` subcommand accepts `--path /dev/hidrawN` to disambiguate, and
+**Expected:** one line under "FIDO HID devices:" per inserted authenticator, in
+the form `<path> <vid>:<pid> usage=f1d0:0001 <model> serial=… [FIDO]`. A
+`serial=…(ccid)` suffix means the serial came from the card interface because
+the key exposes none over USB; `name=…` appears once you've named the key with
+`keyroostctl key-name`. Below the raw sections, `list` prints a correlated
+per-device summary built from the same snapshot. With multiple keys plugged in
+you'll get one line each — every `keyroostctl fido <subcommand>` accepts
+`--path /dev/hidrawN` (or the global `--device <NAME>`) to disambiguate, and
 kernel hidraw numbers **change on each replug**, so enumerate fresh.
 
 ### Step F2: GetInfo round-trips

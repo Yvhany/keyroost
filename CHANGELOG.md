@@ -24,6 +24,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   factory condition. Each step reports its own outcome, so anything that does
   not finish is named rather than folded into an overall "done". Per-applet
   resets remain available individually.
+  **The name is reused, and that matters for old scripts.** `factory-reset`
+  meant the Molto2 profile reset in 0.5.x and earlier, and became
+  `molto reset` in 0.6.0. Both spellings are confirmed with `--yes`, so a
+  script written against 0.5.x will *not* fail with "unknown subcommand" — it
+  will run and wipe every applet on the key rather than only the Molto2
+  profiles. Audit any script from that era for the exact string
+  `keyroostctl factory-reset` and change it to `keyroostctl molto reset`.
+  See `docs/migration.html`.
 
 ### Security
 - **A forced PIV reset now refuses cards it could not put back together.**

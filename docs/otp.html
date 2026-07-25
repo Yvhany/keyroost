@@ -68,8 +68,8 @@
 
   <section class="kr-section">
     <h2>Adding &amp; reading codes</h2>
-    <p>In the <strong>On-device OTP</strong> tab, choose <strong>Add credential</strong>,
-      then enter the issuer, account and Base32 secret and pick <strong>TOTP</strong>
+    <p>In the <strong>On-device OTP</strong> tab, choose <strong>+ Add entry</strong>,
+      then enter the issuer/app, account and Base32 secret and pick <strong>TOTP</strong>
       (time-based) or <strong>HOTP</strong> (counter-based), the algorithm, digits, and —
       for TOTP — the period (commonly 30 or 60 seconds). TOTP entries show a live code with
       a countdown ring that refreshes when the window rolls over. Entries marked
@@ -86,26 +86,33 @@
       <span class="kr-mark mono">k</span>
       <p>HID-HOTP types over the key's keyboard (HID) interface, so that interface must be
         enabled. keyroost shows an <strong>Enable HID-HOTP</strong> /
-        <strong>Disable HID-HOTP</strong> control; toggling it reconfigures the key's USB
-        interfaces and needs a re-plug to take effect. keyroost refuses any change that
-        would leave fewer than two interfaces enabled, so you can't lock yourself out.</p>
+        <strong>Disable HID-HOTP</strong> item in the pane's <strong>…</strong> menu; because
+        it reconfigures the key's USB interfaces you must type the phrase
+        <code>change interface</code> to confirm, and the change needs a re-plug to take
+        effect. keyroost refuses any change that would leave fewer than two interfaces
+        enabled, so you can't lock yourself out.</p>
     </div>
     <h3 style="margin-top:18px">Provisioning</h3>
-    <p>Open the <strong>HID-HOTP</strong> form, enter the Base32 secret, choose 6 or 8
+    <p>From the pane's <strong>…</strong> (more actions) menu choose
+      <strong>Configure HID-HOTP…</strong>, enter the Base32 secret, choose 6 or 8
       digits, and set the typing options: <strong>Send Enter</strong> (append Return),
-      <strong>Long touch</strong> (require a 2-second press), <strong>Numeric keypad</strong>
+      <strong>Long touch (2s)</strong> (require a two-second press), <strong>Numeric keypad</strong>
       (type with keypad scancodes). Save, and the card shows the slot as configured.</p>
     <h3>Changing options without re-entering the seed</h3>
     <p>Once a seed is provisioned you can change the typing options without re-entering the
-      secret: open the form and use <strong>Update options only</strong>. The seed slot is
-      left untouched. To replace the seed, enter a new secret and Save; to remove it, use
-      <strong>Clear slot</strong>.</p>
+      secret: reopen the form, <strong>leave the secret field blank</strong>, and press
+      <strong>Save</strong>. The seed slot is left untouched (digit length can only change
+      as part of a seed write, so it is greyed out until you type a new secret). To replace
+      the seed, enter a new secret and Save; to remove it, use <strong>Clear slot</strong>.</p>
   </section>
 
   <section class="kr-section">
     <h2>Command line</h2>
-<pre><code>keyroostctl otp config                 # interface states &amp; slot status
-keyroostctl otp interface --fido --ccid --keyboard   # enable interfaces (re-plug after)</code></pre>
+<pre><code>keyroostctl otp list                  # stored entries
+keyroostctl otp get --account &lt;name&gt;   # read a live code
+keyroostctl otp config                 # interface states &amp; slot status
+keyroostctl otp button-hotp --seed-stdin --digits 6   # provision HID-HOTP (seed via stdin)
+keyroostctl otp interface --fido --ccid --keyboard    # enable interfaces (re-plug after)</code></pre>
   </section>
 
   <section class="kr-section kr-res-section">

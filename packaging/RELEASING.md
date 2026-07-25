@@ -53,6 +53,10 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       The top entry MUST match the new workspace version —
       `python3 packaging/flatpak/gen-metainfo-releases.py --check` proves it
       (CI enforces the same).
+- [ ] **Breaking changes → `docs/migration.html`.** If this release renames a
+      flag, moves a command, or changes a library signature, add its section
+      (exact before → after) — the README points users there as the canonical
+      record, and the Pages deploy rides on the `docs/**` change.
 - [ ] Full gates: clippy `-D warnings`, fmt, workspace tests.
 - [ ] Land on main via the signing flow (rebase over origin/main re-creates
       the commit signed; push `HEAD:main`).

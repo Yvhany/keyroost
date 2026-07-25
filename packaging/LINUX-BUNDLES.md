@@ -20,24 +20,33 @@ bundles automatically.
 
 1. **Icon — DONE.** The **dark-on-amber** `k` monogram is committed in
    `packaging/icons/` (full hicolor tree + SVG master + 256px PNG). The alternate
-   amber-on-dark colorway is archived in `docs/app_icons/`. See
+   amber-on-dark colorway is **not** in the tree — recover it from git history
+   (the commit that added `docs/app_icons/`) if you ever switch colorways. The
+   Windows `.ico` is generated from the same PNGs into `crates/keyroost/assets/`
+   — see
    [`packaging/icons/README.md`](icons/README.md). (Still TODO for the auto-update
    remote: copy the SVG into the `keyroost-flatpak` repo root as `keyroost-icon.svg`
    — setup step 3.)
 
-2. **pcsc-lite sha256 — DONE.** The manifest pins **pcsc-lite 2.3.0** (`.tar.xz`)
-   with its verified sha256 (`1acca22d…060d3d`). To bump later, pick a newer
-   release from <https://pcsclite.apdu.fr/files/> and recompute:
+2. **pcsc-lite sha256 — DONE.** The manifest pins **pcsc-lite 2.5.1** (`.tar.xz`)
+   with its verified sha256 (`bfcfe38a…8741b`). Expect to bump this on its own
+   schedule: `pcsclite.apdu.fr` keeps only the latest couple of releases, so the
+   pinned URL eventually 404s and the flatpak build fails on download (that is
+   exactly how the 2.3.0 pin died). To bump, pick the current release from
+   <https://pcsclite.apdu.fr/files/> and recompute:
 
    ```bash
-   ver=2.5.1   # latest at time of writing
+   ver=2.5.1   # replace with the version you are pinning
    curl -fsSLO "https://pcsclite.apdu.fr/files/pcsc-lite-${ver}.tar.xz"
    sha256sum "pcsc-lite-${ver}.tar.xz"
    ```
 
-   `flatpak-builder` refuses to build unless the sha256 matches. If bumping major
-   series, re-confirm the client-only `./configure` flags (they drift across
-   pcsc-lite versions).
+   Put both the URL and the new hash in
+   `packaging/flatpak/io.github.framefilter.keyroost.yml`; `flatpak-builder`
+   refuses to build unless the sha256 matches. pcsc-lite is **meson-only since
+   2.x** — the manifest uses `buildsystem: meson` with `-D…=false` flags, not
+   `./configure`. If bumping across a major series, re-confirm those
+   client-only meson options still exist under the same names.
 
 3. **Auto-update repo `framefilter/keyroost-flatpak` (REQUIRED for the
    auto-update remote).** The OSTree repo is hosted in a **dedicated** repo, NOT
@@ -90,12 +99,20 @@ bundles automatically.
 ### Flatpak — auto-updating remote (recommended)
 
 ```bash
-# one-time: add the remote from the one-click descriptor
-flatpak remote-add --if-not-exists keyroost \
+# one-time: add Flathub (for the shared runtime) AND the keyroost remote in the
+# SAME scope — a scope mismatch is the most common install failure.
+flatpak remote-add --if-not-exists --user flathub \
+    https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak remote-add --if-not-exists --user keyroost \
     https://framefilter.github.io/keyroost-flatpak/keyroost.flatpakrepo
-flatpak install keyroost io.github.framefilter.keyroost
+flatpak install --user keyroost io.github.framefilter.keyroost
 # updates ride along with `flatpak update`
 ```
+
+The app runs on `org.freedesktop.Platform` 25.08, which comes from Flathub —
+without that remote the install fails to resolve its runtime. `--user` here is
+what keeps both remotes in one scope; use `--system` consistently instead if you
+prefer, but do not mix the two.
 
 ### Flatpak — offline single-file bundle (no auto-update)
 
@@ -126,7 +143,9 @@ applets need a running **host `pcscd`** (every target talks to the host daemon).
 - **cargo-sources.json** is generated on the runner each build from `Cargo.lock`
   (never committed, never stale). Verified June 2026: the generator yields 414
   crate archives + checksums, all from `static.crates.io`.
-- **pcsc-lite sha256** is pinned (2.3.0) — see setup step 2.
+- **pcsc-lite sha256** is pinned (2.5.1) — see setup step 2. The upstream file
+  server prunes old releases, so a pin that built fine last release can 404 on
+  the next one; the packaging probe run is what catches it.
 - **OSTree history growth:** the `keyroost-flatpak` repo accumulates OSTree
   objects over releases. Prune (`flatpak build-update-repo --prune`) periodically
   if it nears GitHub Pages' soft ~1 GB guidance.
@@ -203,7 +222,8 @@ over HTTPS**. There is no app server. The publish pipeline is:
 4. Ship a `.flatpakrepo` file (a small INI pointing at the repo URL + GPG key)
    so users add the remote with one command:
    `flatpak remote-add --if-not-exists keyroost https://…/keyroost.flatpakrepo`
-   then `flatpak install keyroost io.github.framefilter.keyroost`.
+   then `flatpak install keyroost io.github.framefilter.keyroost` (plus Flathub
+   for the runtime, added in the same scope — see the install section above).
 
 `flat-manager` (Flathub's own backend) is the heavyweight option — a real
 service with a token API and delta generation. **Recommendation: do NOT start

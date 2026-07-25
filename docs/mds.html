@@ -80,10 +80,12 @@
     <p>The bundled snapshot is embedded at build time, but keyroost <strong>also loads a
       user-supplied copy at startup if present</strong> — so packaged builds (AppImage,
       signed <code>.exe</code>, <code>.dmg</code>) can be refreshed without rebuilding.</p>
-<pre><code>python3 tools/gen_mds_data.py            # downloads the live FIDO BLOB
-python3 tools/gen_mds_data.py --blob mds.jwt   # offline, from a local copy</code></pre>
-    <p>Then place the resulting <code>mds_data.json</code> at any of:
-      <code>$KEYROOST_MDS_FILE</code>, <code>~/.config/keyroost/mds_data.json</code> (Linux),
+<pre><code>python3 tools/gen_mds_data.py --out mds_data.json            # downloads the live FIDO BLOB
+python3 tools/gen_mds_data.py --out mds_data.json --blob mds.jwt   # offline, from a local copy</code></pre>
+    <p>Without <code>--out</code> the script writes to <code>crates/keyroost/assets/mds_data.json</code>
+      inside a source checkout, which is the copy that gets embedded at build time. Place the
+      resulting <code>mds_data.json</code> at any of:
+      <code>$KEYROOST_MDS_FILE</code>, <code>~/.config/keyroost/mds_data.json</code> (Linux, or under <code>$XDG_CONFIG_HOME</code>),
       <code>~/Library/Application Support/keyroost/mds_data.json</code> (macOS),
       <code>%APPDATA%\keyroost\mds_data.json</code> (Windows), or next to the executable.</p>
     <p class="kr-muted">The runtime copy is read for display only and isn't cryptographically

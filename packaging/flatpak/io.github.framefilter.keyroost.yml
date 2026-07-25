@@ -103,7 +103,7 @@ modules:
           ${FLATPAK_DEST}/share/metainfo/${FLATPAK_ID}.metainfo.xml
       # Icon: the dark-on-amber colorway — the full freedesktop hicolor tree
       # (scalable SVG + 16…1024px PNGs) from packaging/icons/. The alternate
-      # amber-on-dark colorway is kept in docs/app_icons/ for reference.
+      # amber-on-dark colorway is not in the tree; see packaging/icons/README.md.
       - mkdir -p ${FLATPAK_DEST}/share/icons/hicolor
       - cp -r packaging/icons/hicolor/* ${FLATPAK_DEST}/share/icons/hicolor/
     sources:

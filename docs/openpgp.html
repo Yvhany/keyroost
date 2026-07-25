@@ -97,9 +97,12 @@
     <h2>What keyroost does with OpenPGP</h2>
     <div class="kr-tool">
       <span class="kr-mark mono">k</span>
-      <p>Read card status; <strong>generate</strong> or <strong>import</strong> RSA-2048 keys
-        (host keygen, or a PKCS#1/PKCS#8 PEM/DER file) for the sign, encrypt, or
-        <strong>auth</strong> slot (<code>--slot auth</code>); <strong>sign</strong> (SHA-256 or
+      <p>Read card status and a slot's <strong>public key</strong>, and <strong>verify</strong>
+        a PIN without changing anything; <strong>generate</strong> or <strong>import</strong>
+        RSA keys — RSA-2048 on a factory card, since on-card generation follows the slot's own
+        algorithm attributes — by host keygen or from a PKCS#1/PKCS#8 PEM/DER file, for the
+        sign, encrypt, or <strong>auth</strong> slot (<code>--slot auth</code>);
+        <strong>sign</strong> (SHA-256 or
         SHA-1), <strong>decrypt</strong>, and <strong>authenticate</strong> (client/SSH
         signature with the Authentication key); set cardholder name / URL; register a key for
         GnuPG; <strong>change the user or admin PIN</strong> and <strong>unblock a

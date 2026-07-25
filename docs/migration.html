@@ -59,6 +59,26 @@
 
 <main class="kr-wrap">
 
+  <section class="kr-section" id="v0-7-7">
+    <h2>v0.7.7 <span class="kr-pill kr-pill-warn">unreleased</span></h2>
+    <p>No flag or API renames. One reused name to watch for, and three additions that break
+      nothing:</p>
+    <ul>
+      <li><code>keyroostctl factory-reset</code> is a <strong>new top-level command</strong>
+        that resets every applet on a key. It reuses a name that was removed in v0.6.0 with a
+        different meaning — see the warning under v0.6.0 below.</li>
+      <li><code>keyroostctl piv move-key --from &lt;slot&gt; --to &lt;slot&gt;</code> — new;
+        the 20 retired PIV slots (82–95) are now accepted anywhere <code>--slot</code> is.</li>
+      <li><code>keyroostctl fido ssh-cert list|extract</code> — new; read-only.</li>
+    </ul>
+  </section>
+
+  <section class="kr-section" id="v0-7-6">
+    <h2>v0.7.6</h2>
+    <p class="kr-muted">Bug-fix release — no breaking changes for scripts or library
+      consumers.</p>
+  </section>
+
   <section class="kr-section" id="v0-7-5">
     <h2>v0.7.5</h2>
 
@@ -128,7 +148,7 @@ keyroostctl --device mykey fido info    # 0.7.5+</code></pre>
       <tr><td><code>keyroostctl set-customer-key …</code></td><td><code>keyroostctl molto customer-key …</code></td></tr>
       <tr><td><code>keyroostctl import …</code></td><td><code>keyroostctl molto import …</code></td></tr>
       <tr><td><code>keyroostctl import-file …</code></td><td><code>keyroostctl molto import-file …</code></td></tr>
-      <tr><td><code>keyroostctl factory-reset …</code></td><td><code>keyroostctl molto reset …</code></td></tr>
+      <tr><td><code>keyroostctl factory-reset …</code></td><td><code>keyroostctl molto reset …</code> — <strong>see the warning below</strong></td></tr>
       <tr><td><code>keyroostctl fido-info</code></td><td><code>keyroostctl fido info</code></td></tr>
       <tr><td><code>keyroostctl fido-reset …</code></td><td><code>keyroostctl fido reset …</code></td></tr>
       <tr><td><code>keyroostctl fido-pin-set …</code></td><td><code>keyroostctl fido pin-set …</code></td></tr>
@@ -139,6 +159,17 @@ keyroostctl --device mykey fido info    # 0.7.5+</code></pre>
       <tr><td><code>keyroostctl fido-creds-delete …</code></td><td><code>keyroostctl fido creds-delete …</code></td></tr>
       <tr><td><code>keyroostctl manpage &gt; x.1</code></td><td><code>keyroostctl manpage ./man</code></td></tr>
     </table>
+    </div>
+    <div class="kr-callout danger">
+      <div class="kr-callout-title danger">Danger: <code>factory-reset</code> was reused</div>
+      <p>Since v0.7.7 <code>keyroostctl factory-reset</code> exists again as a top-level
+        command — but it is <strong>not</strong> the old Molto2 reset. It wipes
+        <em>every resettable applet</em> on the selected key: OATH, OpenPGP, PIV, Token2 OTP,
+        then FIDO2. Both the old flat command and the new one are confirmed with
+        <code>--yes</code>, so a stale <code>keyroostctl factory-reset --yes</code> will
+        <strong>not</strong> fail with "unknown subcommand" — it will run and destroy far more
+        than the script intended. Audit any script from ≤&nbsp;0.5.x for that exact string and
+        change it to <code>keyroostctl molto reset</code>.</p>
     </div>
     <p>The customer-key flags (<code>--key</code>, <code>--key-ascii</code>,
       <code>--key-env</code>, <code>--key-ascii-env</code>) moved under

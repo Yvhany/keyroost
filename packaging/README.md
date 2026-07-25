@@ -43,24 +43,46 @@ credential is touched.
 ## winget (`Framefilter.Keyroost`)
 
 1. First submission is manual (Microsoft reviews new packages): fill the
-   three templates in `packaging/winget/` (`@VERSION@`, `@SHA_WIN@` from
-   SHA256SUMS) and PR them to `microsoft/winget-pkgs` under
+   three templates in `packaging/winget/` (`@VERSION@`, and `@SHA_WIN@` from
+   the **signed** zip's `.sha256` sidecar — see the note below) and PR them to
+   `microsoft/winget-pkgs` under
    `manifests/f/Framefilter/Keyroost/<version>/`, or run
    `wingetcreate new` interactively.
 2. Create a classic PAT with `public_repo`; add it as secret `WINGET_TOKEN`.
-3. Future version bumps are PR'd automatically; Microsoft's validation
-   pipeline merges routine bumps within hours to days.
+3. Version bumps are PR'd by the workflow, but **not on the release run**.
+   Since v0.7.6 the winget job holds for the Token2-signed Windows build
+   (policy, 2026-07-17): on the tag fanout it prints
+   `winget is HOLDING for the Token2-signed build` and exits 0. **That skip is
+   the designed outcome, not a failure.** The submission happens later:
+
+   ```text
+   tag → fanout (winget notices + skips)
+       → Token2 signs → maintainer attaches
+         keyroost-vX.Y.Z-windows-x86_64-signed.zip (+ .sha256) as NEW assets
+         (never replacing the CI zips — that invalidates SHA256SUMS/provenance)
+       → gh workflow run publish.yml -f tag=vX.Y.Z
+       → every other job no-ops; winget Authenticode-verifies every PE in the
+         zip, then submits the PR
+   ```
+
+   Microsoft's validation pipeline merges routine bumps within hours to days.
+   A hard *failure* of this job (rather than a skip) means the `WINGET_TOKEN`
+   PAT is set but rejected — renew it. Full release-day sequence:
+   [`RELEASING.md`](RELEASING.md) steps 4–5.
 
 ## What a release looks like afterwards
 
 ```text
-git tag v0.4.0 && git push origin v0.4.0
+git tag vX.Y.Z && git push origin vX.Y.Z
   → release.yml: builds Linux/macOS/Windows archives, SHA256SUMS,
     provenance attestation, publishes the GitHub Release
+  → linux-bundles.yml (same tag, in parallel): AppImage + flatpak bundle,
+    attached to that same Release
   → publish.yml (after your one-click environment approval):
-      crates.io  — 14 crates in dependency order (OIDC)
+      crates.io  — the whole workspace in dependency order (OIDC)
       AUR        — keyroost-bin PKGBUILD/.SRCINFO push
       Homebrew   — tap formula push
-      winget     — version-bump PR to microsoft/winget-pkgs
+      winget     — SKIPS with a notice: holds for the Token2-signed zip,
+                   then submits on a re-dispatch (see above)
   → cargo-binstall needs nothing: it finds the new archives by version
 ```

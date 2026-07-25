@@ -65,19 +65,36 @@
       on. In every case the point is the same: keys and credentials are <strong>destroyed,
       not recoverable</strong>. Because the secrets only ever lived on the device, there is
       no backup to restore from unless <em>you</em> made one.</p>
+    <p>A whole-key reset is a sweep of independent steps, not a single atomic act. Each
+      applet that completes comes back in factory condition, and <strong>every step reports
+      its own outcome</strong> — so a run can legitimately end with some applets wiped, one
+      failed, and the key still needing attention. Read the report; don't assume a clean
+      slate because the command finished.</p>
     <ul>
       <li><strong>FIDO2</strong> — erases all resident credentials/passkeys and clears the
         PIN. Any account relying solely on this key for sign-in is locked out until you
         register a replacement. <a href="fido2.html">FIDO2 →</a></li>
-      <li><strong>OATH</strong> — removes all stored TOTP/HOTP seeds. You'll need each
-        service's setup secret/QR again. <a href="oath.html">OATH →</a></li>
+      <li><strong>OATH</strong> — removes all stored TOTP/HOTP seeds and clears the applet
+        password. It needs no password to run, which makes it the only way back from a
+        forgotten one. You'll need each service's setup secret/QR again.
+        <a href="oath.html">OATH →</a></li>
       <li><strong>OpenPGP</strong> — destroys the on-card sign/encrypt/auth keys and resets
         PINs. Anything encrypted to the card's encryption key becomes undecryptable.
         <a href="openpgp.html">OpenPGP →</a></li>
       <li><strong>PIV</strong> — clears slots, certificates, PIN/PUK, and management key.
+        A whole-device reset reaches PIV the manufacturer-intended way: the PIN and then the
+        PUK are deliberately blocked, and only then is the applet wiped. If the run stops in
+        between, PIV stays locked and un-wiped until a reset finishes — the per-step report
+        says which state it is in. keyroost checks for the vendor RESET instruction
+        <em>before</em> it blocks anything and refuses cards that show no sign of implementing
+        it, so a standards-only card is never left locked with no way back.
         <a href="piv.html">PIV →</a></li>
-      <li><strong>Token2 Molto2</strong> — factory reset wipes loaded slots and customer-key
-        state. <a href="molto2.html#customer-key">Molto2 →</a></li>
+      <li><strong>Token2 on-device OTP</strong> — erases every OTP entry stored on the key's
+        own applet. The key asks for a confirming button press before it wipes.
+        <a href="otp.html">On-device OTP →</a></li>
+      <li><strong>Token2 Molto2</strong> — factory reset wipes loaded slots and restores the
+        default customer key; the token asks you to confirm with its own button.
+        <a href="molto2.html#customer-key">Molto2 →</a></li>
     </ul>
   </section>
 
@@ -104,12 +121,35 @@
     <h2>How keyroost treats resets</h2>
     <div class="kr-tool">
       <span class="kr-mark mono">k</span>
-      <p>Destructive operations always resolve to an <strong>explicit target</strong>, never
-        a default device — so a reset can't land on the wrong key by accident. Reset support
-        spans the FIDO, OATH, OpenPGP, PIV, and Molto2 applets; read-only inspection
+      <p>A destructive command never guesses which key it is aimed at. With one key
+        connected it uses that key; with several it <strong>refuses</strong> until you name
+        one with <code>--device</code>, and it rejects <code>--reader</code> and
+        <code>--device</code> together, since those can name different keys. Every wipe also
+        needs an explicit <code>--yes</code>. Reset support spans the FIDO2, OATH, OpenPGP,
+        PIV, Token2 on-device OTP, and Molto2 applets; read-only inspection
         (<code>list</code>, <code>fido info</code>, <code>piv status</code>) never changes
         anything and never needs a PIN.</p>
     </div>
+  </section>
+
+  <section class="kr-section" id="whole-key">
+    <h2>Resetting a whole key at once</h2>
+    <p>One command wipes every resettable applet the key exposes, in order — OATH, OpenPGP,
+      PIV, Token2 on-device OTP, then FIDO2 last, because its reset needs an unplug/replug
+      and a touch:</p>
+<pre><code>keyroostctl factory-reset --yes</code></pre>
+    <p>The card applets run silently; the OTP step wants a confirming button press on the
+      key; the FIDO2 step prompts you to re-plug and touch. keyroost pins the key's identity
+      before the sweep starts and <strong>verifies the key that comes back after the replug
+      is the one you confirmed</strong> — a key that exposes no serial is accepted only when
+      it is unambiguously the only one connected. Each step prints its own result and the
+      command exits nonzero if anything failed.</p>
+    <p>The desktop app offers the same sweep as a <strong>Factory reset</strong> card on a
+      key's Overview tab, with a live per-step report — including a FIDO2 row — so you can
+      see exactly which applets came back clean and which need another pass.</p>
+    <p class="kr-muted">The Token2 Molto2 is not part of this sweep; it has its own
+      <code>keyroostctl molto reset --yes</code>, which also needs a physical button
+      confirmation on the token. <a href="molto2.html">Molto2 →</a></p>
   </section>
 
   <section class="kr-section kr-res-section">

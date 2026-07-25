@@ -13,8 +13,9 @@ keyroost is an open-source Rust toolchain for hardware security keys, working
 across vendors over PC/SC and USB HID. It speaks FIDO2/CTAP2, OATH (TOTP/HOTP),
 and the OpenPGP and PIV card protocols, manages on-device OTP on Token2 FIDO keys,
 and also programs the Token2 Molto2 / Molto2v2 TOTP token. Ships a Rust library,
-a CLI (`keyroostctl`), and a dark-themed desktop GUI (`keyroost`) — implemented
-from public standards, with no vendor SDKs, no Python, and no Qt.
+a CLI (`keyroostctl`), and a desktop GUI (`keyroost`) with a dark and light
+theme — implemented from public standards, with no vendor SDKs, no Python, and
+no Qt.
 
 > **Built with AI.** I saw a real need for this but never learned to code, so
 > the parts I author — code, docs, and all — are written end-to-end with AI.
@@ -39,9 +40,13 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   both NFC (CTAP-over-NFC) and a contact / ISO-7816 chip reader (T=0) — not just
   direct USB. Resident-credential metadata surfaces the fuller passkey detail
   too: the user's UPN, display name, user id, and the full credential id.
+  Resident SSH credentials can be listed and their stored OpenSSH certificate
+  extracted from largeBlob to a `-cert.pub` file (`fido ssh-cert`).
 - **OATH (TOTP/HOTP)** — list, add, delete, and compute codes over PC/SC,
-  including applet-password set / clear / unlock. In the GUI, secret fields have
-  a reveal (eye) toggle so you can check an OTP secret before committing it.
+  including applet-password set / clear / unlock, and a factory reset of the
+  applet (`oath reset --yes`) — the recovery path for a forgotten password. In
+  the GUI, secret fields have a reveal (eye) toggle so you can check an OTP
+  secret before committing it.
 - **OpenPGP card (v3.4)** — read status; generate or import RSA-2048 keys (host
   keygen or a PKCS#1/PKCS#8 PEM/DER file) for the signature, encryption, or
   authentication slot — each writes the v4 fingerprint and a generation timestamp
@@ -53,7 +58,10 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   serial, PIN retries, which slots 9A/9C/9D/9E hold a certificate), on-card key
   generation, certificate import / export, self-signed certs or a CSR for a CA,
   clearing a slot's certificate (`delete-cert`) or key (`delete-key`, on YubiKey
-  5.7+), moving a key between slots (`move-key`, on YubiKey 5.7+), and PIN / PUK / management-key changes and applet reset. The GUI collects the
+  5.7+), moving a key between slots (`move-key`, on YubiKey 5.7+), and PIN / PUK
+  / management-key changes and applet reset. Every slot-taking command addresses
+  9A/9C/9D/9E *and* the 20 Yubico retired key-management slots (82–95), so keys
+  can be archived and rotated. The GUI collects the
   management key per operation (and wipes it after), which is ideal for a slot or
   two; for **provisioning many slots or keys, the CLI is the intended path** — the
   management key and PIN come from env/stdin once, so a shell loop does the batch
@@ -75,12 +83,20 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   directly on a Token2 FIDO security key and read their codes over USB-HID, NFC,
   or CCID; configure the single HOTP-on-touch keystroke slot; read the serial;
   and enable / disable the key's USB interfaces (FIDO / keyboard-HID / CCID).
+- **One-shot factory reset** — `keyroostctl factory-reset --yes` (and a card on
+  the GUI device Overview tab) resets every resettable applet on a key in turn:
+  OATH, OpenPGP, PIV, Token2 OTP, then FIDO2 (which needs an unplug/replug and a
+  touch at the end). Only manufacturer-intended resets are used, and each step
+  reports its own outcome rather than being folded into one "done".
 - **Friendly device names** — an opt-in `keys.json` registry to target a specific
   physical key by name when several are connected, instead of by a reshuffling
   `/dev/hidrawN` path. Destructive operations always resolve to an explicit
   target, never a default. The registry lives under `%APPDATA%` on Windows (the
   platform config dir elsewhere), and names are validated with anti-spoofing
   checks while allowing a relaxed, readable character set.
+  On Windows and macOS the OS reports no USB position, so when two keys of the
+  same make could each own the same card reader keyroost shows them separately
+  rather than guessing which reader belongs to which key.
 
 ## Supported devices
 
@@ -223,9 +239,10 @@ an open industry standard.
 
 ## Design principles
 
-- **Few dependencies, by design.** The protocol and codec layers are hand-written
-  and pull in nothing: the Molto2 wire protocol (SM4, SHA-1, the MAC), base32, hex,
-  CBOR, CTAP-HID framing, and the OATH / OpenPGP / PIV byte layers are all in-tree.
+- **Few dependencies, by design.** The protocol and codec layers are hand-written:
+  the Molto2 wire protocol (SM4, SHA-1, the MAC), base32, hex, CBOR, CTAP-HID
+  framing, and the OATH / OpenPGP / PIV byte layers are all in-tree, pulling in
+  nothing beyond `zeroize` for wiping secret buffers.
   External crates are added only when *not* doing so would be irresponsible or
   impractical — audited cryptography we won't hand-roll under `forbid(unsafe_code)`
   (RustCrypto: `sha2` / `hmac` / `aes` / `p256` / `rsa` / …) and platform glue
@@ -246,8 +263,9 @@ an open industry standard.
 
 ## Install
 
-keyroost ships through every mainstream channel below. Each archive and bundle
-contains both `keyroost` (the GUI) and `keyroostctl` (the CLI). Pick whichever
+keyroost ships through every mainstream channel below. The release archives, the
+Flatpak, Homebrew, winget and the AUR package all carry both `keyroost` (the GUI)
+and `keyroostctl` (the CLI); the AppImage is GUI-only. Pick whichever
 fits your platform; the smart-card features need a host PC/SC daemon (see
 [Smart-card prerequisite](#smart-card-prerequisite)).
 
@@ -271,7 +289,7 @@ two executables onto your `PATH`. Every release also publishes `SHA256SUMS` and
 build-provenance attestation. For example, on Linux x86_64:
 
 ```bash
-curl -L https://github.com/framefilter/keyroost/releases/latest/download/keyroost-vX.Y.Z-linux-x86_64.tar.gz \
+curl -L https://github.com/framefilter/keyroost/releases/download/vX.Y.Z/keyroost-vX.Y.Z-linux-x86_64.tar.gz \
   | tar xz   # then move keyroostctl / keyroost onto your PATH
 ```
 
@@ -280,12 +298,18 @@ The prebuilt binaries need `libpcsclite` at runtime — on a FIDO-only machine i
 
 ### cargo (from source)
 
-Needs the Rust toolchain (and, on Linux, the PC/SC dev package — see
+Needs the Rust toolchain — **1.92+ for the GUI** (`keyroost`), 1.85+ for the CLI
+(`keyroostctl`) and libraries — and, on Linux, the PC/SC dev package plus the
+GUI's X11/Wayland/GL libraries (see
 [Smart-card prerequisite](#smart-card-prerequisite)):
 
 ```bash
 cargo install keyroostctl keyroost
 ```
+
+The release binaries and the AppImage are built with the optional `qr` feature
+(scan a TOTP QR from the live screen). `cargo install` does not enable it — add
+`cargo install keyroost --features qr` if you want it.
 
 Or let `cargo-binstall` fetch the same pre-built release archive instead of
 compiling — useful on atomic distros (e.g. Bazzite) where `cargo install`'s
@@ -337,6 +361,9 @@ flatpak install --user keyroost io.github.framefilter.keyroost
 # updates ride along with `flatpak update`
 ```
 
+The Flatpak carries the CLI as well; run it with
+`flatpak run --command=keyroostctl io.github.framefilter.keyroost`.
+
 Prefer a system-wide install? Use `--system` on all three commands instead —
 the key is keeping Flathub and the keyroost remote in the *same* scope.
 
@@ -351,12 +378,14 @@ The Flatpak bundles the pcsc-lite *client* and talks to the **host** `pcscd`, so
 you still need that daemon running on the host (see
 [Smart-card prerequisite](#smart-card-prerequisite)).
 
-### AppImage (Linux — no install)
+### AppImage (Linux — no install, GUI only)
 
 Download `keyroost-x86_64.AppImage` from the
-[latest release](https://github.com/framefilter/keyroost/releases/latest):
+[latest release](https://github.com/framefilter/keyroost/releases/latest) — the
+asset name is version-less, so this URL always fetches the current build:
 
 ```bash
+curl -LO https://github.com/framefilter/keyroost/releases/latest/download/keyroost-x86_64.AppImage
 chmod +x keyroost-x86_64.AppImage
 ./keyroost-x86_64.AppImage
 # On FUSE3-only distros, install libfuse2, or run without FUSE:
@@ -379,6 +408,9 @@ macOS and Windows have PC/SC built in. On Linux, install the PC/SC library +
 daemon (the package name differs per distro). Building from source with `cargo`
 additionally needs the PC/SC *dev* package, and the GUI needs the X11/Wayland/GL
 libraries that `eframe`/`egui` link against.
+
+Once installed, `keyroostctl doctor` checks all of this for you — PC/SC service,
+readers, FIDO HID access, and udev rules — read-only, touching no key.
 
 keyroost is otherwise distro-neutral — it talks to the kernel's `hidraw`/`sysfs`
 and to PC/SC, both of which every mainstream distribution provides; only the
@@ -406,9 +438,14 @@ packages — those are just for the GUI.) macOS and Windows have PC/SC built in,
 and the FIDO HID backend uses `hidapi` (IOKit / hid.dll) automatically — no extra
 packages. macOS/Windows are tier-2 (best-effort, not yet hardware-verified).
 
+(Building the **GUI on Windows** compiles a small build script that embeds the
+app icon and version info into `keyroost.exe`; it needs a resource compiler —
+`rc.exe`, part of the Windows SDK that ships with the standard MSVC toolchain
+setup. The CLI has no build script.)
+
 > **Windows and FIDO:** Windows reserves raw FIDO HID access for elevated
 > processes (the OS routes normal apps through its own WebAuthn API instead).
-> Expect the `fido` commands and the Security Keys pane to require an
+> Expect the `fido` commands and the GUI's FIDO2 tab to require an
 > elevated ("Run as administrator") session on Windows; the Molto2, OATH,
 > OpenPGP, and PIV features go over PC/SC and work unelevated. Elevate for
 > the FIDO command you need, then drop back — don't run the whole tool
@@ -441,7 +478,7 @@ packages. macOS/Windows are tier-2 (best-effort, not yet hardware-verified).
 
 The OATH, OpenPGP, and PIV applets are reached over PC/SC and need no special
 permissions. Talking to a key's **FIDO interface** (the `fido` commands, and the
-Security Keys GUI pane), though, opens a `/dev/hidraw*` node, which is
+GUI's FIDO2 tab), though, opens a `/dev/hidraw*` node, which is
 root-only by default. Install the bundled udev rules to grant the logged-in user
 access:
 
@@ -462,16 +499,20 @@ installing them.
 # discover connected devices: PC/SC readers + FIDO authenticators (USB-HID and NFC)
 keyroostctl list
 
+# diagnose the local environment (PC/SC service, readers, FIDO HID access,
+# udev rules, registry permissions) — read-only, touches no key
+keyroostctl doctor
+
 # --- FIDO2 (YubiKey / Solo 2 / Nitrokey 3), over USB-HID or an NFC reader ---
 keyroostctl fido info
 keyroostctl fido pin-retries
 keyroostctl fido creds-list --pin-stdin        # PIN read from stdin, never argv
 keyroostctl fido ssh-cert list --pin-stdin     # list SSH certs stored in resident credentials
-keyroostctl fido ssh-cert extract --credential id --out cert-cert.pub --pin-stdin
+keyroostctl fido ssh-cert extract --credential ssh:demo --out demo-cert.pub --pin-stdin
 
 # --- OATH over PC/SC ---
 keyroostctl oath list --reader yubikey
-keyroostctl oath code <name> --reader yubikey
+keyroostctl oath code 'GitHub:me@x.com' --reader yubikey
 
 # --- OpenPGP card ---
 keyroostctl openpgp status --reader yubikey
@@ -504,16 +545,23 @@ keyroostctl prog config --algorithm sha1 --time-step 30 --display-timeout 30
 
 # --- Token2 on-device OTP (PIN+ Series FIDO keys) ---
 keyroostctl otp list
-keyroostctl otp add GitHub me@x.com --seed-stdin    # base32 seed from stdin, never argv
-keyroostctl otp get GitHub me@x.com
+keyroostctl otp add --app GitHub --account me@x.com --seed-stdin   # seed from stdin, never argv
+keyroostctl otp get --app GitHub --account me@x.com
 
 # --- Destructive operations ---
-keyroostctl factory-reset --device <name> --yes    # reset all applets on a key
+keyroostctl factory-reset --device my-yubikey --yes   # reset every applet on that key
 
 # name a key to target it when several are plugged in (opt-in)
 keyroostctl key-name list
 
-# launch the GUI (per-device tabs: Overview, Security Keys, OATH, OpenPGP, PIV,
+# machine-readable output for scripts (status and query commands)
+keyroostctl --json piv status --reader yubikey
+
+# shell completions and man pages
+keyroostctl completions bash > /etc/bash_completion.d/keyroostctl
+keyroostctl manpage ./man && man -l ./man/keyroostctl-piv.1
+
+# launch the GUI (per-device tabs: Overview, FIDO2, Authenticator, OpenPGP, PIV,
 # On-device OTP, plus the distinct Molto2 and single-profile programmable-token views)
 keyroost
 ```
@@ -527,28 +575,33 @@ two to know about: **v0.7.5** renames the global device selector from
 `--name` to `--device`, and **v0.6.0** moved the Molto2 / FIDO commands under
 the `molto` and `fido` groups.
 
+One name to watch: in **≤0.5.x** `keyroostctl factory-reset` meant the Molto2
+profile reset (now `keyroostctl molto reset`). The name is live again, but it
+now wipes *every* applet on a key. See the migration page before re-running an
+old script.
+
 ## Workspace layout
 
 | Crate | Purpose | External deps |
 |---|---|---|
 | `keyroost-proto` | Pure-Rust Molto2 wire protocol (SM4, SHA-1, APDU, MAC) | none |
-| `keyroost-transport` | PC/SC discovery, Molto2 session, CCID serial, OATH/OpenPGP/PIV applets, Token2 OTP session | `pcsc`, `aes`/`des` (mgmt-key auth), `zeroize`; `hidapi` on macOS/Windows |
+| `keyroost-transport` | PC/SC discovery, Molto2 session, CCID serial, OATH/OpenPGP/PIV applets, Token2 OTP session | `pcsc`, `aes`/`des`/`cipher` (mgmt-key auth), `getrandom`, `zeroize`; `hidapi` on macOS/Windows |
 | `keyroost-hid` | USB HID enumeration of FIDO devices | none on Linux (`sysfs`); `hidapi` on macOS/Windows |
-| `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential management | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`) for client-PIN, `zeroize`; `hidapi` on macOS/Windows |
-| `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer | none |
-| `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | none |
-| `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management + SPKI/PEM | none |
-| `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO byte/codec layer (APDU + HID framing) | RustCrypto (`sha2`/`aes`/`cbc`/`p256`) for ECDH seed encryption, `zeroize` |
-| `keyroost-token2prog` | Pure-Rust Token2 single-profile programmable-token wire protocol (SM4 seed/MAC, fixed device key, config TLV); reuses `keyroost-proto` | none |
+| `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential management | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`rand_core`) for client-PIN, `aes-gcm` + `miniz_oxide` for per-credential largeBlob, `zeroize`; `hidapi` on macOS/Windows |
+| `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer | `zeroize` |
+| `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | `zeroize` |
+| `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management + SPKI/PEM | `zeroize` |
+| `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO byte/codec layer (APDU + HID framing) | RustCrypto (`sha2`/`aes`/`cbc`/`p256`/`rand_core`) for ECDH seed encryption, `zeroize` |
+| `keyroost-token2prog` | Pure-Rust Token2 single-profile programmable-token wire protocol (SM4 seed/MAC, fixed device key, config TLV); reuses `keyroost-proto` | `zeroize` |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`); serial matching | `serde`, `serde_json` |
 | `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) | none |
 | `keyroost-rsakey` | Host-side RSA-2048 keygen + PKCS#1/PKCS#8 (PEM/DER) loading | `rsa`, `rand`, `zeroize` |
-| `keyroost-import` | `otpauth://` + Aegis / 2FAS / otpauth-list parsers | `serde`/`serde_json`, `scrypt`, `aes-gcm`, `base64`, `zeroize` (all behind `bulk`) |
-| `keyroost-qr` | QR 2FA import from PNG/JPEG screenshots, a live screen capture, and GA export batches (optional `qr` feature; built into the release + AppImage binaries) | `rqrr`, `png`, `jpeg-decoder`, `zeroize` |
-| `keyroost-winwebauthn` | Windows-only helper for the non-admin FIDO2 path: detect a FIDO key via the HID access-denied signal, open Windows' security-key settings, and relaunch elevated; inert on non-Windows | none |
-| `keyroost-screengrab` | Windows-only still screen capture (GDI `BitBlt`) for QR-from-screen; isolates the unsafe Win32 FFI from the GUI crate; inert on non-Windows | `windows-sys` |
-| `keyroostctl` | Command-line interface | `clap`, `clap_complete`, `clap_mangen`, `zeroize` |
-| `keyroost` | egui desktop GUI | `eframe`, `egui`, `arboard`, `zeroize` |
+| `keyroost-import` | `otpauth://` + Aegis / 2FAS / otpauth-list parsers | `zeroize`; `serde`/`serde_json` (behind `bulk`); `scrypt`, `aes-gcm`, `base64` (behind `encrypted`, which implies `bulk`) |
+| `keyroost-qr` | QR 2FA import from PNG/JPEG screenshots and Google Authenticator export batches — always built in; the GUI's *live screen* capture is behind the `qr` feature (on in the release archives and the AppImage, off in the Flatpak) | `rqrr`, `png`, `jpeg-decoder`, `zeroize` |
+| `keyroost-winwebauthn` | Windows-only helper for the non-admin FIDO2 path: detect a FIDO key via the HID access-denied signal, open Windows' security-key settings, and relaunch elevated; inert on non-Windows | `windows-sys` (Windows only) |
+| `keyroost-screengrab` | Windows-only still screen capture (GDI `BitBlt`) for QR-from-screen; isolates the unsafe Win32 FFI from the GUI crate; inert on non-Windows | `windows-sys` (Windows only) |
+| `keyroostctl` | Command-line interface | `clap`, `clap_complete`, `clap_mangen`, `serde`/`serde_json`, `zeroize` |
+| `keyroost` | egui desktop GUI | `eframe`, `egui`, `arboard`, `rfd`, `pollster`, `png`, `base64`, `serde`/`serde_json`, `zeroize`; `x11rb`/`ashpd` on Linux (`qr` feature); `winresource` build-dep on Windows |
 
 ## Protocol
 
@@ -573,8 +626,8 @@ private until a fix ships.
 Licensed under either of
 
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
-  <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
 
 at your option. Unless you explicitly state otherwise, any contribution
 intentionally submitted for inclusion in the work by you, as defined in the

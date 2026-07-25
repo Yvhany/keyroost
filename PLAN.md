@@ -466,6 +466,13 @@ No single mechanism identifies every key — layered resolver:
 
 ### Config — `~/.config/keyroost/keys.toml`
 
+> **Superseded by what shipped.** The registry is `keys.json`, not TOML, and
+> the label charset below was never adopted: `keyroost_keyring::validate_name`
+> is deliberately permissive — 1–64 characters of any script or case, with
+> spaces and punctuation allowed, rejecting only blank names and
+> control / zero-width / bidi-override characters. The sketch is kept for the
+> record; `crates/keyroost-keyring/src/lib.rs` is authoritative.
+
 Array-of-tables, matched on `serial`; `name` is the unique label
 (charset `[a-z0-9_-]`):
 

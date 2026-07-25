@@ -4,18 +4,18 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Storage — large blobs — keyroost</title>
-<meta name="description" content="Read and edit a FIDO2 key's large-blob array: view stored entries as hex and ASCII, and add, edit, or delete plaintext keyroost notes, over the standard authenticatorLargeBlobs command.">
+<meta name="description" content="Read and edit a FIDO2 key's large-blob array: view stored entries as hex and ASCII, add, edit, or delete plaintext keyroost notes, and extract a stored SSH certificate, over the standard authenticatorLargeBlobs command.">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="keyroost">
 <meta property="og:title" content="Storage — large blobs — keyroost">
-<meta property="og:description" content="Read and edit a FIDO2 key's large-blob array: view stored entries as hex and ASCII, and add, edit, or delete plaintext keyroost notes, over the standard authenticatorLargeBlobs command.">
+<meta property="og:description" content="Read and edit a FIDO2 key's large-blob array: view stored entries as hex and ASCII, add, edit, or delete plaintext keyroost notes, and extract a stored SSH certificate, over the standard authenticatorLargeBlobs command.">
 <meta property="og:url" content="https://framefilter.github.io/keyroost/storage.html">
 <meta property="og:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Storage — large blobs — keyroost">
-<meta name="twitter:description" content="Read and edit a FIDO2 key's large-blob array: view stored entries as hex and ASCII, and add, edit, or delete plaintext keyroost notes, over the standard authenticatorLargeBlobs command.">
+<meta name="twitter:description" content="Read and edit a FIDO2 key's large-blob array: view stored entries as hex and ASCII, add, edit, or delete plaintext keyroost notes, and extract a stored SSH certificate, over the standard authenticatorLargeBlobs command.">
 <meta name="twitter:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
 
 <link rel="icon" type="image/png" href="assets/keyroost-logo.png">
@@ -52,7 +52,7 @@
   <div class="kr-wrap">
     <p class="kr-label">Learn · Storage</p>
     <h1>Large blobs</h1>
-    <p class="kr-lede">Inspect and edit a key's large-blob array — view stored entries as hex and ASCII, and keep your own plaintext notes — over the standard CTAP 2.1 <code>authenticatorLargeBlobs</code> command.</p>
+    <p class="kr-lede">Inspect and edit a key's large-blob array — view stored entries as hex and ASCII, keep your own plaintext notes, and pull an SSH certificate back out — over the standard CTAP 2.1 <code>authenticatorLargeBlobs</code> command.</p>
   </div>
 </section>
 
@@ -75,7 +75,8 @@
 
   <section class="kr-section">
     <h2>Where to find it</h2>
-    <p>Open the <strong>FIDO2</strong> tab and choose the <strong>Storage</strong> tab. It
+    <p>Open the <strong>FIDO2</strong> tab, unlock with your PIN, then choose the
+      <strong>Storage</strong> tab. It
       appears only when the key reports <code>largeBlobs</code> support in its
       <code>getInfo</code> options. The array loads automatically when you open the tab;
       <strong>Reload</strong> refreshes it on demand. Reading needs no PIN, but adding,
@@ -86,7 +87,7 @@
     <h2>What you can do</h2>
     <p><strong>View entries.</strong> Each stored entry is shown as a card. <em>View bytes</em>
       expands a side-by-side <strong>hex + ASCII</strong> dump of its contents. Genuine
-      relying-party entries are labelled <em>relying-party data</em> and are read-only —
+      relying-party entries are labelled <em>relying-party data</em> and cannot be edited —
       they are encrypted by the website that created them, so keyroost never rewrites them.</p>
     <p><strong>Add a note.</strong> The <em>Add</em> button opens a composer; type text and
       save it. keyroost stores it as its own entry, marked so it can be recognised and read
@@ -94,8 +95,13 @@
       clear.</p>
     <p><strong>Edit a note.</strong> keyroost's own notes have an <em>Edit</em> button that
       replaces the text in place. Relying-party entries cannot be edited.</p>
-    <p><strong>Delete an entry.</strong> Any entry can be deleted; keyroost rewrites the array
-      without it.</p>
+    <p><strong>Delete an entry.</strong> Any entry can be deleted, but deleting one a relying
+      party owns may break the service that stored it — so that case is gated: the desktop app
+      asks you to confirm, and the CLI requires an explicit <code>--yes</code>. keyroost then
+      rewrites the array without the entry.</p>
+    <p><strong>Erase everything.</strong> A separate wipe-all action clears the entire array —
+      relying-party data included, not just keyroost notes. It is irreversible, needs your PIN,
+      and is double-confirmed in the app (<code>--yes</code> on the CLI).</p>
   </section>
 
   <section class="kr-section">
@@ -109,6 +115,42 @@
       recomputes the checksum before writing. Each write re-reads the key's current array
       first, so concurrent relying-party entries are preserved. Writes are authenticated with
       a Large-Blob-Write token derived from your PIN.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>Command line</h2>
+<pre><code>keyroostctl fido large-blob list
+keyroostctl fido large-blob get 0
+keyroostctl fido large-blob add "spare key in the desk drawer" --pin-stdin
+keyroostctl fido large-blob edit 2 "moved to the safe" --pin-stdin
+keyroostctl fido large-blob export 1 entry.bin              # raw bytes, no PIN
+keyroostctl fido large-blob export 1 id_ecdsa_sk-cert.pub --as-cert
+keyroostctl fido large-blob delete 1 --pin-stdin --yes      # --yes only for RP-owned entries
+keyroostctl fido large-blob clear --pin-stdin --yes         # wipes the whole array</code></pre>
+    <p class="kr-muted">Reading (<code>list</code>, <code>get</code>, <code>export</code>) needs
+      no PIN — the array is world-readable. Note that <code>add</code> and <code>edit</code>
+      take the note text as an argument, so it is visible to other local processes in the
+      process list while the command runs; that is fine for a note and unacceptable for a
+      secret, which is another reason not to put one here.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>SSH certificates</h2>
+    <p>The commonest real occupant of the large-blob array is an <strong>OpenSSH
+      certificate</strong>: tools like <code>ssh-keygen</code> and <code>fido2-token</code>
+      store the certificate for a resident SSH credential here so it travels with the key
+      instead of living in a file you have to carry. keyroost can read one back out.</p>
+    <p>Each such entry is encrypted under a per-credential <em>largeBlobKey</em> that only the
+      key can hand over, so extraction goes through credential management and needs your PIN
+      (no touch). It is <strong>read-only</strong> — keyroost never writes or rewrites a
+      relying party's certificate.</p>
+<pre><code>keyroostctl fido ssh-cert list --pin-stdin
+keyroostctl fido ssh-cert extract --credential ssh:demo --out id_ecdsa_sk-cert.pub --pin-stdin</code></pre>
+    <p><code>--credential</code> is needed only to disambiguate when the key holds several SSH
+      credentials, and <code>--out</code> defaults to a sanitised
+      <code>&lt;rp-id&gt;-cert.pub</code>; pass <code>--force</code> to overwrite an existing
+      file. In the desktop app the same thing is <strong>Save certificate…</strong> on the
+      <strong>Passkeys</strong> tab, next to the SSH credential it belongs to.</p>
   </section>
 
   <section class="kr-section">

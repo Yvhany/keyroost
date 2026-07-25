@@ -107,9 +107,10 @@
     </ul>
     <div class="kr-callout danger">
       <div class="kr-callout-title danger">Rotating &amp; resetting are consequential</div>
-      <p>Rotating the customer key or factory-resetting the token changes what it will accept
-        and can wipe loaded slots. Make sure you can re-derive every seed before you do
-        either. <a href="reset.html">See resetting →</a></p>
+      <p>Rotating the customer key or factory-resetting the token changes what it will accept.
+        A factory reset wipes the loaded profiles and restores the default customer key, and
+        the token makes you confirm it with its own button. Make sure you can re-derive every
+        seed before you do either. <a href="reset.html">See resetting →</a></p>
     </div>
   </section>
 
@@ -117,8 +118,9 @@
     <h2>What keyroost does with the Molto2</h2>
     <div class="kr-tool">
       <span class="kr-mark mono">k</span>
-      <p>Program a slot from an <code>otpauth://</code> URI; bulk-import from Aegis / 2FAS /
-        an <code>otpauth://</code> list; sync the host clock; rotate the customer key; and
+      <p>Read slot occupancy and titles; program a slot from an <code>otpauth://</code> URI;
+        set a slot's title or delete it; bulk-import from Aegis / 2FAS / an
+        <code>otpauth://</code> list; sync the host clock; rotate the customer key; and
         factory-reset — over a pure-Rust protocol layer (SM4, SHA-1, APDU builders, MAC)
         with no external crypto dependencies.</p>
     </div>
@@ -151,7 +153,9 @@
     <div class="kr-tool">
       <span class="kr-mark mono">k</span>
       <p>From the CLI: <code>keyroostctl prog info</code> (serial, model, on-device clock),
-        <code>keyroostctl prog seed</code> (seed from stdin / env, never argv), and
+        <code>keyroostctl prog seed</code> (seed from stdin or an environment variable —
+        <code>--base32-stdin</code> / <code>--base32-env</code>, so it stays out of
+        <code>ps</code> and shell history), and
         <code>keyroostctl prog config</code> (algorithm, time-step, display timeout). The GUI
         offers the same on a dedicated programmable-token pane.</p>
     </div>

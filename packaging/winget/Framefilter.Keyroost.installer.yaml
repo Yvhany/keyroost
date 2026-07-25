@@ -1,5 +1,18 @@
-# Installer manifest template. Replace @VERSION@ and @SHA_WIN@ (from the
-# release's SHA256SUMS). The zip carries two portable executables.
+# Installer manifest template. Replace @VERSION@ (e.g. 0.7.6, no leading `v`)
+# and @SHA_WIN@. The zip carries two portable executables.
+#
+# The URL below points at the **Token2-signed** zip, NOT the CI-built
+# `keyroost-v<version>-windows-x86_64.zip`. That is policy, not preference:
+# `.github/workflows/publish.yml`'s winget job holds the submission until
+# `keyroost-v<version>-windows-x86_64-signed.zip` is attached to the release,
+# Authenticode-verifies every PE inside it, and only then submits. Rendering
+# this template against the unsigned CI zip would publish unsigned bytes under
+# the same package id and break the SmartScreen certificate reputation the wait
+# exists to accumulate.
+#
+# @SHA_WIN@ therefore comes from the signed zip's own `.sha256` sidecar asset —
+# NOT from `SHA256SUMS`, which covers only the CI-built archives:
+#   gh release download vX.Y.Z --pattern 'keyroost-vX.Y.Z-windows-x86_64-signed.zip.sha256' -O -
 PackageIdentifier: Framefilter.Keyroost
 PackageVersion: "@VERSION@"
 InstallerType: zip
@@ -18,7 +31,7 @@ Dependencies:
     - PackageIdentifier: Microsoft.VCRedist.2015+.x64
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/framefilter/keyroost/releases/download/v@VERSION@/keyroost-v@VERSION@-windows-x86_64.zip
+    InstallerUrl: https://github.com/framefilter/keyroost/releases/download/v@VERSION@/keyroost-v@VERSION@-windows-x86_64-signed.zip
     InstallerSha256: "@SHA_WIN@"
 ManifestType: installer
 ManifestVersion: 1.6.0

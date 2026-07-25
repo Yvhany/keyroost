@@ -7,15 +7,28 @@ behaviour of the Token2 device itself; none of it is copyrighted by anyone.
 
 > **Status:** the algorithm and APDU layouts below are confirmed by byte-for-byte
 > agreement between keyroost's protocol layer and an independent third-party SM4
-> implementation (`gmssl`). Hardware confirmation is still pending for response
-> layouts (notably `get info`).
+> implementation (`gmssl`), and the command set has been exercised against real
+> hardware (see `docs/BRINGUP.md`). The per-profile public block envelope is
+> hardware-captured. Still unconfirmed: the **`get info` response layout** — no
+> captured trace of it is committed to this repository, so the field boundaries
+> below are the parser's working assumption rather than an observed fact — and
+> the *meaning* of the opaque fields (`get info`'s 3-byte header and 2-byte
+> separator, and the two u32 time fields in the public block).
 
 ## Transport
 
 - **Class:** USB CCID smart card (ISO 7816-4 APDUs over PC/SC).
 - **Vendor ID:** `0x349E` (shared across all of Token2's products — the Molto2
   *and* the PIN+/FIDO2+ FIDO keys — so VID alone does not identify a Molto2)
-- **Product ID:** `0x0300` (Molto2 / Molto2v2; the FIDO keys are `0x0022`)
+- **Product ID:** `0x0300` (Molto2 / Molto2v2) — confirmed by Token2 (issue #25)
+  as always and only the Molto2. There is no single "FIDO PID": Token2's FIDO
+  line uses many PIDs under the same VID — `0x0013`–`0x0016` (PIN+ Mini),
+  `0x0023`–`0x0026` (PIN+ Series / FIDO2 Security Key), `0x0203`–`0x0206`
+  (Bio3 Dual) — plus `0x0022` (the T2F2 / PIN+ key as it appears in the vendor's
+  reference udev rule) and `0x0430` for the MFA NFC reader. Classify with
+  `keyroost_proto::token2_product` / `is_molto2_usb` rather than testing against
+  any one PID; a Token2 PID that isn't in that table means "not provably a
+  Molto2", not "FIDO".
 - **Reader name:** the Molto2 reader carries the product name, e.g.
   `TOKEN2 Molto2 [CCID Interface] 00 00`. Matching on the brand "TOKEN2" is
   **too broad** — Token2's FIDO keys (FIDO2+, PIN+, PIN+R3, …) also brand as
@@ -56,8 +69,9 @@ Required before any "secure" command (CLA `0x84`).
 
 ## Per-command MAC (secure commands)
 
-For every CLA `0x84` command the last 4 bytes of `Lc` are a MAC computed as
-follows:
+For every CLA `0x84` command the last 4 bytes of the payload are a MAC computed
+as follows (`Lc` itself is a one-byte length field covering encrypted body +
+MAC):
 
 1. Build the MAC input: `[CLA=0x80, INS, P1, P2, Lc'] || payload` where `Lc'`
    is the **payload** length (not the final `Lc` including the MAC), and
@@ -83,10 +97,10 @@ In the tables below "Lc" is the length of the entire payload (encrypted body
 |---|---|---|---|---|---|
 | `0x41` | `00` | `00` | — (Le=`00`) | Device info | Serial + system time |
 | `0x41` | `00` | profile (0..99) | `70` (Lc=`01`) | Per-profile public block | Title + occupancy + TOTP config |
-| `0xE6` | `00` | profile (0..99) | — (Lc=`00`) | — (sw=`9000`/`6A83`) | Delete one profile's seed (keyless) |
+| `0xE6` | `00` | profile (0..99) | — (Le=`00`) | — (sw=`9000`/`6A83`) | Delete one profile's seed (keyless) |
 | `0x4B` | `08` | `00` | — (Le=`00`) | 8-byte challenge | Start auth handshake |
 | `0xCE` | `00` | `00` | 16-byte SM4(challenge \|\| zeros) | — | Finish auth handshake |
-| `0x56` | `00` | `00` | — (Le=`00`) | — (sw=9000) | Factory reset (physical confirm) |
+| `0x56` | `00` | `00` | — (Le=`00`) | — (sw=`9060`, then `9000` once the button is pressed) | Factory reset (physical confirm) |
 
 #### `0x41` get info response layout
 
@@ -99,8 +113,10 @@ offset  length  field
 6+N     4       UTC time as a big-endian u32 (unix epoch seconds)
 ```
 
-The first 3 and the 2-byte separator are not yet confirmed to be constant; the
-parser tolerates both because Token2's reference does the same.
+The first 3 bytes and the 2-byte separator are not yet confirmed to be constant;
+the parser carries them through uninterpreted and bounds-checks every offset it
+derives from `data[3]`, so a truncated or hostile response errors cleanly rather
+than panicking.
 
 #### `0x41` per-profile public block (P2 = profile)
 
@@ -195,6 +211,8 @@ with the same `D4 01 <profile>` header.
 | `9060` | Success — command queued, awaiting on-device button confirmation (factory reset, set customer key) |
 | `63 Cx` | Auth failed; low nibble `x` is attempts remaining before lock (ISO-7816 retry counter) |
 | `6A83` | Referenced data not found (e.g. `0xE6` on a slot with no seed) |
+| `61 XX` | `XX` more response bytes pending — issue `GET RESPONSE` (T=0 readers; shared applet paths only, never the Molto2 protocol) |
+| `6C XX` | Wrong `Le` — reissue the *same* command with `Le = XX` (T=0 readers; shared applet paths only) |
 | other `6xxx` / `9xxx` | Command-specific failure |
 
 `9060` is not an error: the device has accepted the request and is waiting for
@@ -203,6 +221,34 @@ the user to press the up-arrow button to commit. Both `factory_reset` and
 
 keyroost surfaces auth failures specifically (`TransportError::AuthFailed`) so
 they can be retried; everything else becomes `TransportError::Apdu { sw1, sw2 }`.
+
+### Response continuation (`61xx` / `6Cxx`)
+
+The Molto2 protocol itself is single-exchange: the session's `transmit` sends one
+APDU and treats any status word other than `9000` / `9060` as terminal. No Molto2
+command returns more data than fits in one response, so no `GET RESPONSE` loop is
+needed and none is implemented on this path — a `61xx` here would surface as an
+error, not as a continuation.
+
+The **shared smart-card applet paths** (OATH, OpenPGP, PIV over PC/SC) do
+reassemble, because they run over readers whose T=0 handling differs:
+
+- `61 XX` — chunk accepted; send `GET RESPONSE` asking for exactly the `XX` bytes
+  the card says are pending (`XX == 0` meaning 256, the short-form convention)
+  and accumulate. Asking blindly for 256 is what makes a card that validates `Le`
+  answer `6Cxx` mid-read.
+- `6C XX` — the card returned **no data** and wants the command *currently in
+  flight* reissued with `Le = XX`. Whatever has already been accumulated is kept.
+
+Whether a host ever sees `6C XX` is reader-dependent, not card-dependent: readers
+that absorb the `Le` correction in firmware (the Token2 dual-interface reader)
+never surface it, while readers that pass the raw card response through (Alcor,
+SCM, Realtek, …) do — which is why an OpenPGP read after a factory reset failed
+with `SW=6CFF` on some hosts and not others (issue #84).
+
+Both loops are bounded — 1 MiB accumulated and 4096 chunks
+(`MAX_REASSEMBLED_RESPONSE` / `MAX_RESPONSE_CHUNKS`) — so a card that answers
+`6Cxx` forever terminates.
 
 ## Known unknowns
 
@@ -220,5 +266,9 @@ they can be retried; everything else becomes `TransportError::Apdu { sw1, sw2 }`
 4. **HOTP.** The Molto2 marketing material mentions HOTP; we have no APDU set
    for it and no UI for it.
 
-Contributions adding hardware traces / probing results are welcome — see the
-`keyroostctl probe` work item in the README roadmap.
+Contributions adding hardware traces / probing results are welcome — the hidden
+`keyroostctl molto probe` subcommand sweeps the plain class (CLA `0x80`), and
+with `--authed` the secure class too, classifying each status word. It skips the
+INS bytes known to mutate the device (`0xC5`, `0xD5`, `0xD4`, `0xD7`, `0xCE`,
+`0x56`, `0xD8`) unless `--include-destructive` is passed, requires `--yes`, and
+takes `--slot` for the P2 profile index (default 99).

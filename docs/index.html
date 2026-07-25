@@ -148,7 +148,9 @@
     <p class="kr-muted" style="margin-top:16px">Have a programmable TOTP token instead of a
       multi-applet key? See <a href="molto2.html">Token2 Molto2</a> — and its
       <a href="molto2.html#single-profile">single-profile siblings</a> (OTPC, miniOTP, C30x).
-      Starting over with a key? See <a href="reset.html">resetting safely</a>.</p>
+      Starting over with a key? See <a href="reset.html">resetting safely</a>. Going deeper:
+      <a href="fingerprint.html">fingerprints</a>, <a href="settings.html">security policy</a>,
+      <a href="storage.html">on-key storage</a>, <a href="naming.html">naming your keys</a>.</p>
   </section>
 
   <section class="kr-section" id="setup">
@@ -237,9 +239,12 @@
       <div class="kr-answer">
         <p>Any standards-compliant FIDO2 key for the FIDO features — keyroost implements
           the published CTAP2 spec, not vendor quirks. Hardware-verified so far: YubiKey 5
-          series, SoloKeys Solo 2, Nitrokey 3, Token2 PIN+ (including fingerprints and
+          series, SoloKeys Solo 2, Nitrokey 3, Token2 PIN+ (FIDO2, fingerprints and
           on-device OTP), and the Token2 Molto2 and single-profile programmable tokens.
-          OATH, OpenPGP, and PIV work on any key that exposes those applets over PC/SC.
+          The OATH, OpenPGP, and PIV commands are built to the published specs and apply to
+          any key exposing those applets over PC/SC, verified on a YubiKey 5 — on PIN+ keys
+          those three are <em>not yet exercised on that hardware by this project</em>, so
+          treat them as experimental there.
           <a href="https://github.com/framefilter/keyroost#supported-devices">Full device
           table →</a></p>
       </div>
@@ -299,9 +304,13 @@ flatpak install --user keyroost io.github.framefilter.keyroost</code></pre>
     <div class="kr-callout note">
       <div class="kr-callout-title note">Linux prerequisites</div>
       <p>The smart-card features (OATH, OpenPGP, PIV, Molto2) need the host's
-        <code>pcscd</code> daemon — <code>sudo apt install pcscd</code> or your distro's
-        equivalent. Talking to a key's FIDO interface needs the bundled udev rules so the
-        device node isn't root-only. Both are two-minute setups —
+        <code>pcscd</code> daemon installed and running — <code>sudo apt install pcscd</code>
+        (or your distro's equivalent), then <code>sudo systemctl enable --now pcscd</code>.
+        Talking to a key's FIDO interface needs the bundled udev rules so the
+        device node isn't root-only: copy <code>udev/70-keyroost-fido.rules</code> into
+        <code>/etc/udev/rules.d/</code>, then <code>sudo udevadm control --reload-rules
+        &amp;&amp; sudo udevadm trigger</code> and re-plug the key. After installing,
+        <code>keyroostctl doctor</code> verifies both. Both are two-minute setups —
         <a href="https://github.com/framefilter/keyroost#smart-card-prerequisite">full
         notes in the README</a>.</p>
     </div>
@@ -319,8 +328,14 @@ brew install keyroost</code></pre>
 <pre><code>winget install Framefilter.Keyroost</code></pre>
 
     <h3>Everything else — Cargo or pre-built archives</h3>
-    <p>With a Rust toolchain you can build both binaries from crates.io:</p>
-<pre><code>cargo install keyroostctl keyroost</code></pre>
+    <p>With a Rust toolchain (1.92+, for the GUI) you can build both binaries from crates.io.
+      On Linux this needs the PC/SC <em>dev</em> package, and the GUI needs the X11/Wayland/GL
+      libraries <code>eframe</code>/<code>egui</code> link against:</p>
+<pre><code>sudo apt install libpcsclite-dev libxkbcommon-dev libwayland-dev libxcb1-dev libgl1-mesa-dev
+cargo install keyroostctl keyroost</code></pre>
+    <p>(For the CLI alone, <code>libpcsclite-dev</code> is enough — <code>cargo install keyroostctl</code>.
+      Fedora/Arch package names are in the
+      <a href="https://github.com/framefilter/keyroost#smart-card-prerequisite">README</a>.)</p>
     <p>Or grab a pre-built archive for your platform from the releases page.</p>
 
     <p class="kr-related" style="margin-top:18px">
@@ -379,7 +394,10 @@ brew install keyroost</code></pre>
       Rust toolchain for hardware security keys — FIDO2, OATH, OpenPGP, PIV, and Token2
       Molto2 — implemented from public standards, with no vendor SDKs.
       <a href="https://github.com/framefilter/keyroost">Source on GitHub →</a></p>
-    <p class="kr-small">Not affiliated with or endorsed by any vendor named here; product
+    <p class="kr-small">Free and open source under the
+      <a href="https://github.com/framefilter/keyroost/blob/main/LICENSE-MIT">MIT</a> or
+      <a href="https://github.com/framefilter/keyroost/blob/main/LICENSE-APACHE">Apache-2.0</a>
+      licence, at your option. Not affiliated with or endorsed by any vendor named here; product
       names are used descriptively and remain their owners' trademarks. This guide is
       general information, not security advice for any specific threat model.</p>
   </div>

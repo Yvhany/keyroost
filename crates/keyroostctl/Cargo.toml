@@ -34,8 +34,10 @@ keyroost-import = { path = "../keyroost-import", version = "0.7.6", features = [
 keyroost-rsakey = { path = "../keyroost-rsakey", version = "0.7.6" }
 clap = { version = "4", features = ["derive"] }
 # Same project family as clap; generate shell completions / a man page at
-# runtime (`completions` / `manpage` subcommands) instead of via build.rs —
-# the workspace deliberately has no build scripts.
+# runtime (`completions` / `manpage` subcommands) rather than from a build
+# script, so nothing in this crate is generated at compile time. (The only
+# build script in the workspace is the Windows-gated one in `keyroost`, which
+# embeds the app icon and version resource and generates no code.)
 clap_complete = "4"
 clap_mangen = "0.3"
 # Already in the workspace tree (via rsa and p256); wraps PINs/seeds read from

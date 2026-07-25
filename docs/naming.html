@@ -84,7 +84,11 @@
     </ul>
     <p>Either way, matching is a plain string comparison against that serial — so a named key
       is recognized the moment it's connected, in any port, and is shown as "not connected"
-      when it's absent.</p>
+      when it's absent. keyroost pairs a card reader to its USB device by exact bus address
+      first and refuses to fall back to a name-based guess when the evidence is ambiguous, so
+      in a crowded, hard-to-disambiguate set a key may read as not connected rather than being
+      confidently mistaken for its neighbour — deliberately, since a wrong match would send
+      card operations and FIDO operations to two different physical keys.</p>
     <div class="kr-callout tip">
       <div class="kr-callout-title tip">Naming is opt-in and stays on your computer</div>
       <p>Nothing is written to disk until you explicitly add a name. When you do, keyroost
@@ -123,9 +127,12 @@ keyroostctl key-name remove signing-yubikey</code></pre>
       changes between plugs.</p>
     <div class="kr-callout note">
       <div class="kr-callout-title note">Label rules</div>
-      <p>A label is 1–64 characters of lowercase letters, digits, hyphens, and underscores
-        (<code>[a-z0-9_-]</code>). Names must be unique, and each serial can carry only one
-        name — keyroost refuses a duplicate name or a second name for the same key.</p>
+      <p>A label is 1–64 characters and otherwise free-form: letters of any case or script,
+        digits, spaces and punctuation are all fine — <code>Signing YubiKey</code>,
+        <code>Clé de bureau</code>, <code>backup-2</code>. Only control, zero-width and
+        bidi-override characters are rejected, because those let a saved name spoof what it
+        displays as. Names must be unique, and each serial can carry only one name — keyroost
+        refuses a duplicate name or a second name for the same key.</p>
     </div>
   </section>
 

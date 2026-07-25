@@ -1251,7 +1251,10 @@ enum KeyNameCmd {
     /// Record a friendly name for a connected key. Writes the key's serial to
     /// keys.json on this computer (opt-in) so it's recognizable by name later.
     Add {
-        /// Friendly label to assign, e.g. "signing-yubikey" ([a-z0-9_-]).
+        /// Friendly label to assign, e.g. "Signing YubiKey". Any text up to 64
+        /// characters — letters of any script, digits, spaces, punctuation;
+        /// only blank names and control / zero-width / bidi characters are
+        /// rejected.
         name: String,
         /// Which connected key to name. Omit to auto-pick / choose interactively.
         #[arg(long, value_name = "PATH")]

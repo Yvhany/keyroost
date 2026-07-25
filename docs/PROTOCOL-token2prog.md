@@ -105,7 +105,8 @@ vendor reference.
 #### Model identification from the serial
 
 The printed serial begins with a product-specific digit prefix. The known
-mapping (`keyroost_token2prog::model_for_serial`, matched longest-prefix-first):
+mapping (`keyroost_token2prog::model_for_serial`; all current prefixes are seven
+digits and none overlap, but the matcher takes the longest match defensively):
 
 | Serial prefix | Model |
 |---|---|
