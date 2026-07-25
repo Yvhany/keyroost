@@ -254,31 +254,42 @@ pub fn config_dir() -> Option<std::path::PathBuf> {
     // Windows has no HOME/XDG by default; use the standard roaming AppData dir.
     #[cfg(windows)]
     {
-        if let Some(appdata) = std::env::var_os("APPDATA") {
-            if !appdata.is_empty() {
-                return Some(PathBuf::from(appdata).join("keyroost"));
-            }
-        }
-        if let Some(profile) = std::env::var_os("USERPROFILE") {
-            if !profile.is_empty() {
-                return Some(PathBuf::from(profile).join(".config").join("keyroost"));
-            }
-        }
-        None
+        let appdata = std::env::var_os("APPDATA");
+        let profile = std::env::var_os("USERPROFILE");
+        config_dir_from(appdata.as_deref(), profile.as_deref())
     }
     #[cfg(not(windows))]
     {
-        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-            if !xdg.is_empty() {
-                return Some(PathBuf::from(xdg).join("keyroost"));
-            }
-        }
-        let home = std::env::var_os("HOME")?;
-        if home.is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(home).join(".config").join("keyroost"))
+        let xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let home = std::env::var_os("HOME");
+        config_dir_from(xdg.as_deref(), home.as_deref())
     }
+}
+
+/// The [`config_dir`] rule as a pure function of the two environment values it
+/// reads — `(XDG_CONFIG_HOME, HOME)`, or `(APPDATA, USERPROFILE)` on Windows.
+///
+/// Split out so the rule can be tested without touching process environment.
+/// `setenv` races every other thread that calls `getenv`: it can reallocate the
+/// environ array under a concurrent reader, which on macOS kills the process
+/// outright. Rust 2024 makes `std::env::set_var` `unsafe` for exactly this
+/// reason. A test that mutates env is therefore not just untidy — it is a data
+/// race whose blast radius is every other test sharing the binary.
+pub fn config_dir_from(
+    primary: Option<&std::ffi::OsStr>,
+    fallback: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    if let Some(primary) = primary {
+        if !primary.is_empty() {
+            return Some(PathBuf::from(primary).join("keyroost"));
+        }
+    }
+    let fallback = fallback?;
+    if fallback.is_empty() {
+        return None;
+    }
+    // `$HOME/.config/keyroost`, or `%USERPROFILE%\.config\keyroost`.
+    Some(PathBuf::from(fallback).join(".config").join("keyroost"))
 }
 
 /// Default config path for `keys.json`. See [`config_dir`] for the directory rule.
@@ -750,5 +761,43 @@ mod tests {
         // No temp file left behind.
         assert!(!path.with_extension("json.tmp").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_dir_prefers_the_primary_var_and_falls_back_to_the_home_var() {
+        use std::ffi::OsStr;
+        // Primary set and non-empty wins outright.
+        assert_eq!(
+            config_dir_from(Some(OsStr::new("/tmp/xdg")), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/tmp/xdg").join("keyroost"))
+        );
+        // Primary unset falls back to <home>/.config/keyroost.
+        assert_eq!(
+            config_dir_from(None, Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/home/u").join(".config").join("keyroost"))
+        );
+        // An EMPTY primary is treated as unset, not as the root directory —
+        // otherwise `XDG_CONFIG_HOME=` would resolve to "/keyroost".
+        assert_eq!(
+            config_dir_from(Some(OsStr::new("")), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/home/u").join(".config").join("keyroost"))
+        );
+        // Nothing usable on either side yields None rather than a relative path.
+        assert_eq!(config_dir_from(None, None), None);
+        assert_eq!(
+            config_dir_from(Some(OsStr::new("")), Some(OsStr::new(""))),
+            None
+        );
+    }
+
+    #[test]
+    fn keys_json_and_the_gui_settings_share_one_directory() {
+        // The invariant the split must not break: keys.json and settings.json
+        // resolve to the same directory, whatever the environment says.
+        if let Some(dir) = config_dir() {
+            assert_eq!(config_path(), Some(dir.join("keys.json")));
+        } else {
+            assert_eq!(config_path(), None);
+        }
     }
 }

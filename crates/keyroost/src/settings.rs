@@ -280,46 +280,39 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Serialises every test that touches `XDG_CONFIG_HOME`. Cargo runs a
-    /// crate's tests as threads in ONE process, so an env mutation is visible
-    /// to every other test while it is in effect — a reader of env-derived
-    /// state races the mutator just as surely as a second mutator would.
-    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn settings_path_is_config_dir_plus_settings_json() {
         // The GUI settings file must live in the SAME directory keyroost-keyring
-        // resolves for keys.json — proven by delegation, no env mutation. It
-        // still takes the guard: `config_dir()` reads `XDG_CONFIG_HOME`.
-        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // resolves for keys.json — proven by delegation, reading env but never
+        // writing it.
         match keyroost_keyring::config_dir() {
             Some(dir) => assert_eq!(config_path(), Some(dir.join("settings.json"))),
             None => assert_eq!(config_path(), None),
         }
     }
 
-    #[cfg(not(windows))]
     #[test]
-    fn config_path_follows_xdg_config_home() {
-        // NOTE: this test MUTATES process env, so it holds ENV_GUARD for the
-        // whole window in which the override is live. The GUI crate is edition
-        // 2021, where `std::env::set_var` is safe (not `unsafe`), so no
-        // `unsafe` block is needed.
-        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        std::env::set_var("XDG_CONFIG_HOME", "/tmp/keyroost-xdg-cfg");
-        let got = config_path();
-        match saved_xdg {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
+    fn settings_path_honours_an_xdg_override() {
+        // The XDG rule itself is `keyroost_keyring::config_dir_from`, tested
+        // there against supplied values. Here we only pin that a settings path
+        // is that directory plus `settings.json` — no process env is mutated.
+        //
+        // This replaces a test that called `set_var("XDG_CONFIG_HOME", …)`.
+        // That raced every other test in this binary: `setenv` can reallocate
+        // the environ array under a concurrent `getenv`, and on macOS it killed
+        // the whole test process with SIGTRAP once this binary grew past ~90
+        // tests. A mutex could not fix it — the other 90-odd readers never took
+        // the lock.
+        let dir = keyroost_keyring::config_dir_from(
+            Some(std::ffi::OsStr::new("/tmp/keyroost-xdg-cfg")),
+            None,
+        )
+        .expect("an explicit XDG value always resolves");
         assert_eq!(
-            got,
-            Some(
-                PathBuf::from("/tmp/keyroost-xdg-cfg")
-                    .join("keyroost")
-                    .join("settings.json")
-            )
+            dir.join("settings.json"),
+            PathBuf::from("/tmp/keyroost-xdg-cfg")
+                .join("keyroost")
+                .join("settings.json")
         );
     }
 }
