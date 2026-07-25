@@ -40,7 +40,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   into a single row. Card operations then went to one key while FIDO
   operations — PIN entry, credential deletion, reset — went to the other. Both
   the guess and the ordering bug that could still mispair a key have been
-  fixed, and one key can no longer disappear from the list.
+  fixed, and one key can no longer disappear from the list. On Windows and
+  macOS, where the operating system does not report USB positions at all,
+  keyroost now refuses to guess whenever two keys of the same make could each
+  plausibly own the reader: it shows them separately rather than picking one.
+  A key that is alone with its reader still pairs up as before.
+- **An armed FIDO reset can no longer outlive what it was armed for.** If the
+  key list failed to refresh, or arming was refused, an already-armed wipe
+  could keep waiting invisibly and fire on the next replug — after the window
+  had said nothing was armed. Every such path now cancels the ceremony and
+  says so, and the wipe re-checks its target before firing.
 - **Factory reset's throwaway PIN/PUK guesses are now random.** They were
   fixed constants that were themselves valid credentials, so a card whose real
   PUK happened to match had its PIN silently reset to a value published in the
@@ -87,6 +96,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Saving two SSH certificates at once no longer writes the wrong one.**
   Leaving one "Save certificate…" dialog open and starting another wrote the
   second certificate to the first one's filename.
+- **A slow-to-reappear key is no longer accused of being the wrong key.** After
+  the replug prompt, a key's serial is read over its card interface, which
+  re-registers a moment after the FIDO one. keyroost waited under a second and
+  then reported that a different key had been connected. It now waits up to
+  three seconds — still well inside the reset window — and, when a key simply
+  has not identified itself yet, says so instead of alleging a swap, naming the
+  command that finishes the job.
+- **A factory reset abandoned part-way now says what it did.** Selecting
+  another key while the applets were being wiped discarded the whole report
+  silently — including which applets had been erased and whether PIV had been
+  left locked. It now records that in the log.
+- **PIV reset failures are no longer all called permanent.** A card answering
+  the reset with a transient or unspecific status was declared unrecoverable
+  and the user was steered away from retrying. Only the statuses that genuinely
+  mean the card has no reset instruction say that now.
 - **Error messages no longer suggest commands that cannot run.** Several hints
   printed a command without its required `--yes`, or without its subcommand
   group, so following them verbatim failed — including the PIV recovery hint

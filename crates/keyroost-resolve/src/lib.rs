@@ -36,12 +36,46 @@ pub fn needs_ccid_serial(d: &HidDevice) -> bool {
 /// touches PC/SC.
 pub fn effective_serials(devices: &[HidDevice]) -> Vec<Option<String>> {
     let ccid = ccid_readers_if_needed(devices);
+    let refs: Vec<&HidDevice> = devices.iter().collect();
+    devices
+        .iter()
+        .zip(ccid_serials_for(&refs, &ccid))
+        .map(|(d, s)| d.serial_number.clone().or(s))
+        .collect()
+}
+
+/// CCID-read serials for a whole HID set at once, parallel to `devices` (`None`
+/// where the node needs no CCID serial, or where none can be attributed safely).
+///
+/// Beyond what [`ccid_serial_for`] decides per node, this refuses the
+/// single-reader fallback whenever *several* topology-free nodes could each be
+/// that reader's owner. One reader belongs to exactly one physical key, so
+/// handing its serial to more than one row makes two keys report the same
+/// identity — and a caller that re-checks the serial to confirm it is talking to
+/// the key the user chose would then accept the wrong one.
+pub fn ccid_serials_for(devices: &[&HidDevice], readers: &[YubiKeyCcid]) -> Vec<Option<String>> {
+    // Serials proven to belong to a node by exact USB topology. Those readers
+    // are spoken for, so they are not available to a topology-free guess.
+    let taken: Vec<String> = devices
+        .iter()
+        .filter(|d| d.usb_bus.is_some())
+        .filter_map(|d| ccid_serial_for(d, readers))
+        .collect();
+    // With no topology on either side, every such node is an equally good owner
+    // of the one reader, so more than one claimant means nobody may take it.
+    let claimants = devices
+        .iter()
+        .filter(|d| needs_ccid_serial(d) && d.usb_bus.is_none())
+        .count();
     devices
         .iter()
         .map(|d| {
-            d.serial_number
-                .clone()
-                .or_else(|| ccid_serial_for(d, &ccid))
+            let serial = ccid_serial_for(d, readers);
+            let contended = claimants > 1 || serial.as_ref().is_some_and(|s| taken.contains(s));
+            if d.usb_bus.is_none() && contended {
+                return None;
+            }
+            serial
         })
         .collect()
 }
@@ -76,6 +110,11 @@ pub fn ccid_readers_if_needed(devices: &[HidDevice]) -> Vec<YubiKeyCcid> {
 /// confused; falls back to the unambiguous single-reader case only when the HID
 /// node reports no topology at all. Never guesses among several readers —
 /// returns `None` instead, which is the safe outcome.
+///
+/// This single-node view cannot see that *another* topology-free node is an
+/// equally good owner of the one reader; callers holding the whole HID set
+/// should use [`ccid_serials_for`], which additionally refuses that fallback
+/// when it is contended.
 pub fn ccid_serial_for(d: &HidDevice, readers: &[YubiKeyCcid]) -> Option<String> {
     if !needs_ccid_serial(d) {
         return None;
@@ -199,6 +238,29 @@ mod tests {
         let readers = [reader(Some(9), Some(53), "37806840")];
         let d = yubikey("/dev/hidraw20", Some(9), Some(60));
         assert_eq!(ccid_serial_for(&d, &readers), None);
+    }
+
+    #[test]
+    fn set_view_refuses_a_contended_single_reader() {
+        // Two topology-free YubiKeys and one reader: per node the fallback looks
+        // unambiguous, but only one of them owns that reader. Stamping its
+        // serial on both would make the two keys report the same identity.
+        let readers = [reader(None, None, "37806840")];
+        let a = yubikey("/dev/hidraw16", None, None);
+        let b = yubikey("/dev/hidraw18", None, None);
+        assert_eq!(ccid_serials_for(&[&a, &b], &readers), vec![None, None]);
+        // One node alone still takes it — the common no-topology case.
+        assert_eq!(
+            ccid_serials_for(&[&a], &readers),
+            vec![Some("37806840".to_string())]
+        );
+        // A node with topology is decided by topology, whatever else is present.
+        let c = yubikey("/dev/hidraw20", Some(9), Some(53));
+        let topo = [reader(Some(9), Some(53), "27717893")];
+        assert_eq!(
+            ccid_serials_for(&[&a, &c], &topo),
+            vec![None, Some("27717893".to_string())]
+        );
     }
 
     #[test]

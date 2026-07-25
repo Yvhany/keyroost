@@ -454,8 +454,9 @@ enum Cmd {
     },
     /// Factory-reset EVERY resettable applet on the selected key: OATH,
     /// OpenPGP, PIV, Token2 OTP, then FIDO2 (which needs an unplug/replug +
-    /// touch at the end). Wipes all credentials, codes, keys, and PINs; the
-    /// key stays fully usable afterward. Irreversible.
+    /// touch at the end). Wipes all credentials, codes, keys, and PINs; each
+    /// applet that completes comes back in factory condition, and every step
+    /// reports its own outcome. Irreversible.
     FactoryReset {
         /// Substring of the PC/SC reader name (skips auto-detection for the
         /// smart-card applets).
@@ -3855,6 +3856,19 @@ fn reader_device_conflict(
     Ok(())
 }
 
+/// What the user reads before consenting to a whole-device wipe.
+///
+/// It does not promise the key "stays usable": PIV's wipe blocks the PIN and
+/// PUK on purpose before erasing, so a run that stops in between leaves that
+/// applet locked and un-wiped. What can be promised is per applet and per step
+/// — the same line the GUI's `factory_reset_confirm_summary` settled on, so the
+/// two front ends ask for consent to the same thing.
+const FACTORY_RESET_CONSENT: &str =
+    "refusing to factory-reset without --yes (wipes ALL applets: OATH, OpenPGP, \
+     PIV, Token2 OTP, and FIDO2; every credential, code, key, and PIN is erased. \
+     Each applet that completes comes back in factory condition, and every step \
+     reports its own outcome)";
+
 fn run_factory_reset(
     reader: Option<&str>,
     yes: bool,
@@ -3863,12 +3877,7 @@ fn run_factory_reset(
     use keyroost_resolve::{factory_reset_plan, ResetStep, StepOutcome, StepReport};
 
     if !yes {
-        return Err(
-            "refusing to factory-reset without --yes (wipes ALL applets: \
-                    OATH, OpenPGP, PIV, Token2 OTP, and FIDO2; the key stays \
-                    usable but every credential, code, key, and PIN is erased)"
-                .into(),
-        );
+        return Err(FACTORY_RESET_CONSENT.into());
     }
 
     // Resolve the one selected device (or a lone key) via the shared model,
@@ -3883,6 +3892,15 @@ fn run_factory_reset(
     // port instead.
     let expected_serial = dev.serial.clone();
     let expected_model = dev.model.clone();
+    // …and its USB ids, which are what a key with no serial can still be told
+    // apart by. The model name can't do that job on its own: before the replug
+    // it may be read off the PC/SC reader name and afterwards off the HID
+    // product string, and outside the vendors we normalize those two are not
+    // the same string.
+    let expected_ids = hid_ids_at(
+        dev.hid_path.as_deref(),
+        &keyroost_hid::enumerate().unwrap_or_default(),
+    );
     let plan = factory_reset_plan(dev.caps);
     if plan.is_empty() {
         return Err(format!(
@@ -3907,7 +3925,7 @@ fn run_factory_reset(
             ResetStep::Fido => {
                 // Interactive replug + touch; on its own so a card-step
                 // failure above never skips the FIDO offer.
-                match fido_reset_after_replug(&expected_serial, &expected_model) {
+                match fido_reset_after_replug(&expected_serial, &expected_model, expected_ids) {
                     Ok(()) => StepOutcome::Wiped,
                     Err(e) => StepOutcome::Failed(sanitize_terminal(&e.to_string())),
                 }
@@ -3973,13 +3991,115 @@ fn reinserted_target(expected_serial: &str, candidates: &[&str]) -> ReinsertMatc
     }
 }
 
+/// Why the key the reset was confirmed for is not among the ones visible after
+/// the replug. The two are not the same event and must not carry the same
+/// message: one is a key swap, the other is a key that has not finished
+/// re-enumerating.
+#[derive(Debug, PartialEq, Eq)]
+enum NotPresentReason {
+    /// Everything visible names itself, and none of them is the pinned key.
+    DifferentKey,
+    /// Nothing is visible yet, or something visible has not published a serial
+    /// yet — so it cannot be ruled in *or* out.
+    Unidentified,
+}
+
+/// Distinguish "a different key is in the port" from "the key hasn't come back
+/// with an identity yet".
+///
+/// Only the first is a swap, and only it may be said out loud: a key whose
+/// serial is read over the card interface (every YubiKey — it exposes no USB
+/// `iSerialNumber`) shows up HID-first with an empty serial and re-registers
+/// with the smart-card service a beat later. Until then it is indistinguishable
+/// from a stranger by serial alone, and accusing the user of a swap they did not
+/// make — while pointing them at a re-run that races the same way — is the worse
+/// error of the two. So a mismatch is claimed only when *every* visible key
+/// names itself and none of the names is the pinned one; an empty serial
+/// anywhere (including nothing connected at all) means unidentified.
+fn not_present_reason(serials: &[&str]) -> NotPresentReason {
+    if !serials.is_empty() && serials.iter().all(|s| !s.is_empty()) {
+        NotPresentReason::DifferentKey
+    } else {
+        NotPresentReason::Unidentified
+    }
+}
+
+/// What to tell the user when the pinned key wasn't among the keys visible
+/// after the replug — a refusal either way, but only one of them is an
+/// accusation, and only one of them names the right way out.
+fn not_present_message(
+    expected_model: &str,
+    expected_serial: &str,
+    waited_secs: u64,
+    present: &str,
+    reason: NotPresentReason,
+) -> String {
+    match reason {
+        NotPresentReason::DifferentKey => format!(
+            "the key now connected is not the one this factory reset was confirmed \
+             for: expected {} serial {}, found {present}. Nothing was reset over \
+             FIDO2 — plug the intended key in and re-run `keyroostctl \
+             factory-reset --yes`.",
+            sanitize_terminal(expected_model),
+            sanitize_terminal(expected_serial),
+        ),
+        NotPresentReason::Unidentified => format!(
+            "the key this factory reset was confirmed for ({} serial {}) did not \
+             come back with an identity to match within {waited_secs} seconds of \
+             the replug: found {present}. That is not a different key — its serial \
+             is read over the card interface, which re-registers with the \
+             smart-card service a beat after the FIDO one, so a key that is simply \
+             slow to settle looks exactly like this. Nothing was reset over FIDO2 \
+             — give it a moment, then run `keyroostctl fido reset --yes` to finish \
+             the wipe (re-running `keyroostctl factory-reset --yes` would repeat \
+             the applet resets and race the same way).",
+            sanitize_terminal(expected_model),
+            sanitize_terminal(expected_serial),
+        ),
+    }
+}
+
 /// One connected key reduced to what the post-replug match needs: its effective
-/// serial, its model name, and whether it exposes a FIDO HID interface.
+/// serial, its model name, its USB ids, and whether it exposes a FIDO HID
+/// interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Candidate<'a> {
     serial: &'a str,
     model: &'a str,
+    ids: Option<(u16, u16)>,
     fido: bool,
+}
+
+/// The USB vendor/product ids of the hidraw node a resolved device is bound to.
+/// `keyroost_resolve::Device` carries the path but not the ids, so the HID
+/// enumeration is what supplies them; a device with no FIDO interface, or one
+/// whose node came or went between the two scans, has none.
+fn hid_ids_at(path: Option<&Path>, hids: &[keyroost_hid::HidDevice]) -> Option<(u16, u16)> {
+    let path = path?;
+    hids.iter()
+        .find(|h| h.path == path)
+        .map(|h| (h.vendor_id, h.product_id))
+}
+
+/// Whether a serial-less candidate is the same *product* as the pinned key.
+///
+/// USB ids decide it whenever both sides expose them, as `ResetArm.target_ids`
+/// does in the GUI. The model name can't: it is derived from the PC/SC reader
+/// name on one side of the replug and from the HID product string on the other,
+/// and for any vendor whose reader name we don't normalize to the same string
+/// those two differ — turning "the same key came back" into a refusal. A
+/// differing name is no more a mismatch here than it is on the serial path,
+/// which already accepts a relabelled key. The name stays only as the fallback
+/// for a key whose ids are unknown on one side or the other.
+fn same_product(
+    expected_model: &str,
+    expected_ids: Option<(u16, u16)>,
+    cand: &Candidate<'_>,
+) -> bool {
+    match (expected_ids, cand.ids) {
+        (Some(expected), Some(got)) => expected == got,
+        _ => cand.model == expected_model,
+    }
 }
 
 /// Decide which of the keys present after the replug prompt is the confirmed
@@ -3990,16 +4110,21 @@ struct Candidate<'a> {
 /// on that alone leaves the whole factory reset a dead end for them. So the
 /// serial-less case matches on the one thing that *is* provable — that there is
 /// nothing else the key could be: exactly one key is connected, it too has no
-/// serial, it is the same model, and it speaks FIDO. A second visible key
-/// refuses immediately, which leaves only a deliberate hot-swap of an identical
-/// serial-less model during the prompt — the risk `fido reset --yes` already
-/// accepts.
+/// serial, it is the same product (see `same_product`), and it speaks FIDO. A
+/// second visible key refuses immediately, which leaves only a deliberate
+/// hot-swap of an identical serial-less model during the prompt — the risk
+/// `fido reset --yes` already accepts.
 fn reinserted_serial_less_target(
     expected_model: &str,
+    expected_ids: Option<(u16, u16)>,
     candidates: &[Candidate<'_>],
 ) -> ReinsertMatch {
     match candidates {
-        [only] if only.serial.is_empty() && only.model == expected_model && only.fido => {
+        [only]
+            if only.serial.is_empty()
+                && same_product(expected_model, expected_ids, only)
+                && only.fido =>
+        {
             ReinsertMatch::Found(0)
         }
         [] | [_] => ReinsertMatch::NotPresent,
@@ -4016,13 +4141,48 @@ fn reinserted_serial_less_target(
 fn reinserted_match(
     expected_serial: &str,
     expected_model: &str,
+    expected_ids: Option<(u16, u16)>,
     candidates: &[Candidate<'_>],
 ) -> ReinsertMatch {
     if expected_serial.is_empty() {
-        return reinserted_serial_less_target(expected_model, candidates);
+        return reinserted_serial_less_target(expected_model, expected_ids, candidates);
     }
     let serials: Vec<&str> = candidates.iter().map(|c| c.serial).collect();
     reinserted_target(expected_serial, &serials)
+}
+
+/// Whether a post-replug look has an answer worth acting on, or whether the
+/// poll should keep going.
+///
+/// Anything but `NotPresent` normally settles it — except a `Found` on a row
+/// with no FIDO HID interface, which is the *card* side of the key arriving
+/// first: the hidraw node is not created yet, or its report descriptor still
+/// reads empty so nothing classifies it as FIDO. Acting on that means failing
+/// with "came back without a FIDO HID interface" while the whole budget that
+/// exists for a half-enumerated key sits unspent. `Ambiguous` still stops at
+/// once: a second key claiming the pinned identity does not become less true by
+/// waiting.
+fn reinsert_settled(found: &ReinsertMatch, candidates: &[Candidate<'_>]) -> bool {
+    match *found {
+        ReinsertMatch::NotPresent => false,
+        ReinsertMatch::Found(i) => matches!(candidates.get(i), Some(c) if c.fido),
+        ReinsertMatch::Ambiguous => true,
+    }
+}
+
+/// One post-replug look: the resolved devices reduced to candidates, matched
+/// against the pinned identity, plus whether that answer settles the poll.
+fn match_reinsert(
+    expected_serial: &str,
+    expected_model: &str,
+    expected_ids: Option<(u16, u16)>,
+    present: &[keyroost_resolve::Device],
+) -> (ReinsertMatch, bool) {
+    let hids = keyroost_hid::enumerate().unwrap_or_default();
+    let candidates = candidates_of(present, &hids);
+    let found = reinserted_match(expected_serial, expected_model, expected_ids, &candidates);
+    let settled = reinsert_settled(&found, &candidates);
+    (found, settled)
 }
 
 /// The keys visible after the replug, named for the mismatch message so the
@@ -4060,6 +4220,7 @@ fn describe_present(devices: &[keyroost_resolve::Device]) -> String {
 fn fido_reset_after_replug(
     expected_serial: &str,
     expected_model: &str,
+    expected_ids: Option<(u16, u16)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let serial_less = expected_serial.is_empty();
 
@@ -4067,20 +4228,32 @@ fn fido_reset_after_replug(
     let mut _line = String::new();
     std::io::stdin().read_line(&mut _line).ok();
 
-    // A just-replugged key needs a beat before its CCID interface re-registers,
-    // and that interface is where a YubiKey's serial comes from — so a first
-    // look that finds nothing is retried briefly. Briefly is the operative
-    // word: CTAP only accepts a reset in the first seconds after power-up.
+    // A just-replugged key needs a beat before its interfaces re-register, and
+    // the card one — where a YubiKey's serial is read from, it publishes no USB
+    // iSerialNumber — is the slower of the two. So a first look that finds
+    // nothing is retried against a wall-clock deadline, not a scan count: with
+    // no reader registered yet an `enumerate()` returns in milliseconds, and a
+    // handful of those back to back is not a wait at all.
+    //
+    // Three seconds is the budget. It is long enough for a reader replugged a
+    // moment ago to register with the smart-card service (the GUI spends four
+    // scans at 1500 ms on this same event) and short enough to leave most of
+    // the ~10 s post-power-up window a FIDO reset has to land in for the touch
+    // that follows. It is only ever spent on a key that would otherwise have
+    // been refused outright.
+    const REINSERT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+    const REINSERT_POLL: std::time::Duration = std::time::Duration::from_millis(300);
+    let deadline = std::time::Instant::now() + REINSERT_DEADLINE;
+
     let mut present = keyroost_resolve::enumerate()?;
-    let mut found = reinserted_match(expected_serial, expected_model, &candidates_of(&present));
-    for _ in 0..2 {
-        if found != ReinsertMatch::NotPresent {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(400));
+    let (mut found, mut settled) =
+        match_reinsert(expected_serial, expected_model, expected_ids, &present);
+    while !settled && std::time::Instant::now() + REINSERT_POLL < deadline {
+        std::thread::sleep(REINSERT_POLL);
         present = keyroost_resolve::enumerate()?;
-        found = reinserted_match(expected_serial, expected_model, &candidates_of(&present));
+        (found, settled) = match_reinsert(expected_serial, expected_model, expected_ids, &present);
     }
+    let serials: Vec<&str> = present.iter().map(|d| d.serial.as_str()).collect();
 
     let i = match found {
         ReinsertMatch::Found(i) => i,
@@ -4097,13 +4270,12 @@ fn fido_reset_after_replug(
             .into());
         }
         ReinsertMatch::NotPresent => {
-            return Err(format!(
-                "the key now connected is not the one this factory reset was confirmed \
-                 for: expected {} serial {}, found {}. Nothing was reset over FIDO2 — \
-                 plug the intended key in and re-run `keyroostctl factory-reset --yes`.",
-                sanitize_terminal(expected_model),
-                sanitize_terminal(expected_serial),
-                describe_present(&present)
+            return Err(not_present_message(
+                expected_model,
+                expected_serial,
+                REINSERT_DEADLINE.as_secs(),
+                &describe_present(&present),
+                not_present_reason(&serials),
             )
             .into());
         }
@@ -4146,15 +4318,39 @@ fn fido_reset_after_replug(
 
 /// The resolved devices reduced to what the post-replug match reads, parallel
 /// to `devices` so a `Found(i)` indexes straight back into them.
-fn candidates_of(devices: &[keyroost_resolve::Device]) -> Vec<Candidate<'_>> {
+fn candidates_of<'a>(
+    devices: &'a [keyroost_resolve::Device],
+    hids: &[keyroost_hid::HidDevice],
+) -> Vec<Candidate<'a>> {
     devices
         .iter()
         .map(|d| Candidate {
             serial: d.serial.as_str(),
             model: d.model.as_str(),
+            ids: hid_ids_at(d.hid_path.as_deref(), hids),
             fido: d.hid_path.is_some(),
         })
         .collect()
+}
+
+/// What a PIV factory-reset step reports when it fails with anything but the
+/// three self-describing variants: the error, plus where the card actually
+/// stands and what finishes the job.
+///
+/// `force_reset` blocks the PIN and PUK on its way to RESET — the card only
+/// accepts a RESET once both are blocked — so a fault in the middle can leave
+/// PIV locked but not wiped. That is not bricked, but it is also not something
+/// `keyroostctl piv reset` can finish: a fault in the PUK loop leaves the PIN
+/// blocked and the PUK *not* blocked, which is exactly the state
+/// `PivSession::reset` answers `PivResetNotAllowed` to. Re-running the factory
+/// reset is the path that works whether one credential ended up blocked or
+/// both, so that is what this points at (and what the GUI says).
+fn piv_factory_reset_failure(err: &str) -> String {
+    format!(
+        "{err} (the wipe blocks the PIN and PUK before erasing, so PIV may now be \
+         locked but not wiped — that is not bricked: re-run `keyroostctl \
+         factory-reset` to finish it)"
+    )
 }
 
 /// Run one card-applet reset step, mapping its result to a StepOutcome so a
@@ -4191,17 +4387,7 @@ fn reset_one_card_applet(
                         TransportError::PivForceResetUnsupported
                         | TransportError::PivForceResetIncomplete(_)
                         | TransportError::PivPukGuessAccepted => e.into(),
-                        // Anything else: force_reset blocks the PIN and PUK on
-                        // its way to RESET, so a failure here can leave a card
-                        // that is blocked but not wiped. That is not bricked —
-                        // a blocked card is exactly what the single-applet
-                        // reset finishes off.
-                        other => format!(
-                            "{other} (if the PIN and PUK became blocked before this \
-                             failed, the card is not bricked — `keyroostctl piv \
-                             reset --yes` finishes the wipe)"
-                        )
-                        .into(),
+                        other => piv_factory_reset_failure(&other.to_string()).into(),
                     }
                 })?;
             }
@@ -7961,11 +8147,24 @@ mod cli_tests {
         );
     }
 
-    /// Terse `Candidate` builder so the match tests read as tables.
+    /// Terse `Candidate` builder so the match tests read as tables. No USB ids:
+    /// the cases below are about serials and the sole-candidate rule, and with
+    /// the ids unknown `same_product` falls back to the model name.
     fn cand<'a>(serial: &'a str, model: &'a str, fido: bool) -> Candidate<'a> {
         Candidate {
             serial,
             model,
+            ids: None,
+            fido,
+        }
+    }
+
+    /// `cand` with USB ids, for the cases where the ids are what decides.
+    fn cand_ids<'a>(serial: &'a str, model: &'a str, ids: (u16, u16), fido: bool) -> Candidate<'a> {
+        Candidate {
+            serial,
+            model,
+            ids: Some(ids),
             fido,
         }
     }
@@ -7977,7 +8176,7 @@ mod cli_tests {
         // the reset was confirmed for, and it answers over FIDO: there is
         // nothing else it could be, so the reset goes ahead.
         assert_eq!(
-            reinserted_match("", "Security Key", &[cand("", "Security Key", true)]),
+            reinserted_match("", "Security Key", None, &[cand("", "Security Key", true)]),
             ReinsertMatch::Found(0)
         );
     }
@@ -7990,6 +8189,7 @@ mod cli_tests {
             reinserted_match(
                 "",
                 "Security Key",
+                None,
                 &[
                     cand("", "Security Key", true),
                     cand("12345678", "YubiKey", true)
@@ -8002,6 +8202,7 @@ mod cli_tests {
             reinserted_match(
                 "",
                 "Security Key",
+                None,
                 &[
                     cand("", "Security Key", true),
                     cand("", "Security Key", true)
@@ -8011,7 +8212,7 @@ mod cli_tests {
         );
         // A different model came back: not the confirmed key.
         assert_eq!(
-            reinserted_match("", "Security Key", &[cand("", "Solo 2", true)]),
+            reinserted_match("", "Security Key", None, &[cand("", "Solo 2", true)]),
             ReinsertMatch::NotPresent
         );
         // The lone key now reports a serial, so it is not the serial-less key
@@ -8020,18 +8221,19 @@ mod cli_tests {
             reinserted_match(
                 "",
                 "Security Key",
+                None,
                 &[cand("12345678", "Security Key", true)]
             ),
             ReinsertMatch::NotPresent
         );
         // Right model, no serial, but no FIDO HID interface to reset over.
         assert_eq!(
-            reinserted_match("", "Security Key", &[cand("", "Security Key", false)]),
+            reinserted_match("", "Security Key", None, &[cand("", "Security Key", false)]),
             ReinsertMatch::NotPresent
         );
         // Nothing plugged back in yet.
         assert_eq!(
-            reinserted_match("", "Security Key", &[]),
+            reinserted_match("", "Security Key", None, &[]),
             ReinsertMatch::NotPresent
         );
     }
@@ -8045,6 +8247,7 @@ mod cli_tests {
             reinserted_match(
                 "12345678",
                 "Security Key",
+                None,
                 &[cand("", "Security Key", true)]
             ),
             ReinsertMatch::NotPresent
@@ -8054,6 +8257,7 @@ mod cli_tests {
             reinserted_match(
                 "12345678",
                 "Security Key",
+                None,
                 &[cand("12345678", "Security Key", true)]
             ),
             ReinsertMatch::Found(0)
@@ -8064,6 +8268,7 @@ mod cli_tests {
             reinserted_match(
                 "12345678",
                 "Security Key",
+                None,
                 &[
                     cand("87654321", "Solo 2", true),
                     cand("12345678", "YubiKey 5", true)
@@ -8076,6 +8281,7 @@ mod cli_tests {
             reinserted_match(
                 "12345678",
                 "Security Key",
+                None,
                 &[cand("87654321", "Security Key", true)]
             ),
             ReinsertMatch::NotPresent
@@ -8085,6 +8291,7 @@ mod cli_tests {
             reinserted_match(
                 "12345678",
                 "Security Key",
+                None,
                 &[
                     cand("12345678", "Security Key", true),
                     cand("12345678", "Security Key", true)
@@ -8092,6 +8299,203 @@ mod cli_tests {
             ),
             ReinsertMatch::Ambiguous
         );
+    }
+
+    #[test]
+    fn factory_reset_only_calls_it_a_different_key_when_every_key_names_itself() {
+        // A YubiKey publishes no USB iSerialNumber, so right after a replug it
+        // is visible over HID with an empty serial and its real one only lands
+        // once the reader re-registers. That is the key coming back, not a
+        // swap — it must not be reported as one.
+        assert_eq!(
+            not_present_reason(&[""]),
+            NotPresentReason::Unidentified,
+            "a key that hasn't published its serial yet is not a different key"
+        );
+        // Same when it is one of several: anything unidentified leaves the
+        // question open.
+        assert_eq!(
+            not_present_reason(&["87654321", ""]),
+            NotPresentReason::Unidentified
+        );
+        // Nothing back in the port yet — also not an accusation.
+        assert_eq!(not_present_reason(&[]), NotPresentReason::Unidentified);
+        // Every visible key names itself and none of them is the pinned one:
+        // now, and only now, is a mismatch a fact.
+        assert_eq!(
+            not_present_reason(&["87654321"]),
+            NotPresentReason::DifferentKey
+        );
+        assert_eq!(
+            not_present_reason(&["87654321", "11112222"]),
+            NotPresentReason::DifferentKey
+        );
+    }
+
+    #[test]
+    fn factory_reset_unidentified_key_is_not_accused_of_being_a_swap() {
+        // The message the empty-serial case produces must not claim a swap, and
+        // must name the command that finishes the wipe without re-running the
+        // race — `factory-reset --yes` would just replay it.
+        let msg = not_present_message(
+            "YubiKey 5",
+            "12345678",
+            3,
+            "YubiKey 5 with no serial",
+            not_present_reason(&[""]),
+        );
+        assert!(
+            !msg.contains("is not the one this factory reset was confirmed for"),
+            "must not accuse a swap: {msg}"
+        );
+        assert!(msg.contains("did not come back with an identity"), "{msg}");
+        assert!(msg.contains("card interface"), "must say why: {msg}");
+        assert!(
+            msg.contains("`keyroostctl fido reset --yes`"),
+            "must name the way to finish the wipe: {msg}"
+        );
+
+        // …and the genuine mismatch still refuses in as many words.
+        let msg = not_present_message(
+            "YubiKey 5",
+            "12345678",
+            3,
+            "YubiKey 5 serial 87654321",
+            not_present_reason(&["87654321"]),
+        );
+        assert!(
+            msg.contains("is not the one this factory reset was confirmed for"),
+            "{msg}"
+        );
+        assert!(msg.contains("87654321"), "{msg}");
+        assert!(
+            !msg.contains("fido reset"),
+            "a different key must not be offered a shortcut to wiping it: {msg}"
+        );
+    }
+
+    #[test]
+    fn factory_reset_serial_less_key_is_matched_by_usb_ids_not_model_name() {
+        // The model name is read from the PC/SC reader name before the replug
+        // and from the HID product string after it. For a vendor whose reader
+        // name we don't normalize the two differ, and comparing them refuses
+        // the very key that just came back. The USB ids don't drift.
+        const NITROKEY: (u16, u16) = (0x20a0, 0x42b2);
+        assert_eq!(
+            reinserted_serial_less_target(
+                "Nitrokey 3",
+                Some(NITROKEY),
+                &[cand_ids("", "Nitrokey 3 NFC", NITROKEY, true)]
+            ),
+            ReinsertMatch::Found(0),
+            "same product, differently spelled model name: still the same key"
+        );
+        // A different product in the port is still refused — the ids are what
+        // does the disqualifying now.
+        assert_eq!(
+            reinserted_serial_less_target(
+                "Nitrokey 3",
+                Some(NITROKEY),
+                &[cand_ids("", "Nitrokey 3", (0x1050, 0x0407), true)]
+            ),
+            ReinsertMatch::NotPresent
+        );
+        // With the ids unknown on one side there is nothing better than the
+        // model name, so that rule stays in place as the fallback.
+        assert_eq!(
+            reinserted_serial_less_target("Nitrokey 3", None, &[cand("", "Nitrokey 3", true)]),
+            ReinsertMatch::Found(0)
+        );
+        assert_eq!(
+            reinserted_serial_less_target("Nitrokey 3", None, &[cand("", "Solo 2", true)]),
+            ReinsertMatch::NotPresent
+        );
+        // Matching ids do not loosen anything else: a second key still refuses,
+        // and a key with a serial is not the serial-less one that was pinned.
+        assert_eq!(
+            reinserted_serial_less_target(
+                "Nitrokey 3",
+                Some(NITROKEY),
+                &[
+                    cand_ids("", "Nitrokey 3", NITROKEY, true),
+                    cand_ids("", "Nitrokey 3", NITROKEY, true)
+                ]
+            ),
+            ReinsertMatch::Ambiguous
+        );
+        assert_eq!(
+            reinserted_serial_less_target(
+                "Nitrokey 3",
+                Some(NITROKEY),
+                &[cand_ids("12345678", "Nitrokey 3", NITROKEY, true)]
+            ),
+            ReinsertMatch::NotPresent
+        );
+    }
+
+    #[test]
+    fn factory_reset_keeps_polling_for_a_key_that_came_back_card_first() {
+        // The card side re-registered before the hidraw node existed: the key
+        // is the right one, but there is nothing to send CTAP over yet. Acting
+        // on it fails with "came back without a FIDO HID interface" while the
+        // budget that exists for exactly this moment is unspent — so keep
+        // polling instead.
+        let half = [cand("12345678", "YubiKey 5", false)];
+        assert!(!reinsert_settled(&ReinsertMatch::Found(0), &half));
+        // Once the FIDO interface shows up there is nothing left to wait for.
+        let whole = [cand("12345678", "YubiKey 5", true)];
+        assert!(reinsert_settled(&ReinsertMatch::Found(0), &whole));
+        // Nothing matched yet: keep looking until the deadline.
+        assert!(!reinsert_settled(&ReinsertMatch::NotPresent, &whole));
+        // Ambiguous stops at once, in both directions: a second key claiming
+        // the pinned identity is not something waiting can resolve, and the
+        // wait would only be spent to refuse anyway.
+        assert!(reinsert_settled(&ReinsertMatch::Ambiguous, &half));
+        assert!(reinsert_settled(&ReinsertMatch::Ambiguous, &whole));
+    }
+
+    #[test]
+    fn piv_factory_reset_failure_points_at_the_reset_that_can_finish() {
+        // A fault in the PUK loop leaves the PIN blocked and the PUK not, and
+        // the card refuses RESET until both are — so `piv reset` cannot finish
+        // the job in the state this message accompanies. Only re-running the
+        // factory reset works whether one credential ended up blocked or both.
+        let msg = piv_factory_reset_failure("PIV: unexpected status 6A80");
+        assert!(msg.contains("PIV: unexpected status 6A80"), "{msg}");
+        assert!(
+            !msg.contains("piv reset"),
+            "must not point at a command the card would refuse: {msg}"
+        );
+        assert!(msg.contains("`keyroostctl factory-reset`"), "{msg}");
+        assert!(
+            msg.contains("not bricked"),
+            "the user needs to know the card is recoverable: {msg}"
+        );
+    }
+
+    #[test]
+    fn factory_reset_consent_does_not_promise_the_key_stays_usable() {
+        // PIV's wipe blocks the PIN and PUK before erasing, so a run that stops
+        // in between leaves that applet locked and un-wiped. Consent must not
+        // be asked for on a promise the tool can't keep — same rule the GUI's
+        // confirmation follows.
+        assert!(!FACTORY_RESET_CONSENT.contains("stays usable"));
+        assert!(!FACTORY_RESET_CONSENT.contains("stays fully usable"));
+        assert!(
+            FACTORY_RESET_CONSENT
+                .contains("Each applet that completes comes back in factory condition"),
+            "{FACTORY_RESET_CONSENT}"
+        );
+        // The command's own help text is the other place the user reads this
+        // before consenting.
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let sub = cmd
+            .find_subcommand("factory-reset")
+            .expect("factory-reset subcommand");
+        let help = sub.clone().render_long_help().to_string();
+        assert!(!help.contains("stays fully usable"), "{help}");
+        assert!(help.contains("comes back in factory condition"), "{help}");
     }
 
     #[test]

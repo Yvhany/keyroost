@@ -70,19 +70,44 @@ fn credential_guess_from(raw: &[u8; GUESS_LEN], previous: Option<&[u8]>) -> Zero
 /// onto what the card is actually left holding.
 ///
 /// By that point the PIN and the PUK are deliberately blocked, so a card that
-/// *refuses* RESET is a card keyroost can no longer finish: the single-applet
-/// `piv reset` sends the identical instruction and gets the identical refusal.
-/// Only refusals are rewritten — a transport fault (card pulled, reader gone)
-/// is not the card saying no, and re-running the reset is still right there.
+/// *permanently* refuses RESET is a card keyroost can no longer finish: the
+/// single-applet `piv reset` sends the identical instruction and gets the
+/// identical refusal. Only the permanent refusals are rewritten — a transport
+/// fault (card pulled, reader gone) and an unspecific or transient status word
+/// are not the card saying "this instruction does not exist", and re-running
+/// the factory reset against a quiescent applet is still right there. The
+/// callers append that re-run hint to everything left falling through.
 fn map_reset_stage_error(e: TransportError) -> TransportError {
     match e {
-        // 6983 (RESET not allowed), 6982 (security status not satisfied), and
-        // the labelled catch-all that carries 6D00/6A81 from a card with no
-        // such instruction: every way the card can answer "no" to RESET.
+        // Two refusals, and only two, are the card's final word.
+        //
+        // 6983 (mapped to PivResetNotAllowed): the card checked the one
+        // precondition RESET has and says it is unmet — with the PIN and PUK
+        // already blocked, a second run reaches the same check and gets the
+        // same answer, so there is nothing left to retry.
+        //
+        // 6D00 (INS not supported) / 6A81 (function not supported): the
+        // vendor-extension RESET instruction is not implemented at all. No
+        // amount of retrying conjures it.
+        //
+        // Everything else the card can answer under this label — 6F00 (no
+        // precise diagnosis), 6881, a 6A82 from an applet that momentarily
+        // lost its selection after the blocking loops — says nothing about
+        // RESET being unavailable, so it must NOT be rewritten into a verdict
+        // of "permanently unusable". 6982 is deliberately absent for the same
+        // reason: RESET is not gated behind a security state, so a card
+        // answering "security status not satisfied" is in an unexpected
+        // transient state rather than declaring RESET impossible.
         TransportError::PivResetNotAllowed
-        | TransportError::PivSecurityNotSatisfied
         | TransportError::Apdu {
-            label: "piv reset", ..
+            label: "piv reset",
+            sw1: 0x6D,
+            sw2: 0x00,
+        }
+        | TransportError::Apdu {
+            label: "piv reset",
+            sw1: 0x6A,
+            sw2: 0x81,
         } => TransportError::PivForceResetIncomplete(
             "the PIN and the PUK are now both blocked, but the card refused the \
              RESET instruction, so the PIV applet was NOT wiped. Its keys and \
@@ -676,10 +701,11 @@ impl PivSession {
         }
 
         // 3. Both blocked — RESET should now succeed. If the card refuses it
-        //    anyway (the capability pre-check passes on either GET VERSION or
+        //    for good (the capability pre-check passes on either GET VERSION or
         //    GET SERIAL, so a card can clear it and still have no RESET), say
-        //    so honestly: this is the one exit that leaves a card nothing here
-        //    can rescue.
+        //    so honestly: that is the one exit that leaves a card nothing here
+        //    can rescue. An unspecific status word is not that exit and keeps
+        //    the caller's "re-run the factory reset" hint.
         self.reset().map_err(map_reset_stage_error)
     }
 
@@ -954,12 +980,12 @@ mod tests {
 
     #[test]
     fn reset_refusals_report_an_unrecoverable_card() {
-        // Every way the card can answer "no" to RESET, once the PIN and PUK are
-        // already blocked: 6983, 6982, and the labelled catch-all a card with no
-        // RESET instruction lands in (6D00 / 6A81).
+        // The card's final word on RESET, once the PIN and PUK are already
+        // blocked: 6983 (the one precondition RESET has, re-checked identically
+        // on a re-run) and the 6D00 / 6A81 pair that means the instruction does
+        // not exist. 6982 is NOT here — see reset_transient_refusals_fall_through.
         for e in [
             TransportError::PivResetNotAllowed,
-            TransportError::PivSecurityNotSatisfied,
             TransportError::Apdu {
                 label: "piv reset",
                 sw1: 0x6D,
@@ -979,6 +1005,49 @@ mod tests {
             assert!(text.contains("NOT wiped"));
             assert!(text.contains("no keyroost command"));
             assert!(!text.contains("re-run"));
+        }
+    }
+
+    #[test]
+    fn reset_transient_refusals_fall_through() {
+        // Status words the card can answer under the RESET label that say
+        // nothing about RESET being unavailable: 6F00 (no precise diagnosis),
+        // 6881, and a 6A82 from an applet that momentarily lost its selection
+        // after the blocking loops. The PIN and PUK really are blocked by then,
+        // but the applet is still resettable — re-running the factory reset
+        // against a quiescent applet succeeds — so calling the card
+        // permanently unusable would steer the user away from the fix. These
+        // pass through untouched and pick up the caller's re-run hint.
+        //
+        // 6982 (PivSecurityNotSatisfied) belongs here rather than with the
+        // terminal set: RESET is not gated behind a security state, so a card
+        // answering it is in an unexpected transient state, not declaring the
+        // instruction impossible.
+        for e in [
+            TransportError::Apdu {
+                label: "piv reset",
+                sw1: 0x6F,
+                sw2: 0x00,
+            },
+            TransportError::Apdu {
+                label: "piv reset",
+                sw1: 0x68,
+                sw2: 0x81,
+            },
+            TransportError::Apdu {
+                label: "piv reset",
+                sw1: 0x6A,
+                sw2: 0x82,
+            },
+            TransportError::PivSecurityNotSatisfied,
+        ] {
+            let before = e.to_string();
+            let mapped = map_reset_stage_error(e);
+            assert!(!matches!(
+                mapped,
+                TransportError::PivForceResetIncomplete(_)
+            ));
+            assert_eq!(mapped.to_string(), before);
         }
     }
 

@@ -253,7 +253,9 @@ fn reader_by_vendor(
 /// bus+address. Pass 2 lets the vendor guess take only what pass 1 left over, so
 /// a weak name-only match can never claim a reader ahead of the node that proved
 /// it is that reader's own sibling — which is how card operations ended up on one
-/// physical key while FIDO operations went to another, under a single row.
+/// physical key while FIDO operations went to another, under a single row. Pass 2
+/// also fails closed when two nodes guess the same reader: an unresolvable tie
+/// binds nobody rather than whoever the backend happened to enumerate first.
 ///
 /// Deterministic: both passes walk `hids` and `probes` in slice order; the
 /// `claimed` map is only ever looked up by key, never iterated.
@@ -285,12 +287,30 @@ fn bind_readers(
         if bound[i].is_some() || hid.usb_bus.is_some() {
             continue;
         }
-        if let Some(name) = reader_by_vendor(probes, yk_readers, hid)
+        let Some(name) = reader_by_vendor(probes, yk_readers, hid)
             .filter(|n| reader_is_bindable(&claimed, n, hid))
-        {
-            claimed.insert(name.clone(), (hid.usb_bus, hid.usb_address));
-            bound[i] = Some(name);
+        else {
+            continue;
+        };
+        // Fail closed on contention: with no topology on either side, several
+        // same-vendor nodes are *equally* good guesses for the one reader, and
+        // one of them is a FIDO-only key that has no card interface at all. The
+        // guess would then be pure enumeration order, and a wrong bind is not a
+        // cosmetic error — it points every FIDO operation on that row (PIN
+        // change, credential deletion, authenticatorReset) at a key the user did
+        // not select. Bind none of them and let the card and the FIDO node show
+        // as separate rows, exactly as they do when a reader is absent.
+        let contended = hids.iter().enumerate().any(|(j, h)| {
+            j != i
+                && bound[j].is_none()
+                && h.usb_bus.is_none()
+                && reader_by_vendor(probes, yk_readers, h).as_deref() == Some(name.as_str())
+        });
+        if contended {
+            continue;
         }
+        claimed.insert(name.clone(), (hid.usb_bus, hid.usb_address));
+        bound[i] = Some(name);
     }
     bound
 }
@@ -312,13 +332,14 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
         })
         .collect();
 
+    // Whole-set attribution: the single-reader fallback is refused when several
+    // topology-free nodes could each own that reader, so a FIDO-only key can
+    // never inherit another key's CCID serial (which would also defeat the
+    // re-check that a reset is talking to the key the user picked).
     let serials: Vec<Option<String>> = hids
         .iter()
-        .map(|h| {
-            h.serial_number
-                .clone()
-                .or_else(|| crate::ccid_serial_for(h, &yk_readers))
-        })
+        .zip(crate::ccid_serials_for(&hids, &yk_readers))
+        .map(|(h, s)| h.serial_number.clone().or(s))
         .collect();
 
     // Serials duplicated across the live HID set are NOT unique identity: two
@@ -1308,11 +1329,12 @@ mod tests {
         assert!(devs[0].transport.contains("FIDO HID"));
     }
 
-    #[test]
-    fn two_hid_nodes_never_bind_the_same_reader() {
-        // Two Yubico FIDO nodes with no reported topology and a single reader:
-        // the reader belongs to exactly one of them, so the second node must be
-        // refused rather than fused into the same row.
+    /// Two topology-free Yubico nodes and a single Yubico reader — the shape
+    /// hidapi reports on Windows and macOS, where `usb_bus` is always `None`, so
+    /// the vendor guess is the only correlation path. One of these nodes is a
+    /// FIDO-only key with no card interface at all, but nothing in the reported
+    /// data says which. Returned in the given enumeration order.
+    fn topology_free_yubico_pair(fido_only_first: bool) -> Vec<Device> {
         let probes = [probe(
             "Yubico YubiKey OTP+FIDO+CCID 00 00",
             false,
@@ -1323,19 +1345,156 @@ mod tests {
             None,
             None,
         )];
-        let hids = [
-            hid(0x1050, 0x0407, "/dev/hidraw17", None, None, None),
-            hid(0x1050, 0x0406, "/dev/hidraw18", None, None, None),
-        ];
+        let card_sibling = hid(0x1050, 0x0407, "/dev/hidraw17", None, None, None);
+        let fido_only = hid(0x1050, 0x0406, "/dev/hidraw18", None, None, None);
+        let hids = if fido_only_first {
+            [fido_only, card_sibling]
+        } else {
+            [card_sibling, fido_only]
+        };
+        correlate(&hids, &probes, &Keyring::default())
+    }
+
+    #[test]
+    fn two_topology_free_nodes_contending_for_one_reader_bind_none() {
+        // Neither node can be shown to own the reader, and guessing sends every
+        // FIDO operation on that row — PIN change, credential deletion,
+        // authenticatorReset — to whichever key the backend enumerated first.
+        // The reader therefore stays on its own row, the same shape produced
+        // when a key's reader is absent. Asserted in BOTH orders: the previous
+        // test only checked that the reader was claimed once and that two hidraw
+        // paths existed, which is true of the wrong binding too.
+        for fido_only_first in [true, false] {
+            let devs = topology_free_yubico_pair(fido_only_first);
+            assert_eq!(
+                devs.len(),
+                3,
+                "the card and both FIDO nodes each get their own row \
+                 (fido_only_first = {fido_only_first})"
+            );
+            let claimed: Vec<&Device> = devs.iter().filter(|d| d.reader.is_some()).collect();
+            assert_eq!(
+                claimed.len(),
+                1,
+                "one reader, one row (fido_only_first = {fido_only_first})"
+            );
+            assert_eq!(
+                claimed[0].hid_path, None,
+                "an unresolvable tie must bind no FIDO node to the reader \
+                 (fido_only_first = {fido_only_first})"
+            );
+            let mut paths: Vec<String> = devs
+                .iter()
+                .filter_map(|d| d.hid_path.as_ref().map(|p| p.display().to_string()))
+                .collect();
+            paths.sort();
+            assert_eq!(
+                paths,
+                ["/dev/hidraw17", "/dev/hidraw18"],
+                "each FIDO node keeps its own hidraw node (fido_only_first = {fido_only_first})"
+            );
+        }
+    }
+
+    #[test]
+    fn contended_reader_serial_is_never_stamped_on_a_fido_row() {
+        // The reader's CCID serial identifies exactly one physical key. Handing
+        // it to both FIDO rows would make them indistinguishable — and would
+        // defeat the re-check that a reset ran against the key the user picked.
+        for fido_only_first in [true, false] {
+            let devs = topology_free_yubico_pair(fido_only_first);
+            let holders = devs.iter().filter(|d| d.serial == "11111111").count();
+            assert_eq!(
+                holders, 1,
+                "only the card row may report the CCID serial \
+                 (fido_only_first = {fido_only_first})"
+            );
+            for d in devs.iter().filter(|d| d.hid_path.is_some()) {
+                assert!(
+                    d.serial.is_empty(),
+                    "a FIDO row must not inherit the card's serial \
+                     (fido_only_first = {fido_only_first})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn single_topology_free_node_still_merges_with_its_reader() {
+        // The common Windows/macOS case, and the one the contention rule must
+        // not cost us: one key, one reader, nothing to contend with — they merge
+        // into a single row carrying both the reader and the FIDO node.
+        let probes = [probe(
+            "Yubico YubiKey OTP+FIDO+CCID 00 00",
+            false,
+            true,
+            false,
+            false,
+            Some("11111111"),
+            None,
+            None,
+        )];
+        let hids = [hid(0x1050, 0x0407, "/dev/hidraw17", None, None, None)];
         let devs = correlate(&hids, &probes, &Keyring::default());
+        assert_eq!(devs.len(), 1, "one key must still be one row");
+        assert_eq!(devs[0].serial, "11111111");
         assert_eq!(
-            devs.iter().filter(|d| d.reader.is_some()).count(),
-            1,
-            "the reader may be claimed once"
+            devs[0].hid_path.as_deref(),
+            Some(std::path::Path::new("/dev/hidraw17"))
         );
-        let paths: std::collections::HashSet<_> =
-            devs.iter().filter_map(|d| d.hid_path.clone()).collect();
-        assert_eq!(paths.len(), 2, "each FIDO node keeps its own hidraw node");
+        assert_eq!(
+            devs[0].reader.as_deref(),
+            Some("Yubico YubiKey OTP+FIDO+CCID 00 00")
+        );
+        assert!(devs[0].caps.has(Caps::FIDO2) && devs[0].caps.has(Caps::OATH));
+    }
+
+    #[test]
+    fn reported_topology_is_unaffected_by_the_contention_rule() {
+        // Same two Yubico keys, but on a backend that reports bus+address (the
+        // sysfs path): pass 1 settles ownership on hard evidence, so the tie
+        // never arises and the card key keeps its own FIDO node in either order.
+        for fido_only_first in [true, false] {
+            let probes = [probe(
+                "Yubico YubiKey OTP+FIDO+CCID 00 00",
+                false,
+                true,
+                false,
+                false,
+                Some("11111111"),
+                Some(9),
+                Some(16),
+            )];
+            let card_sibling = hid(0x1050, 0x0407, "/dev/hidraw17", None, Some(9), Some(16));
+            let fido_only = hid(0x1050, 0x0406, "/dev/hidraw18", None, Some(9), Some(20));
+            let hids = if fido_only_first {
+                [fido_only, card_sibling]
+            } else {
+                [card_sibling, fido_only]
+            };
+            let devs = correlate(&hids, &probes, &Keyring::default());
+            assert_eq!(devs.len(), 2, "two physical keys must stay two devices");
+            let card = devs
+                .iter()
+                .find(|d| d.reader.is_some())
+                .expect("the card key keeps its reader");
+            assert_eq!(
+                card.hid_path.as_deref(),
+                Some(std::path::Path::new("/dev/hidraw17")),
+                "the reader-backed row must carry its OWN FIDO node \
+                 (fido_only_first = {fido_only_first})"
+            );
+            assert_eq!(card.serial, "11111111");
+            let alone = devs
+                .iter()
+                .find(|d| d.reader.is_none())
+                .expect("the FIDO-only key stands alone");
+            assert_eq!(
+                alone.hid_path.as_deref(),
+                Some(std::path::Path::new("/dev/hidraw18"))
+            );
+            assert!(alone.serial.is_empty());
+        }
     }
 }
 

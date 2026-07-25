@@ -852,6 +852,9 @@ fn factory_reset_row_line(row: &FactoryResetRow) -> (String, RowTone) {
 /// selection (so nothing clears the report in between), and a row still
 /// reading "failed" after a wipe that succeeded tells the user their passkeys
 /// and PIN survived on a key that is actually empty. The latest outcome wins.
+///
+/// Only a caller that actually attempted the wipe may use this. Everything
+/// else takes [`resolve_pending_fido_reset_row`].
 fn resolve_fido_reset_row(rows: &mut [FactoryResetRow], outcome: keyroost_resolve::StepOutcome) {
     if let Some(row) = rows.iter_mut().find(|r| match r {
         FactoryResetRow::FidoPending => true,
@@ -861,6 +864,63 @@ fn resolve_fido_reset_row(rows: &mut [FactoryResetRow], outcome: keyroost_resolv
             step: keyroost_resolve::ResetStep::Fido,
             outcome,
         });
+    }
+}
+
+/// Resolve the FIDO row only while it is still waiting on the ceremony.
+///
+/// For callers that end a *dialog* rather than a wipe: cancelling the modal, or
+/// refusing to arm it. They can't know whether the dialog they just closed was
+/// the factory reset's finale or a standalone "Reset key" the user opened
+/// afterwards — and the report survives both a tab switch and a replug, so a
+/// stale one is still on screen. Overwriting an answered row from here turns a
+/// finished "FIDO2 wiped" into "FIDO2 failed" the moment the user opens the
+/// FIDO2 tab and backs out of the reset dialog, inviting them to repeat an
+/// irreversible ceremony that already succeeded. A pending row is the only
+/// evidence that this dialog owns the finale, so it is the only row these
+/// callers may write.
+fn resolve_pending_fido_reset_row(
+    rows: &mut [FactoryResetRow],
+    outcome: keyroost_resolve::StepOutcome,
+) {
+    if let Some(row) = rows
+        .iter_mut()
+        .find(|r| matches!(r, FactoryResetRow::FidoPending))
+    {
+        *row = FactoryResetRow::Step(keyroost_resolve::StepReport {
+            step: keyroost_resolve::ResetStep::Fido,
+            outcome,
+        });
+    }
+}
+
+/// Render a forced PIV wipe's failure for the report pane.
+///
+/// `force_reset` blocks the PIN and then the PUK on its way to RESET, so a
+/// failure between the blocking and the wipe leaves a card that is locked but
+/// not erased. The confirmation modal promises the report says which state the
+/// card is in, so every failure has to carry that.
+///
+/// Three variants already say it themselves — the card refused before anything
+/// was blocked, the run stopped part-way (carrying the state), or the throwaway
+/// PUK guess was accepted — and appending to those would contradict them.
+/// Everything else (a transport error mid-loop, an unexpected status word the
+/// PIN/PUK mapping renders as a bare APDU failure, a host RNG failure) arrives
+/// as text that says nothing about the blocking, so the disclosure is appended.
+///
+/// The way out is to run the factory reset again, not the single-applet PIV
+/// reset: a fault in the PUK loop leaves the PIN blocked and the PUK *not*
+/// blocked, and the card refuses a plain RESET until both are blocked.
+fn piv_force_reset_message(e: TransportError) -> String {
+    match e {
+        TransportError::PivForceResetUnsupported
+        | TransportError::PivForceResetIncomplete(_)
+        | TransportError::PivPukGuessAccepted => e.to_string(),
+        other => format!(
+            "{other} (the wipe blocks the PIN and PUK before erasing, so PIV may \
+             now be locked but not wiped \u{2014} that is not bricked: run the \
+             factory reset again to finish it)"
+        ),
     }
 }
 
@@ -893,11 +953,7 @@ fn run_card_reset_step(
                 let name = reader.ok_or("no PC/SC reader for the PIV applet")?;
                 let mut s =
                     keyroost_transport::PivSession::open(name).map_err(|e| e.to_string())?;
-                // force_reset's failures now name the state the card is actually
-                // in (refused before anything was blocked / stopped part-way /
-                // the throwaway PUK guess was accepted), so pass them through
-                // rather than appending a guess about recovery.
-                s.force_reset().map_err(|e| e.to_string())?;
+                s.force_reset().map_err(piv_force_reset_message)?;
             }
             ResetStep::Token2Otp => {
                 // The OTP applet lives on the FIDO HID node when present, else on
@@ -4606,13 +4662,118 @@ impl App {
         }
     }
 
+    /// Fold a finished card sweep into the app, bound to the key it ran
+    /// against. Lifted out of `run_factory_reset_gui`'s apply closure for the
+    /// same reason as [`App::apply_reset_path_outcome`]: the device-binding
+    /// rule is the part worth testing, and it needs no key in hand.
+    ///
+    /// The orphaned case is louder here than anywhere else in the file. By the
+    /// time this runs, every card step has already been executed against the
+    /// key the sweep was dispatched for — OATH, OpenPGP, PIV and the Token2 OTP
+    /// applet are wiped or half-wiped whatever the selection now says.
+    /// `reports` is the only record of that, and it carries the one line that
+    /// tells "wiped" apart from "PIN and PUK blocked but not wiped" (PIV's
+    /// failure text). Dropping it silently loses the difference, so an outcome
+    /// that outlives its selection is said out loud in the log instead.
+    fn apply_factory_reset_sweep(
+        app: &mut App,
+        for_device: Option<&DeviceId>,
+        reports: Vec<keyroost_resolve::StepReport>,
+        ends_in_fido: bool,
+    ) {
+        use keyroost_resolve::{ResetStep, StepOutcome};
+        if !completion_still_valid(for_device, app.selected_device.as_ref()) {
+            // Selection changed mid-sweep; don't paint A's outcome under B —
+            // and deliberately don't open the FIDO dialog either, because
+            // arming a wipe under the key on screen now is exactly what the
+            // guard exists to prevent.
+            let wiped: Vec<&str> = reports
+                .iter()
+                .filter(|r| matches!(r.outcome, StepOutcome::Wiped))
+                .map(|r| r.step.label())
+                .collect();
+            let failed: Vec<String> = reports
+                .iter()
+                .filter_map(|r| match &r.outcome {
+                    StepOutcome::Failed(e) => Some(format!("{}: {e}", r.step.label())),
+                    _ => None,
+                })
+                .collect();
+            let wiped_txt = if wiped.is_empty() {
+                "nothing".to_string()
+            } else {
+                wiped.join(", ")
+            };
+            let failed_txt = if failed.is_empty() {
+                "nothing".to_string()
+            } else {
+                failed.join("; ")
+            };
+            let fido_txt = if ends_in_fido {
+                format!(
+                    " {} was left un-wiped \u{2014} the replug-and-touch ceremony never started.",
+                    ResetStep::Fido.label()
+                )
+            } else {
+                String::new()
+            };
+            app.log(
+                Severity::Warn,
+                format!(
+                    "a factory reset finished after the selection moved on \u{2014} wiped: \
+                     {wiped_txt}; not wiped: {failed_txt}.{fido_txt} Re-select that key to see \
+                     its current state and finish the reset."
+                ),
+            );
+            return;
+        }
+        // Re-initialise each wiped applet's pane to a fresh, empty state
+        // (mirrors the OATH reset apply), clearing its "tried" flag so the
+        // pane re-lists on its own.
+        for r in &reports {
+            if matches!(r.outcome, StepOutcome::Wiped) {
+                match r.step {
+                    ResetStep::Oath => {
+                        app.oath = OathState::default();
+                        app.oath_tried = false;
+                    }
+                    ResetStep::OpenPgp => {
+                        app.openpgp = OpenPgpState::default();
+                    }
+                    ResetStep::Piv => {
+                        app.piv = PivState::default();
+                        app.piv_tried = false;
+                    }
+                    ResetStep::Token2Otp => {
+                        app.otp = OtpState::default();
+                        app.otp_tried = false;
+                    }
+                    ResetStep::Fido => {}
+                }
+            }
+        }
+        app.factory_reset_report = reports.into_iter().map(FactoryResetRow::Step).collect();
+        // Hand the FIDO finale to the tested armed-reset flow. Seed its
+        // report row first: the ceremony can fail (no touch in time) or
+        // be abandoned, and the pane must not read as a finished wipe
+        // until FIDO actually answers — that outcome is routed to
+        // `security_keys.error`, which the Overview tab never paints.
+        if ends_in_fido {
+            app.factory_reset_report.push(FactoryResetRow::FidoPending);
+            app.security_keys.reset = ResetDialog {
+                open: true,
+                ..Default::default()
+            };
+        }
+    }
+
     /// Run a whole-device factory reset: sweep every card applet in the shared
     /// plan off the UI thread (continue-on-error), record a per-step report,
     /// re-initialise the wiped panes, and — when the plan ends in FIDO — hand
     /// the finale to the existing armed `ResetDialog` (which owns the replug +
     /// touch ceremony), so no new FIDO logic is written here.
     fn run_factory_reset_gui(&mut self) -> bool {
-        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        use keyroost_resolve::{ResetStep, StepReport};
         let Some(dev) = self.selected_device().cloned() else {
             return false;
         };
@@ -4641,47 +4802,7 @@ impl App {
                 reports.push(StepReport { step, outcome });
             }
             Box::new(move |app: &mut App| {
-                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                    return; // selection changed mid-reset; don't paint A's outcome under B
-                }
-                // Re-initialise each wiped applet's pane to a fresh, empty state
-                // (mirrors the OATH reset apply), clearing its "tried" flag so the
-                // pane re-lists on its own.
-                for r in &reports {
-                    if matches!(r.outcome, StepOutcome::Wiped) {
-                        match r.step {
-                            ResetStep::Oath => {
-                                app.oath = OathState::default();
-                                app.oath_tried = false;
-                            }
-                            ResetStep::OpenPgp => {
-                                app.openpgp = OpenPgpState::default();
-                            }
-                            ResetStep::Piv => {
-                                app.piv = PivState::default();
-                                app.piv_tried = false;
-                            }
-                            ResetStep::Token2Otp => {
-                                app.otp = OtpState::default();
-                                app.otp_tried = false;
-                            }
-                            ResetStep::Fido => {}
-                        }
-                    }
-                }
-                app.factory_reset_report = reports.into_iter().map(FactoryResetRow::Step).collect();
-                // Hand the FIDO finale to the tested armed-reset flow. Seed its
-                // report row first: the ceremony can fail (no touch in time) or
-                // be abandoned, and the pane must not read as a finished wipe
-                // until FIDO actually answers — that outcome is routed to
-                // `security_keys.error`, which the Overview tab never paints.
-                if ends_in_fido {
-                    app.factory_reset_report.push(FactoryResetRow::FidoPending);
-                    app.security_keys.reset = ResetDialog {
-                        open: true,
-                        ..Default::default()
-                    };
-                }
+                App::apply_factory_reset_sweep(app, for_device.as_ref(), reports, ends_in_fido)
             })
         })
     }
@@ -4795,7 +4916,10 @@ impl App {
             self.reset_arm = None;
             // If this dialog was a factory reset's FIDO finale, say so in the
             // report rather than leaving a row that reads as still in progress.
-            resolve_fido_reset_row(
+            // Pending-only: a row that already answered belongs to an earlier
+            // ceremony this cancel didn't undo (the report outlives the dialog),
+            // and rewriting a completed wipe as "failed" asks for it again.
+            resolve_pending_fido_reset_row(
                 &mut self.factory_reset_report,
                 keyroost_resolve::StepOutcome::Failed(
                     "cancelled \u{2014} the passkeys and PIN are still on this key".into(),
@@ -4823,6 +4947,14 @@ impl App {
             .filter(|s| !s.is_empty());
         if target_serial.is_none() && target_effective_serial.is_none() {
             self.security_keys.reset = ResetDialog::default();
+            // Ending the dialog ends the ceremony behind it, exactly as Cancel
+            // does. Reaching this branch with an arm already live is possible —
+            // the dialog reverts to its confirm form whenever the arm's key is
+            // no longer the selection, so "Arm reset" can be pressed a second
+            // time — and saying "not armed" while the earlier arm keeps polling
+            // is the one combination that wipes a key after telling the user
+            // nothing would happen.
+            self.reset_arm = None;
             let msg = "not armed \u{2014} this key exposes no serial to re-identify it by after \
                        a replug, so the armed reset can't safely target it. Run `keyroostctl \
                        fido reset --yes` within ~10 s of plugging the key in instead."
@@ -4834,8 +4966,10 @@ impl App {
             // (Overview) when this was a factory reset's finale, and
             // `security_keys.error` (the FIDO2 pane the standalone Reset button
             // lives on) either way. Leaving the seeded row pending would ask
-            // for a replug-and-touch ceremony that is never coming.
-            resolve_fido_reset_row(
+            // for a replug-and-touch ceremony that is never coming. Pending-only
+            // for the same reason as the cancel branch: nothing was attempted
+            // here, so an already-answered row is not this refusal's to rewrite.
+            resolve_pending_fido_reset_row(
                 &mut self.factory_reset_report,
                 keyroost_resolve::StepOutcome::Failed(msg.clone()),
             );
@@ -4888,6 +5022,26 @@ impl App {
     /// exposes one, else by the resolver's effective (CCID-read) serial; a
     /// fresh same-model path alone never fires the reset (KEY-005).
     fn poll_reset_arm(&mut self) {
+        // Defence in depth. `on_device_selected` is the sole owner of ending an
+        // armed ceremony, which means every path that moves the selection has
+        // to route through it — one that forgets (the failed-scan path did)
+        // leaves this poll firing an irreversible wipe for a key the UI has
+        // moved off, with the dialog showing its un-armed confirm form (its
+        // "now unplug the key" prompt is device-scoped for the same reason).
+        // Cheaper to re-check the binding here than to rely on one owner.
+        if !self.reset_arm.as_ref().is_some_and(|arm| {
+            completion_still_valid(arm.for_device.as_ref(), self.selected_device.as_ref())
+        }) {
+            if self.reset_arm.take().is_some() {
+                self.log(
+                    Severity::Warn,
+                    "the armed reset was cancelled \u{2014} the key it was armed for is no longer \
+                     the one selected. Re-open \u{201C}Reset key\u{201D} on the key you want to \
+                     wipe.",
+                );
+            }
+            return;
+        }
         let current = Self::fido_devices();
         let mut fire: Option<std::path::PathBuf> = None;
         if let Some(arm) = self.reset_arm.as_mut() {
@@ -5621,13 +5775,30 @@ impl App {
                         app.on_device_selected();
                     }
                 }
-                Err(e) => {
-                    app.devices_error = Some(e);
-                    app.devices.clear();
-                    app.selected_device = None;
-                }
+                Err(e) => App::apply_device_scan_failure(app, e),
             })
         });
+    }
+
+    /// A scan that failed outright: no device list, and therefore no selection.
+    /// Lifted out of `refresh_devices`'s apply closure so the teardown rule is
+    /// exercisable without hardware.
+    ///
+    /// Clearing the selection here is a selection *change* like any other, and
+    /// has to run the same teardown — `on_device_selected` is the sole owner of
+    /// ending an armed FIDO ceremony, so assigning `None` directly left the arm
+    /// live with nothing selected: the dialog (device-scoped) repaints its
+    /// un-armed confirm form while the poll goes on watching for the replug,
+    /// and every rescan path is suppressed while an arm exists, so the empty
+    /// list could never recover on its own.
+    fn apply_device_scan_failure(app: &mut App, error: String) {
+        app.devices_error = Some(error);
+        app.devices.clear();
+        if app.selected_device.take().is_some() {
+            // Same teardown as any other selection change. With nothing
+            // selected it returns before dispatching any read.
+            app.on_device_selected();
+        }
     }
 
     /// Select a device by id (no-op if already selected).
@@ -14389,6 +14560,99 @@ mod tests {
             factory_reset_row_line(&cards[0]),
             ("OpenPGP  failed: blocked".to_string(), RowTone::Bad)
         );
+
+        // …but replace-any is the *attempt* caller's privilege alone. Closing a
+        // dialog attempts nothing, so a wipe that already landed has to survive
+        // it: the report outlives the ceremony (a tab switch and a replug both
+        // leave it standing), so the next dialog the user cancels is routinely
+        // not the one this row came from.
+        resolve_pending_fido_reset_row(
+            &mut rows,
+            StepOutcome::Failed(
+                "cancelled \u{2014} the passkeys and PIN are still on this key".into(),
+            ),
+        );
+        assert_eq!(
+            factory_reset_row_line(&rows[1]),
+            ("FIDO2  wiped".to_string(), RowTone::Done),
+            "a cancel must not rewrite a finished wipe into a failure"
+        );
+        assert_eq!(rows.len(), 2);
+    }
+
+    /// The pending-only resolver still has to answer the row it *is* for: a
+    /// factory reset whose FIDO finale the user cancels must stop reading
+    /// "waiting for the unplug, replug, and touch" — that ceremony is over and
+    /// the passkeys really are still there.
+    #[test]
+    fn cancelling_the_finale_resolves_a_pending_fido_row() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let mut rows = vec![
+            FactoryResetRow::Step(StepReport {
+                step: ResetStep::Oath,
+                outcome: StepOutcome::Wiped,
+            }),
+            FactoryResetRow::FidoPending,
+        ];
+        resolve_pending_fido_reset_row(&mut rows, StepOutcome::Failed("cancelled".into()));
+        assert_eq!(
+            factory_reset_row_line(&rows[1]),
+            ("FIDO2  failed: cancelled".to_string(), RowTone::Bad)
+        );
+        // A second cancel (the standalone dialog, opened and backed out of) has
+        // nothing left to resolve and must leave the answer alone.
+        resolve_pending_fido_reset_row(&mut rows, StepOutcome::Failed("cancelled again".into()));
+        assert_eq!(
+            factory_reset_row_line(&rows[1]),
+            ("FIDO2  failed: cancelled".to_string(), RowTone::Bad)
+        );
+        // And it never invents a row where no factory reset is in flight.
+        let mut empty: Vec<FactoryResetRow> = Vec::new();
+        resolve_pending_fido_reset_row(&mut empty, StepOutcome::Failed("cancelled".into()));
+        assert!(empty.is_empty());
+    }
+
+    /// A forced PIV wipe blocks the PIN and PUK before it erases, so a failure
+    /// in between leaves the applet locked but intact. The confirmation modal
+    /// promises the report says so — which means every failure that doesn't
+    /// already describe the card's state has to carry the disclosure, matching
+    /// what the CLI's factory reset prints for the same failures.
+    #[test]
+    fn piv_force_reset_failures_disclose_the_blocked_credentials() {
+        // Self-describing variants pass through untouched: appending "run the
+        // factory reset again" would contradict them (Unsupported never blocked
+        // anything; the other two already say what to do).
+        let unsupported = piv_force_reset_message(TransportError::PivForceResetUnsupported);
+        assert_eq!(
+            unsupported,
+            TransportError::PivForceResetUnsupported.to_string()
+        );
+        let incomplete =
+            piv_force_reset_message(TransportError::PivForceResetIncomplete("card state here"));
+        assert_eq!(incomplete, "card state here");
+        let guessed = piv_force_reset_message(TransportError::PivPukGuessAccepted);
+        assert_eq!(guessed, TransportError::PivPukGuessAccepted.to_string());
+
+        // Everything else says nothing about the blocking on its own — an
+        // unexpected status word in the PIN/PUK loop renders as a bare APDU
+        // failure — so the disclosure is appended.
+        let bare = piv_force_reset_message(TransportError::Apdu {
+            label: "piv pin/puk",
+            sw1: 0x6a,
+            sw2: 0x80,
+        });
+        assert!(bare.contains("piv pin/puk"), "{bare}");
+        assert!(
+            bare.contains("locked but not wiped"),
+            "the half-wiped state has to be named: {bare}"
+        );
+        assert!(
+            bare.contains("run the factory reset again"),
+            "the way out has to be named: {bare}"
+        );
+        // Not the single-applet reset: a fault in the PUK loop leaves the PUK
+        // unblocked, and the card refuses a plain RESET until both are blocked.
+        assert!(!bare.contains("piv reset"), "{bare}");
     }
 
     /// Refusing to arm (KEY-005: no serial to re-identify the key by after a
@@ -14613,6 +14877,264 @@ mod tests {
                 .any(|l| l.text.contains("the armed reset was cancelled")),
             "the cancelled ceremony must be reported"
         );
+    }
+
+    /// A test arm for whichever key `for_device` names. The identity fields are
+    /// irrelevant to the teardown rules these tests exercise; what matters is
+    /// that a live ceremony exists.
+    fn armed_for(for_device: &str) -> ResetArm {
+        ResetArm {
+            target_serial: Some("AAA".into()),
+            target_path: None,
+            target_ids: None,
+            target_effective_serial: Some("AAA".into()),
+            for_device: Some(for_device.into()),
+            prev_paths: Vec::new(),
+            saw_removal: true,
+        }
+    }
+
+    /// The card sweep wipes four applets before its outcome comes back, so a
+    /// selection that moved in between cannot undo any of it. The report is the
+    /// only record — PIV's failure text is the one place "wiped" is told apart
+    /// from "PIN and PUK blocked but not wiped" — so it cannot be dropped in
+    /// silence. And the FIDO finale must NOT open: arming an irreversible wipe
+    /// under whichever key is on screen now is what the guard exists to stop.
+    #[test]
+    fn an_orphaned_card_sweep_is_logged_and_arms_nothing() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let a: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some("serial:BBB".into()),
+            ..Default::default()
+        };
+        let piv_failure = "PIN and PUK are blocked but the applet was not wiped";
+        let reports = vec![
+            StepReport {
+                step: ResetStep::Oath,
+                outcome: StepOutcome::Wiped,
+            },
+            StepReport {
+                step: ResetStep::OpenPgp,
+                outcome: StepOutcome::Wiped,
+            },
+            StepReport {
+                step: ResetStep::Piv,
+                outcome: StepOutcome::Failed(piv_failure.into()),
+            },
+        ];
+
+        App::apply_factory_reset_sweep(&mut app, Some(&a), reports, true);
+
+        // Nothing of A's run is painted under B…
+        assert!(
+            app.factory_reset_report.is_empty(),
+            "A's report must not appear under B"
+        );
+        // …and above all, B is not armed for a wipe the user confirmed for A.
+        assert!(
+            !app.security_keys.reset.open,
+            "the FIDO finale must never open under another key"
+        );
+        assert!(app.reset_arm.is_none());
+
+        let warn = app
+            .log
+            .iter()
+            .find(|l| l.text.contains("selection moved on"))
+            .unwrap_or_else(|| panic!("a wipe that lands off-screen must still be recorded"));
+        assert!(matches!(warn.severity, Severity::Warn));
+        let text = &warn.text;
+        assert!(text.contains("OATH"), "{text}");
+        assert!(text.contains("OpenPGP"), "{text}");
+        assert!(text.contains("PIV"), "{text}");
+        assert!(
+            text.contains(piv_failure),
+            "PIV's exact failure is the only thing that says the card is locked \
+             but not wiped: {text}"
+        );
+        assert!(
+            text.contains("FIDO2") && text.contains("never started"),
+            "the un-wiped finale has to be named: {text}"
+        );
+
+        // A plan without FIDO says nothing about a ceremony that was never in it.
+        let mut app = App {
+            selected_device: Some("serial:BBB".into()),
+            ..Default::default()
+        };
+        App::apply_factory_reset_sweep(
+            &mut app,
+            Some(&a),
+            vec![StepReport {
+                step: ResetStep::Oath,
+                outcome: StepOutcome::Wiped,
+            }],
+            false,
+        );
+        let text = &app
+            .log
+            .iter()
+            .find(|l| l.text.contains("selection moved on"))
+            .expect("still logged")
+            .text;
+        assert!(!text.contains("FIDO2"), "{text}");
+    }
+
+    /// The same sweep under the key it ran against still paints its report and
+    /// still hands the finale to the armed dialog — the guard must not cost the
+    /// normal flow its outcome.
+    #[test]
+    fn a_same_device_card_sweep_paints_its_report_and_opens_the_finale() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let a: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(a.clone()),
+            oath_tried: true,
+            piv_tried: true,
+            ..Default::default()
+        };
+
+        App::apply_factory_reset_sweep(
+            &mut app,
+            Some(&a),
+            vec![
+                StepReport {
+                    step: ResetStep::Oath,
+                    outcome: StepOutcome::Wiped,
+                },
+                StepReport {
+                    step: ResetStep::Piv,
+                    outcome: StepOutcome::Failed("card refused".into()),
+                },
+            ],
+            true,
+        );
+
+        assert_eq!(app.factory_reset_report.len(), 3);
+        assert_eq!(
+            factory_reset_row_line(&app.factory_reset_report[0]),
+            ("OATH  wiped".to_string(), RowTone::Done)
+        );
+        assert_eq!(
+            factory_reset_row_line(&app.factory_reset_report[1]).1,
+            RowTone::Bad
+        );
+        assert_eq!(
+            factory_reset_row_line(&app.factory_reset_report[2]).1,
+            RowTone::Waiting,
+            "the finale is seeded pending, not reported as done"
+        );
+        assert!(app.security_keys.reset.open, "the finale's dialog opens");
+        // A wiped applet's pane re-lists itself; a failed one keeps its state.
+        assert!(!app.oath_tried);
+        assert!(app.piv_tried);
+        assert!(!app
+            .log
+            .iter()
+            .any(|l| l.text.contains("selection moved on")));
+    }
+
+    /// Refusing to arm (KEY-005) ends the ceremony, exactly as Cancel does. An
+    /// earlier arm can still be live when this branch is reached — the dialog
+    /// reverts to its confirm form whenever the arm's key is no longer the
+    /// selection, so "Arm reset" is pressable a second time — and telling the
+    /// user "not armed" while that arm keeps polling wipes the key on its next
+    /// replug after the UI said nothing would happen.
+    #[test]
+    fn refusing_to_arm_clears_a_live_arm() {
+        let mut app = App {
+            security_keys: SecurityKeysState {
+                reset: ResetDialog {
+                    open: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            reset_arm: Some(armed_for("serial:AAA")),
+            ..Default::default()
+        };
+
+        // Nothing selected: no HID serial and no effective serial — the refusal
+        // branch, reached without touching a key.
+        app.arm_fido_reset();
+
+        assert!(
+            app.reset_arm.is_none(),
+            "a refusal that says \"not armed\" must not leave a ceremony polling"
+        );
+        assert!(!app.security_keys.reset.open);
+    }
+
+    /// A scan can fail outright (pcscd down, a wedged reader), which empties the
+    /// list and the selection. That is a selection change like any other and has
+    /// to run the same teardown: otherwise the arm stays live with nothing
+    /// selected, the dialog repaints its un-armed confirm form while the poll
+    /// keeps watching for the replug, and every rescan path is suppressed while
+    /// an arm exists — so the empty list can never recover.
+    #[test]
+    fn a_failed_scan_disarms_the_reset() {
+        let mut app = App {
+            selected_device: Some("serial:AAA".into()),
+            reset_arm: Some(armed_for("serial:AAA")),
+            security_keys: SecurityKeysState {
+                reset: ResetDialog {
+                    open: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        App::apply_device_scan_failure(&mut app, "pcsc: no service".into());
+
+        assert_eq!(app.devices_error.as_deref(), Some("pcsc: no service"));
+        assert!(app.devices.is_empty());
+        assert!(app.selected_device.is_none());
+        assert!(
+            app.reset_arm.is_none(),
+            "an armed ceremony must not outlive the selection it was armed for"
+        );
+        assert!(
+            !app.security_keys.reset.open,
+            "the dialog behind the ceremony goes with it"
+        );
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.text.contains("the armed reset was cancelled")),
+            "the user was told to replug; the ceremony ending has to be visible"
+        );
+
+        // Already empty: nothing to tear down, and the failure still lands.
+        let mut app = App::default();
+        App::apply_device_scan_failure(&mut app, "pcsc: no service".into());
+        assert_eq!(app.devices_error.as_deref(), Some("pcsc: no service"));
+        assert!(app.log.is_empty(), "no ceremony existed to report ending");
+    }
+
+    /// Defence in depth for the rule above: the poll refuses to fire for a key
+    /// that isn't the selection, whatever any other path forgot to clean up.
+    /// It returns before enumerating, so it never reaches a device.
+    #[test]
+    fn the_poll_refuses_to_fire_for_a_key_that_is_no_longer_selected() {
+        let mut app = App {
+            selected_device: Some("serial:BBB".into()),
+            reset_arm: Some(armed_for("serial:AAA")),
+            ..Default::default()
+        };
+
+        app.poll_reset_arm();
+
+        assert!(
+            app.reset_arm.is_none(),
+            "an arm bound to another key must not survive a poll"
+        );
+        assert!(app
+            .log
+            .iter()
+            .any(|l| l.text.contains("no longer the one selected")));
     }
 
     /// #81: the Settings tab (home of the only Reset path) must exist for any
