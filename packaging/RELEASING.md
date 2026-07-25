@@ -26,6 +26,22 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       Packaging pulls from upstreams that drift on their own schedule — the
       v0.7.3 flatpak broke at release time because an upstream source was
       pruned. Probes catch that; release runs must not.
+- [ ] **Packaged-crate asset check** — every file a crate *references* must be
+      a file it *ships*:
+      `cargo package -p keyroost --no-verify --offline`
+      `tar tzf target/package/keyroost-*.crate | grep -i '\.ico'`
+      Confirm every path `build.rs` reads (and any `include_str!`/
+      `include_bytes!` across the workspace) is inside the tarball. Cargo
+      packages only files beneath the package root, so a path reaching outside
+      it — `../../packaging/...` — silently vanishes from the published crate
+      while still resolving fine in a git checkout. That is how the Windows
+      icon broke `cargo install keyroost` before v0.7.7: nothing catches it,
+      because `cargo publish` runs its verification build on Linux where
+      `build.rs` is a `#[cfg(not(windows))]` no-op, and no workflow builds the
+      packaged tarball at all. Hence `crates/keyroost/assets/keyroost.ico`.
+      Note you cannot *build* the unpacked tarball at this stage: it resolves
+      its sibling `keyroost-*` deps from crates.io at the new version, which is
+      not published yet. Contents are the check here; the build is step 6.
 
 ## 2. Version bump + changelog (prep branch)
 
@@ -101,6 +117,13 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
 - [ ] Install-matrix spot check as machines allow: `cargo install keyroostctl`,
       flatpak update on a real install, AppImage launch, brew upgrade, winget
       after step 5.
+- [ ] **`cargo install keyroost` on Windows** — the one configuration that
+      actually compiles `build.rs` and embeds the icon from the published
+      tarball, and the only place a missing packaged asset shows up. Only
+      possible here, once the sibling crates are live (see the pre-flight
+      asset check for why it cannot run earlier). If this ever fails, the fix
+      belongs under the crate root, not in a wider `include`: cargo cannot
+      package paths above the package directory.
 - [ ] `keyroostctl --version` / GUI About shows X.Y.Z.
 - [ ] Close/comment the issues the release fixes (drafts usually prepared
       during the work); announcement if any.
