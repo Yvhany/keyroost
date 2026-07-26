@@ -4934,8 +4934,20 @@ impl App {
     /// to arm with neither — a replugged key we can't re-identify must not be
     /// matched by "first same-model path" (KEY-005).
     fn arm_fido_reset(&mut self) {
+        self.arm_fido_reset_with(Self::fido_devices());
+    }
+
+    /// The arming decision, with the live device list supplied by the caller.
+    ///
+    /// Separated from [`Self::arm_fido_reset`] so it can be unit-tested without
+    /// enumerating hardware. Enumeration is not free of side effects off Linux:
+    /// `keyroost_hid::enumerate` reads sysfs there, but goes through `hidapi`
+    /// on macOS and Windows, and on macOS that means IOKit from whatever thread
+    /// the test harness happens to be on — which aborted the whole test process
+    /// with SIGTRAP. A unit test also has no business depending on what is
+    /// physically plugged into the machine running it.
+    fn arm_fido_reset_with(&mut self, devices: Vec<FidoHid>) {
         let target_path = self.selected_fido_hid_path();
-        let devices = Self::fido_devices();
         let target = target_path
             .as_ref()
             .and_then(|p| devices.iter().find(|d| &d.path == p));
@@ -4987,7 +4999,10 @@ impl App {
         }
     }
 
-    /// Current FIDO HID devices (cheap sysfs read, no PC/SC).
+    /// Current FIDO HID devices. No PC/SC. Cheap on Linux (a sysfs read), but
+    /// not side-effect-free elsewhere: `keyroost_hid` uses `hidapi` on macOS
+    /// and Windows, so this reaches IOKit / the Win32 HID stack. Keep it out of
+    /// unit tests — take [`Self::arm_fido_reset_with`] and pass a list instead.
     fn fido_devices() -> Vec<FidoHid> {
         keyroost_hid::enumerate()
             .unwrap_or_default()
@@ -14679,7 +14694,9 @@ mod tests {
 
         // Nothing selected: no HID serial and no effective serial, which is the
         // refusal branch (the same state a key that exposes neither lands in).
-        app.arm_fido_reset();
+        // Empty device list: no hardware is enumerated, so the outcome does not
+        // depend on what is plugged into the machine running the test.
+        app.arm_fido_reset_with(Vec::new());
 
         assert!(
             app.reset_arm.is_none(),
@@ -15057,7 +15074,9 @@ mod tests {
 
         // Nothing selected: no HID serial and no effective serial — the refusal
         // branch, reached without touching a key.
-        app.arm_fido_reset();
+        // Empty device list: no hardware is enumerated, so the outcome does not
+        // depend on what is plugged into the machine running the test.
+        app.arm_fido_reset_with(Vec::new());
 
         assert!(
             app.reset_arm.is_none(),
