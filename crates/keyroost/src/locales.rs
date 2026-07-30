@@ -248,7 +248,7 @@ impl Translations {
         ui_strings.insert("filter_keys", "筛选密钥".to_string());
         ui_strings.insert("overview", "概览".to_string());
         ui_strings.insert("fido2", "FIDO2".to_string());
-        ui_strings.insert("authenticator", "身份验证器".to_string());
+        ui_strings.insert("authenticator", "OATH".to_string());
         ui_strings.insert("openpgp", "OpenPGP".to_string());
         ui_strings.insert("piv", "PIV".to_string());
         ui_strings.insert("passkeys_signin", "通行密钥与登录 (FIDO2)".to_string());
@@ -431,7 +431,7 @@ impl Translations {
         ui_strings.insert("slot_empty", "空".to_string());
         ui_strings.insert("slot_has_key", "有密钥".to_string());
         ui_strings.insert("slot_has_cert", "有证书".to_string());
-        ui_strings.insert("authenticator_tab", "身份验证器".to_string());
+        ui_strings.insert("authenticator_tab", "OATH".to_string());
         ui_strings.insert("openpgp_tab", "OpenPGP".to_string());
         ui_strings.insert("piv_tab", "PIV".to_string());
         ui_strings.insert("fido2_tab", "FIDO2".to_string());
@@ -453,14 +453,18 @@ impl Translations {
         ui_strings.insert("delete_credential", "删除凭证？".to_string());
         ui_strings.insert("delete_credential_desc", "从此密钥永久删除「{name}」？此操作无法撤销。".to_string());
         ui_strings.insert("delete", "删除".to_string());
-        ui_strings.insert("reset_oath", "重置 OATH 小程序？".to_string());
+        ui_strings.insert("reset_oath", "重置 OATH".to_string());
         ui_strings.insert("reset_oath_desc", "永久擦除此密钥上的所有身份验证器凭证并清除其密码？此操作无法撤销。".to_string());
+        ui_strings.insert("reset_openpgp", "重置 OpenPGP".to_string());
+        ui_strings.insert("reset_openpgp_desc", "擦除所有 OpenPGP 密钥并恢复默认 PIN。即使 PIN 已遗忘也可使用。".to_string());
+        ui_strings.insert("reset_piv", "重置 PIV".to_string());
+        ui_strings.insert("reset_piv_desc", "清除所有 PIV 密钥、证书和 PIN。仅在 PIN 和 PUK 均已被阻止时有效。".to_string());
         ui_strings.insert("reset_applet", "重置小程序".to_string());
         ui_strings.insert("factory_reset_key", "出厂重置此密钥？".to_string());
         ui_strings.insert("yes_wipe_key", "是的，擦除此密钥".to_string());
         ui_strings.insert("adding_credential", "添加凭证中".to_string());
         ui_strings.insert("deleting_credential", "删除凭证中".to_string());
-        ui_strings.insert("resetting_oath", "重置 OATH 小程序中".to_string());
+        ui_strings.insert("resetting_oath", "重置 OATH 中".to_string());
         ui_strings.insert("generating_key", "生成密钥中".to_string());
         ui_strings.insert("generating_key_touch", "生成密钥中（如果密钥闪烁请触摸它）".to_string());
         ui_strings.insert("importing_key", "导入密钥中".to_string());
@@ -502,6 +506,8 @@ impl Translations {
         ui_strings.insert("state_read_status", "读取状态以查看此密钥".to_string());
         ui_strings.insert("several_keys", "插入了多个密钥".to_string());
         ui_strings.insert("give_names", "为它们命名".to_string());
+        ui_strings.insert("name_save_desc", "将此密钥的序列号与名称一起保存到本机的 keys.json 中 — 数据不会离开您的电脑。最多 64 个字符。".to_string());
+        ui_strings.insert("name_save_desc_token", "将此令牌的序列号与名称一起保存到本机的 keys.json 中 — 数据不会离开您的电脑。".to_string());
         ui_strings.insert("connected", "已连接".to_string());
         ui_strings.insert("refresh", "刷新".to_string());
         ui_strings.insert("add_credential", "添加凭证".to_string());
@@ -585,7 +591,7 @@ impl Translations {
         ui_strings.insert("unblock_user_pin", "解锁用户 PIN".to_string());
         ui_strings.insert("new_credential", "新建凭证".to_string());
         ui_strings.insert("delete_credential", "删除凭证？".to_string());
-        ui_strings.insert("reset_oath_applet", "重置 OATH 小程序？".to_string());
+        ui_strings.insert("reset_oath_applet", "重置 OATH".to_string());
         ui_strings.insert("factory_reset_key", "出厂重置此密钥？".to_string());
         ui_strings.insert("reset_security_key", "重置安全密钥？".to_string());
         ui_strings.insert("delete_fingerprint", "删除指纹？".to_string());
