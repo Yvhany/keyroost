@@ -1,0 +1,67 @@
+name: Fuzz
+
+# Short scheduled fuzzing of the hand-rolled parsers (otpauth, base32/hex,
+# CBOR, OATH/OpenPGP/PIV TLV). Not a substitute for a long campaign, but
+# catches regressions in exactly the code the security review identified as
+# the project's main attack surface. Runs weekly and on demand — never in
+# the PR critical path.
+on:
+  schedule:
+    - cron: '41 4 * * 2' # Tuesdays 04:41 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - otpauth
+          - bulk_import
+          - codec
+          - cbor
+          - oath_parse
+          - openpgp_parse
+          - piv_parse
+          - migration
+          - qr_image
+          - ctap_typed
+          - aegis_encrypted
+          - token2otp_parse
+          - molto_parse
+          - winhid_detail
+          - otp_apdu_retry
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
+        with:
+          toolchain: nightly
+
+      # Caches ~/.cargo/bin (the cargo-fuzz binary) and the instrumented
+      # build trees — without it every weekly matrix job recompiled
+      # cargo-fuzz from source plus the whole dependency tree for ~2 min
+      # of actual fuzzing.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: |
+            . -> target
+            fuzz -> target
+
+      - name: Install cargo-fuzz
+        run: command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --locked
+
+      - name: Fuzz ${{ matrix.target }}
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=120
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

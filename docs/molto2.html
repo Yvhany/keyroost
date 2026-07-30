@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token2 Molto2 — programmable TOTP token — keyroost</title>
+<meta name="description" content="What the Token2 Molto2 / Molto2v2 programmable TOTP hardware token is, how slots and bulk import work, the customer key, clock sync, and what keyroost does — plus the single-profile siblings (OTPC, miniOTP, C30x).">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="keyroost">
+<meta property="og:title" content="Token2 Molto2 — programmable TOTP token — keyroost">
+<meta property="og:description" content="What the Token2 Molto2 / Molto2v2 programmable TOTP hardware token is, how slots and bulk import work, the customer key, clock sync, and what keyroost does — plus the single-profile siblings (OTPC, miniOTP, C30x).">
+<meta property="og:url" content="https://framefilter.github.io/keyroost/molto2.html">
+<meta property="og:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Token2 Molto2 — programmable TOTP token — keyroost">
+<meta name="twitter:description" content="What the Token2 Molto2 / Molto2v2 programmable TOTP hardware token is, how slots and bulk import work, the customer key, clock sync, and what keyroost does — plus the single-profile siblings (OTPC, miniOTP, C30x).">
+<meta name="twitter:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
+
+<link rel="icon" type="image/png" href="assets/keyroost-logo.png">
+<link rel="stylesheet" href="assets/keyroost-theme.css">
+<link rel="stylesheet" href="assets/site.css">
+<script>(function(){try{var t=localStorage.getItem('kr-theme');if(t==='light'||(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches))document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
+</head>
+<body>
+
+<header class="kr-topbar">
+  <div class="kr-wrap kr-topbar-inner">
+    <a class="kr-wordmark" href="index.html" aria-label="keyroost — home"><span class="kr-mark mono">k</span><span>keyroost</span></a>
+    <nav class="kr-nav" aria-label="Learn topics">
+      <a href="security-keys.html">Security keys</a>
+      <a href="fido2.html">FIDO2</a>
+      <a href="oath.html">OATH</a>
+      <a href="otp.html">On-device OTP</a>
+      <a href="fingerprint.html">Fingerprints</a>
+      <a href="mds.html">Device metadata</a>
+      <a href="settings.html">Settings</a>
+      <a href="storage.html">Storage</a>
+      <a href="openpgp.html">OpenPGP</a>
+      <a href="piv.html">PIV</a>
+      <a href="molto2.html">Molto2</a>
+      <a href="naming.html">Naming</a>
+      <a href="reset.html">Reset</a>
+      <a href="migration.html">Migration</a>
+    </nav>
+    <button class="kr-theme-toggle" id="kr-theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<section class="kr-hero">
+  <div class="kr-wrap">
+    <p class="kr-label">Learn · Token2 Molto2</p>
+    <h1>Token2 Molto2</h1>
+    <p class="kr-lede">A programmable hardware TOTP token: it shows rolling 6-digit codes on a
+      little screen, with no app, no battery anxiety, and no network — the original device
+      keyroost was built to program.</p>
+  </div>
+</section>
+
+<main class="kr-wrap">
+
+  <figure class="kr-shot">
+    <img src="assets/screenshots/molto2.webp" width="1640" height="938" loading="lazy"
+         alt="keyroost screenshot — Programming a Token2 Molto2 slot, with the slot rail and per-slot TOTP settings.">
+    <figcaption>Programming a Token2 Molto2 slot, with the slot rail and per-slot TOTP settings.</figcaption>
+  </figure>
+  <section class="kr-section">
+    <h2>What it is</h2>
+    <p>The Molto2 / Molto2v2 is a standalone <a href="oath.html">TOTP</a> token. You load
+      account seeds into numbered <strong>slots</strong>, and the device displays the current
+      code for each — entirely offline. Unlike a phone authenticator, there's no OS to
+      compromise and nothing syncing to a cloud; unlike a single-account token, it holds
+      many. It programs over a smart-card (PC/SC) interface.</p>
+    <div class="kr-callout note">
+      <div class="kr-callout-title note">Independent implementation</div>
+      <p>keyroost's Molto2 support was built by observing the device protocol and its public
+        reference tool — it is not a fork of any vendor software. The wire format, SM4-CBC
+        MAC, and config TLV are documented in the project's <code>PROTOCOL.md</code>.</p>
+    </div>
+  </section>
+
+  <section class="kr-section">
+    <h2>Programming &amp; bulk import</h2>
+    <p>Load a single slot from an <code>otpauth://</code> URI, or migrate a whole set of
+      accounts at once:</p>
+    <ul>
+      <li><strong>Aegis</strong> export (plaintext or encrypted)</li>
+      <li><strong>2FAS</strong> export</li>
+      <li>a list of <code>otpauth://</code> URIs</li>
+    </ul>
+    <p>keyroost can also <strong>sync the device clock</strong> to the host — important,
+      because TOTP depends on accurate time, and a drifted clock shows wrong codes.</p>
+  </section>
+
+  <section class="kr-section" id="customer-key">
+    <h2>The customer key</h2>
+    <p>Writes to the Molto2 are authenticated with a device <strong>customer key</strong> —
+      a secret that gates programming so that not just anyone with physical access can
+      reprogram your token. Sensitive commands are wrapped in an SM4-CBC MAC keyed by it.</p>
+    <ul>
+      <li>keyroost can <strong>rotate the customer key</strong> to a value you control.</li>
+      <li>Treat it like any other key secret: if you lose it you may be unable to reprogram
+        the device without a <a href="reset.html">factory reset</a>.</li>
+      <li>As with all secrets, provide it via the environment/stdin paths keyroost exposes —
+        never on the command line, and the tool won't print it back.</li>
+    </ul>
+    <div class="kr-callout danger">
+      <div class="kr-callout-title danger">Rotating &amp; resetting are consequential</div>
+      <p>Rotating the customer key or factory-resetting the token changes what it will accept.
+        A factory reset wipes the loaded profiles and restores the default customer key, and
+        the token makes you confirm it with its own button. Make sure you can re-derive every
+        seed before you do either. <a href="reset.html">See resetting →</a></p>
+    </div>
+  </section>
+
+  <section class="kr-section">
+    <h2>What keyroost does with the Molto2</h2>
+    <div class="kr-tool">
+      <span class="kr-mark mono">k</span>
+      <p>Read slot occupancy and titles; program a slot from an <code>otpauth://</code> URI;
+        set a slot's title or delete it; bulk-import from Aegis / 2FAS / an
+        <code>otpauth://</code> list; sync the host clock; rotate the customer key; and
+        factory-reset — over a pure-Rust protocol layer (SM4, SHA-1, APDU builders, MAC)
+        with no external crypto dependencies.</p>
+    </div>
+  </section>
+
+  <section class="kr-section" id="single-profile">
+    <h2>The single-profile siblings (OTPC, miniOTP, C30x)</h2>
+    <p>The Molto2 holds many accounts; Token2 also makes a family of
+      <strong>single-profile</strong> programmable tokens that hold exactly one. These are
+      card- and fob-shaped tokens — <strong>OTPC-P1-i</strong> / <strong>OTPC-P2-i</strong>,
+      <strong>miniOTP-2-i</strong> / <strong>miniOTP-3-i</strong>, <strong>C301-i</strong>,
+      and <strong>C302-i</strong> — that show one rolling code on a small display. keyroost
+      programs them over the same kind of smart-card (PC/SC) interface as the Molto2, over a
+      contactless <em>or</em> contact (chip) reader.</p>
+    <ul>
+      <li>Write the <strong>TOTP seed</strong> for the single account the token carries.</li>
+      <li>Set the <strong>configuration</strong> — HMAC algorithm (SHA1 / SHA256), time-step
+        (30 s / 60 s), and display timeout — and sync the device clock to the host.</li>
+      <li>keyroost reads back the device <strong>serial and model</strong> and refuses to
+        program a token whose serial doesn't match a known model.</li>
+    </ul>
+    <div class="kr-callout note">
+      <div class="kr-callout-title note">No customer key — a fixed device key</div>
+      <p>Unlike the Molto2, these tokens don't have a per-device customer key. They
+        authenticate with a single fixed device key, so there's nothing to rotate or lose —
+        but equally, anyone with physical access and a reader can reprogram one. The wire
+        protocol (a close relative of the Molto2's, same SM4 cipher and MAC) is documented
+        independently in the project's <code>PROTOCOL-token2prog.md</code>.</p>
+    </div>
+    <div class="kr-tool">
+      <span class="kr-mark mono">k</span>
+      <p>From the CLI: <code>keyroostctl prog info</code> (serial, model, on-device clock),
+        <code>keyroostctl prog seed</code> (seed from stdin or an environment variable —
+        <code>--base32-stdin</code> / <code>--base32-env</code>, so it stays out of
+        <code>ps</code> and shell history), and
+        <code>keyroostctl prog config</code> (algorithm, time-step, display timeout). The GUI
+        offers the same on a dedicated programmable-token pane.</p>
+    </div>
+  </section>
+
+  <section class="kr-section" id="troubleshooting">
+    <h2>Troubleshooting</h2>
+    <p>These are behaviors of the Molto2 hardware and the smart-card layer, not
+      bugs in keyroost — any smart-card software talks to the token the same way
+      and sees the same thing.</p>
+
+    <h3>The token stops charging while it's plugged into a computer</h3>
+    <p>The Molto2 stops charging the moment your operating system's smart-card
+      service enumerates it — on Linux, when <code>pcscd</code> brings up the card
+      interface. This happens as soon as the token is detected, before any program
+      authenticates or writes to it, so no particular application causes it. To
+      charge the token, use a <strong>plain USB power source</strong> — a charger
+      or power-only cable with no computer attached. (On a nearly full battery it
+      tops off in about half a minute and then stops, which is normal.)</p>
+
+    <h3>The token isn't detected / doesn't show up</h3>
+    <p>The Molto2's card interface sometimes fails to initialize on first contact,
+      so the token is present on USB but no smart-card reader ever appears. The
+      smart-card service only attempts initialization at the moment the token is
+      plugged in — so waiting doesn't help, and neither does restarting the
+      service. Each replug is a fresh attempt:</p>
+    <ul>
+      <li><strong>Power the token off</strong> (unplug and leave it unplugged for
+        ~10 seconds — a failed session can leave its card interface wedged, and
+        only a power-off clears that).</li>
+      <li><strong>Plug it back in</strong> and give it a few seconds, then check
+        with <code>keyroostctl list</code> (the app's device list updates by
+        itself).</li>
+      <li>Still missing? <strong>Just replug again.</strong> It can take two or
+        three cycles; no service restart is needed in between.</li>
+    </ul>
+    <div class="kr-callout danger">
+      <div class="kr-callout-title danger">Don't restart the smart-card service to fix detection</div>
+      <p>Restarting <code>pcscd</code> can't help here — it only retries a token's
+        initialization when the token is plugged in — and restarting it <em>while
+        the token has a healthy, active connection</em> pulls the card interface
+        out from under it and hangs the firmware: the screen freezes. If that
+        happens, <strong>power-cycle the token</strong> (turn it off and back on)
+        and it comes back cleanly.</p>
+    </div>
+
+    <h3>I programmed a slot but it doesn't show a code</h3>
+    <p>A slot shows a rolling code only once it has a <strong>seed</strong> (the
+      TOTP secret). Writing only a <strong>title</strong> sets a label and nothing
+      else — use the full write (seed + title + settings), not the title-only
+      action, when you want the slot to generate codes.</p>
+
+    <h3>Can anyone read my slot titles without the customer key?</h3>
+    <p>Yes. The Molto2 answers title and occupancy reads <strong>without</strong>
+      the customer key, so anyone with physical access to the token can list which
+      slots are used and how they're labeled. <strong>Don't put secrets in slot
+      titles.</strong> Seeds and codes are never readable back off the device.</p>
+  </section>
+
+  <section class="kr-section kr-res-section">
+    <h2>Authoritative resources</h2>
+    <div class="kr-res">
+      <a href="https://datatracker.ietf.org/doc/html/rfc6238"><span class="who">IETF</span>RFC 6238 — TOTP</a>
+      <a href="https://www.token2.com/"><span class="who">Token2</span>Vendor site (Molto2 product line)</a>
+    </div>
+    <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="naming.html">Next: Naming devices →</a></p>
+  </section>
+
+</main>
+
+<footer class="kr-footer">
+  <div class="kr-wrap">
+    <p><span class="kr-pill kr-pill-brand">keyroost</span> &nbsp;Independent, open-source Rust toolchain for hardware security keys. <a href="https://github.com/framefilter/keyroost">Source →</a></p>
+    <p class="kr-small"><em>Token2</em> and <em>Molto2</em> are trademarks of Token2 Sàrl. keyroost is independent and not affiliated with or endorsed by Token2; names are used descriptively.</p>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>

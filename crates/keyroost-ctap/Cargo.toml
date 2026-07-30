@@ -1,0 +1,65 @@
+[package]
+name = "keyroost-ctap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CTAP HID transport, CBOR codec, and high-level CTAP2 commands for FIDO authenticators."
+
+[lints]
+workspace = true
+
+[features]
+# Test/dev hook ONLY — never enable this for a Linux release. It forces the
+# hidapi I/O backend on so the cross-platform CTAP transport can be built and
+# smoke-tested on Linux; real macOS/Windows coverage comes from the CI matrix,
+# not this flag. Building it on Linux needs `libudev-dev` (see keyroost-hid).
+# The default Linux build never touches it and stays dependency-free.
+hidapi-backend = ["dep:hidapi", "keyroost-hid/hidapi-backend"]
+
+[dependencies]
+keyroost-hid = { path = "../keyroost-hid", version = "0.7.6" }
+keyroost-proto = { path = "../keyroost-proto", version = "0.7.6" }
+# Optional so a default Linux build pulls nothing (the hidraw File backend is
+# dependency-free); enabled by `hidapi-backend` for testing.
+hidapi = { version = "2.6", optional = true, default-features = false, features = [
+    "linux-static-hidraw",
+    "macos-shared-device",
+    "windows-native",
+] }
+# Phase 2 crypto: PIN protocol uses P-256 ECDH, AES-256-CBC, HMAC-SHA-256.
+# Vendoring all of this would be ~1500 LOC of unaudited primitives; sha2 is
+# already pulled in transitively by p256, so adding the rest explicitly costs
+# only `hmac`/`aes`/`cbc` (each <1000 LOC, all RustCrypto-audited).
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+aes = { version = "0.8", default-features = false }
+cbc = { version = "0.1", default-features = false, features = ["block-padding"] }
+p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdh"] }
+# OsRng for ephemeral keypair + AES IVs. p256 re-exports rand_core but the
+# OsRng inside it is gated behind rand_core's `getrandom` feature.
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+# Already in the tree via p256/elliptic-curve; used to scrub shared secrets
+# and pinUvAuthTokens on drop (forbid(unsafe_code) rules out a manual wipe).
+# `alloc` is explicit: without it there is no `Vec<u8>: Zeroize`, so a
+# `vec.zeroize()` silently auto-derefs to the slice impl and leaves the
+# capacity tail unwiped — and which impl applies would then depend on whether
+# another crate in the same build turned `alloc` on. Every other crate here
+# enables it; matching them keeps the wipe total and build-independent.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# Per-credential largeBlob AEAD (CTAP §6.10.4): AES-256-GCM. Already resolved
+# in the workspace lockfile via keyroost-import's Aegis path; direct use here
+# for reading a cert out of largeBlob storage.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+# Raw-DEFLATE inflate for the compressed largeBlob plaintext. Pure Rust;
+# already transitively in the tree.
+miniz_oxide = "0.8"
+
+# Auto-select the hidapi I/O backend on macOS / Windows (Linux keeps the
+# dependency-free hidraw File backend).
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+hidapi = { version = "2.6", default-features = false, features = [
+    "macos-shared-device",
+    "windows-native",
+] }

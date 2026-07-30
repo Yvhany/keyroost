@@ -1,0 +1,115 @@
+# Flatpak manifest — DRAFT, NOT wired into CI. See ../LINUX-BUNDLES.md.
+#
+# Build (local test):
+#   1. Generate cargo-sources.json from the repo Cargo.lock (offline cargo deps).
+#      The CI workflow (.github/workflows/linux-bundles.yml) does this automatically
+#      on the runner; to do it by hand:
+#        pip install 'aiohttp>=3.9.5,<4' 'PyYAML>=6.0.2,<7' 'tomlkit>=0.13.3,<1.0'
+#        curl -fsSLO https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+#        python3 flatpak-cargo-generator.py ../../Cargo.lock -o cargo-sources.json
+#      cargo-sources.json is machine-generated, large, and lock-specific:
+#      it is intentionally NOT committed. CI regenerates it every build, so it
+#      can never go stale. (Verified June 2026: the generator produces 414 crate
+#      archives + checksums from this repo's lockfile, all from static.crates.io.)
+#   2. flatpak-builder --force-clean --repo=../repo build-dir \
+#          io.github.framefilter.keyroost.yml
+#
+# TODO(maintainer): confirm runtime version, pcsc-lite configure flags, and the
+# finish-args device/udev breadth against real hardware before shipping. App-id
+# is DECIDED: io.github.framefilter.keyroost.
+
+app-id: io.github.framefilter.keyroost
+runtime: org.freedesktop.Platform
+# 25.08 = latest stable major (June 2026); 24.08 is the conservative alternative.
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: keyroost
+
+finish-args:
+  # --- GUI (eframe/egui via glow) ---
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc                 # X11 shared memory (MIT-SHM)
+  - --device=dri                # GPU acceleration for egui/glow
+  # --- FIDO HID ---
+  - --device=all                # /dev/hidraw* for FIDO  (TODO: narrow if possible)
+  - --filesystem=/run/udev:ro   # udev device db for HID enumeration (TODO: verify needed)
+  # --- Smart-card applets (Molto2 / OATH / OpenPGP / PIV) ---
+  - --socket=pcsc               # host pcscd socket; client lib is bundled below
+  # --- App data: keys.json friendly-name registry ---
+  - --filesystem=xdg-config/keyroost:create
+
+modules:
+  # ----------------------------------------------------------------------------
+  # 1. pcsc-lite CLIENT library only (NO daemon). The freedesktop runtime ships
+  #    no libpcsclite; we build + install just the client .so so keyroost links
+  #    and loads it, then talk to the HOST pcscd via --socket=pcsc.
+  # TODO(maintainer): pin a known pcsc-lite version + verify the configure flags
+  #    produce a client-only build on that version (flag names drift 1.9 -> 2.x).
+  # ----------------------------------------------------------------------------
+  - name: pcsc-lite
+    # pcsc-lite is meson-only since 2.x (no ./configure). We build just the
+    # libpcsclite CLIENT lib (no daemon): disabling systemd/polkit/udev and the
+    # USB/serial reader backends leaves the lib with no optional deps (verified
+    # against meson.build — usb/serial/libudev are all optional, no error path).
+    buildsystem: meson
+    config-opts:
+      - -Dlibsystemd=false
+      - -Dpolkit=false
+      - -Dlibudev=false
+      - -Dusb=false
+      - -Dserial=false
+    sources:
+      - type: archive
+        # pcsc-lite 2.5.1 (.tar.xz; verified + hashed 2026-06-30). NOTE:
+        # pcsclite.apdu.fr keeps only the latest ~2 releases, so this URL
+        # eventually 404s (it did for 2.3.0). When CI fails to download, bump:
+        #   curl -fsSLO "https://pcsclite.apdu.fr/files/pcsc-lite-<ver>.tar.xz" && sha256sum it
+        # flatpak-builder refuses to build unless the sha256 matches. (Still
+        # meson — keep buildsystem: meson.)
+        url: https://pcsclite.apdu.fr/files/pcsc-lite-2.5.1.tar.xz
+        sha256: bfcfe38a20afc49849c6bf55325e38f449fc4b26d3923fdc32b969ae41a8741b
+    # We only need the libpcsclite client .so; the daemon (pcscd) is the host's.
+    cleanup:
+      - /bin/pcscd
+      - /sbin/pcscd
+      - /lib/pcsc
+      - /lib/systemd
+      - '*.la'
+
+  # ----------------------------------------------------------------------------
+  # 2. keyroost itself (the GUI binary + CLI). Built fully offline from the
+  #    pre-generated cargo-sources.json. The whole workspace is fetched; we
+  #    install both keyroost (GUI) and keyroostctl (CLI).
+  # ----------------------------------------------------------------------------
+  - name: keyroost
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/keyroost/cargo
+        CARGO_NET_OFFLINE: 'true'
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      - cargo build --offline --release -p keyroost -p keyroostctl
+      - install -Dm0755 target/release/keyroost    ${FLATPAK_DEST}/bin/keyroost
+      - install -Dm0755 target/release/keyroostctl ${FLATPAK_DEST}/bin/keyroostctl
+      # desktop file + metainfo + icon (paths relative to this manifest):
+      - install -Dm0644 packaging/flatpak/io.github.framefilter.keyroost.desktop
+          ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
+      - install -Dm0644 packaging/flatpak/io.github.framefilter.keyroost.metainfo.xml
+          ${FLATPAK_DEST}/share/metainfo/${FLATPAK_ID}.metainfo.xml
+      # Icon: the dark-on-amber colorway — the full freedesktop hicolor tree
+      # (scalable SVG + 16…1024px PNGs) from packaging/icons/. The alternate
+      # amber-on-dark colorway is not in the tree; see packaging/icons/README.md.
+      - mkdir -p ${FLATPAK_DEST}/share/icons/hicolor
+      - cp -r packaging/icons/hicolor/* ${FLATPAK_DEST}/share/icons/hicolor/
+    sources:
+      # The repo tree. For a tag-based build, replace with a git/archive source
+      # pinned to the release tag + commit.
+      - type: dir
+        path: ../..
+      # Pre-generated offline cargo sources (NOT committed — see header):
+      - cargo-sources.json

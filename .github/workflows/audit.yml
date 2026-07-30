@@ -1,0 +1,39 @@
+name: Security audit
+
+# RUSTSEC advisory scan over Cargo.lock. Runs when the dependency set
+# changes and weekly (advisories are published against existing versions,
+# so a lockfile that passed yesterday can fail today without any commit).
+on:
+  push:
+    branches: [main]
+    paths: ['Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '.cargo/audit.toml']
+  pull_request:
+    paths: ['Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '.cargo/audit.toml']
+  schedule:
+    - cron: '17 6 * * 1' # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
+        with:
+          toolchain: stable
+
+      # Caches ~/.cargo/bin, so the from-source install below is only paid
+      # when the cache rolls over, not on every dependency-bump PR.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # Installed from source with --locked rather than via a third-party
+      # installer action: one less moving part in the trust chain.
+      - name: Install cargo-audit
+        run: command -v cargo-audit >/dev/null || cargo install cargo-audit --locked
+
+      - name: Audit dependencies
+        run: cargo audit
