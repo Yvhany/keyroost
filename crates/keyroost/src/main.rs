@@ -4755,6 +4755,8 @@ impl App {
                 Language::ZhCn => rust_i18n::set_locale("zh-CN"),
             }
             self.persist_settings();
+            // Force UI refresh to apply new language
+            ctx.request_repaint();
         }
     }
 
