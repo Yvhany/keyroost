@@ -216,7 +216,7 @@ impl Translations {
         help_bodies.insert("pgp", "将密钥变成智能卡，用于加密和签名电子邮件和文件（以及 SSH）。私钥保存在卡上，永远不会接触您计算机的磁盘。".to_string());
         help_bodies.insert("pgp-keys", "三个密钥中的每一个——签名、解密、身份验证——都可以直接在卡上创建，也可以从您已有的 RSA-2048 文件导入。无论哪种方式都会覆盖该密钥中的任何内容，清除它的唯一方法是完全重置。您需要管理员 PIN，密钥可能会要求您触摸。".to_string());
         help_bodies.insert("pgp-card-details", "存储在卡上的可选标签：持卡人姓名和可以找到您公钥的网址。它们是公共信息，但写入它们仍需要管理员 PIN。".to_string());
-        help_bodies.insert("piv", "美国政府智能卡标准，用于企业登录、VPN 和文档签名。在此管理：生成密钥、创建自签名证书或 CA 请求（在卡上签名）、导入证书、更改 PIN/PUK 和管理密钥，以及重置小程序。写入需要管理密钥（出厂默认 010203…0708）。".to_string());
+        help_bodies.insert("piv", "美国政府智能卡标准，用于企业登录、VPN 和文档签名。在此管理：生成密钥、创建自签名证书或 CA 请求（在卡上签名）、导入证书、更改 PIN/PUK 和管理密钥，以及重置小程序。写入需要管理密钥（出厂默认 0102030708）。".to_string());
         help_bodies.insert("piv-generate", "在此插槽内创建全新的私钥并显示其公钥。如果插槽已有密钥，这将永久覆盖它。您需要管理密钥。".to_string());
         help_bodies.insert("piv-certificate", "自签名证书直接存储到插槽中，可以立即使用。CSR 是您发送给证书颁发机构的请求文件，以便他们为您颁发证书。无论哪种方式，签名都在卡上进行，因此需要 PIN 码。".to_string());
         help_bodies.insert("piv-import", "将您已有的证书文件（PEM 或 DER）加载到此插槽中。您需要管理密钥。".to_string());
@@ -232,7 +232,7 @@ impl Translations {
         let mut ui_strings = HashMap::new();
         ui_strings.insert("learn_link", "了解如何使用此功能  ↗".to_string());
         ui_strings.insert("what_is_this", "这是什么？".to_string());
-        ui_strings.insert("touch_to_begin", "触摸传感器开始…".to_string());
+        ui_strings.insert("touch_to_begin", "触摸传感器开始".to_string());
         ui_strings.insert("plug_key", "插入安全密钥以开始".to_string());
         ui_strings.insert("plug_key_desc", "keyroost 管理 YubiKey、Nitrokey、SoloKeys 和 Token2 令牌。\n通过 USB 连接后，它会出现在左侧的列表中。".to_string());
         ui_strings.insert("step1", "将密钥插入 USB 端口".to_string());
