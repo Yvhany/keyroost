@@ -46,7 +46,7 @@ fn btn_label(text: &str) -> String {
     if locale.starts_with("zh") {
         text.to_string()
     } else {
-        format!("{}\u{2026}", text)
+        btn_label(text)
     }
 }
 
@@ -9188,7 +9188,7 @@ impl App {
                                             ui,
                                             p,
                                             BtnKind::Danger,
-                                            &format!("{}\u{2026}", self.translations.ui_string("factory_reset").unwrap_or("Factory reset")),
+                                            &btn_label(self.translations.ui_string("factory_reset").unwrap_or("Factory reset")),
                                         )
                                         .clicked()
                                         {
@@ -10120,7 +10120,7 @@ impl App {
                     ui.add_space(6.0);
                     self.help_dot(ui, p, "reset");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Danger, &format!("{}\u{2026}", self.translations.ui_string("reset_key").unwrap_or("Reset key"))).clicked() {
+                        if theme::button(ui, p, BtnKind::Danger, &btn_label(&self.translations.ui_string("reset_key").unwrap_or("Reset key"))).clicked() {
                             arm_reset = true;
                         }
                     });
@@ -10781,7 +10781,7 @@ impl App {
                         }
                         // Export is read-only, so it's always available
                         // regardless of session lock state.
-                        if theme::button(ui, p, BtnKind::Ghost, &format!("{}\u{2026}", t!("export_entry").to_string())).clicked() {
+                        if theme::button(ui, p, BtnKind::Ghost, &btn_label(&t!("export_entry").to_string())).clicked() {
                             let is_cert =
                                 matches!(classification, EntryKind::SshCert { .. });
                             let default_name = if is_cert {
@@ -12451,11 +12451,11 @@ impl App {
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "pgp-card-details");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("openpgp_set_url").to_string())).clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &btn_label(&t!("openpgp_set_url").to_string())).clicked() {
                         open_modal = Some(OpenPgpCredKind::SetUrl);
                     }
                     ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("openpgp_set_name").to_string())).clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &btn_label(&t!("openpgp_set_name").to_string())).clicked() {
                         open_modal = Some(OpenPgpCredKind::SetName);
                     }
                 });
@@ -12491,17 +12491,17 @@ impl App {
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "pin");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("openpgp_unblock_user_pin").to_string())).clicked()
+                    if theme::button(ui, p, BtnKind::Default, &btn_label(&t!("openpgp_unblock_user_pin").to_string())).clicked()
                     {
                         open_modal = Some(OpenPgpCredKind::UnblockUserPin);
                     }
                     ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("openpgp_change_admin_pin").to_string())).clicked()
+                    if theme::button(ui, p, BtnKind::Default, &btn_label(&t!("openpgp_change_admin_pin").to_string())).clicked()
                     {
                         open_modal = Some(OpenPgpCredKind::ChangeAdminPin);
                     }
                     ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("openpgp_change_user_pin").to_string())).clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &btn_label(&t!("openpgp_change_user_pin").to_string())).clicked() {
                         open_modal = Some(OpenPgpCredKind::ChangeUserPin);
                     }
                 });
@@ -12599,7 +12599,7 @@ impl App {
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "pgp-keys");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("generate").unwrap_or("Generate"))).clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("generate").unwrap_or("Generate"))).clicked() {
                         open_modal = Some(OpenPgpCredKind::GenerateKey);
                     }
                 });
@@ -12633,19 +12633,19 @@ impl App {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     browse_import_key =
-                        theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("browse").unwrap_or("Browse"))).clicked();
+                        theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("browse").unwrap_or("Browse"))).clicked();
                 });
             });
             let have_path = !self.openpgp.import_path.trim().is_empty();
             ui.add_space(6.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("import_file").unwrap_or("Import file"))).clicked()
+                if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("import_file").unwrap_or("Import file"))).clicked()
                     && have_path
                 {
                     open_modal = Some(OpenPgpCredKind::ImportKeyFile);
                 }
                 ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("generate_import").unwrap_or("Generate & import"))).clicked() {
+                if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("generate_import").unwrap_or("Generate & import"))).clicked() {
                     open_modal = Some(OpenPgpCredKind::GenerateImportKey);
                 }
             });
@@ -12810,15 +12810,15 @@ impl App {
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "pin");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("unblock_pin").unwrap_or("Unblock PIN"))).clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("unblock_pin").unwrap_or("Unblock PIN"))).clicked() {
                         open_unblock = true;
                     }
                     ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("change_puk").unwrap_or("Change PUK"))).clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("change_puk").unwrap_or("Change PUK"))).clicked() {
                         open_change_puk = true;
                     }
                     ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("change_pin").unwrap_or("Change PIN"))).clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("change_pin").unwrap_or("Change PIN"))).clicked() {
                         open_change_pin = true;
                     }
                 });
@@ -12836,7 +12836,7 @@ impl App {
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "piv-admin");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("set_retry_counts").unwrap_or("Set retry counts"))).clicked()
+                    if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("set_retry_counts").unwrap_or("Set retry counts"))).clicked()
                     {
                         open_set_retries = true;
                     }
@@ -12869,7 +12869,7 @@ impl App {
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "piv-admin");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("change_management_key").unwrap_or("Change management key")))
+                    if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("change_management_key").unwrap_or("Change management key")))
                         .clicked()
                     {
                         open_change_mgmt = true;
@@ -13102,7 +13102,7 @@ impl App {
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "piv-generate");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("generate").unwrap_or("Generate"))).clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("generate").unwrap_or("Generate"))).clicked() {
                         open_generate = true;
                     }
                     ui.add_space(8.0);
@@ -13180,7 +13180,7 @@ impl App {
                         open_csr = true;
                     }
                     ui.add_space(8.0);
-                    save_csr = theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("save").unwrap_or("Save"))).clicked();
+                    save_csr = theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("save").unwrap_or("Save"))).clicked();
                 });
             });
             if save_csr {
@@ -13220,7 +13220,7 @@ impl App {
                     }
                     ui.add_space(8.0);
                     browse_cert =
-                        theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("browse").unwrap_or("Browse"))).clicked();
+                        theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("browse").unwrap_or("Browse"))).clicked();
                 });
             });
             if browse_cert {
@@ -13262,7 +13262,7 @@ impl App {
                         go_export = true;
                     }
                     ui.add_space(8.0);
-                    save_export = theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("save").unwrap_or("Save"))).clicked();
+                    save_export = theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("save").unwrap_or("Save"))).clicked();
                 });
             });
             if save_export {
@@ -13293,18 +13293,18 @@ impl App {
                     // Move key: relocate the slot's key to an empty slot. Needs
                     // 5.7+ (same gate as delete) and a key in the active slot.
                     if can_delete_key && selected_has_key {
-                        if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", "移动密钥")).clicked() {
+                        if theme::button(ui, p, BtnKind::Default, &btn_label("移动密钥")).clicked() {
                             open_move_key = true;
                         }
                         ui.add_space(6.0);
                     }
                     if can_delete_key {
-                        if theme::button(ui, p, BtnKind::Danger, &format!("{}\u{2026}", self.translations.ui_string("delete_key").unwrap_or("Delete key"))).clicked() {
+                        if theme::button(ui, p, BtnKind::Danger, &btn_label(self.translations.ui_string("delete_key").unwrap_or("Delete key"))).clicked() {
                             open_delete_key = true;
                         }
                         ui.add_space(6.0);
                     }
-                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("delete_certificate").unwrap_or("Delete certificate")))
+                    if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("delete_certificate").unwrap_or("Delete certificate")))
                         .clicked()
                     {
                         open_delete_cert = true;
@@ -13585,12 +13585,12 @@ impl App {
                             self.sync_time_all();
                         }
                         ui.add_space(6.0);
-                        if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("bulk_import").to_string())).clicked() {
+                        if theme::button(ui, p, BtnKind::Default, &btn_label(&t!("bulk_import").to_string())).clicked() {
                             self.bulk_dialog.open = true;
                             self.bulk_dialog.start = self.slot;
                         }
                         ui.add_space(6.0);
-                        if theme::button(ui, p, BtnKind::Danger, &format!("{}\u{2026}", t!("factory_reset").to_string())).clicked() {
+                        if theme::button(ui, p, BtnKind::Danger, &btn_label(&t!("factory_reset").to_string())).clicked() {
                             self.molto_reset_confirm = true;
                         }
                     });
@@ -13792,11 +13792,11 @@ impl App {
                                     self.apply_title_only();
                                 }
                                 ui.add_space(6.0);
-                                if theme::button(ui, p, BtnKind::Danger, &format!("{}\u{2026}", t!("delete_seed").to_string())).clicked() {
+                                if theme::button(ui, p, BtnKind::Danger, &btn_label(&t!("delete_seed").to_string())).clicked() {
                                     self.molto_delete_confirm = true;
                                 }
                                 ui.add_space(6.0);
-                                if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("import_otpauth").to_string())).clicked() {
+                                if theme::button(ui, p, BtnKind::Default, &btn_label(&t!("import_otpauth").to_string())).clicked() {
                                     self.import_dialog.open = true;
                                 }
                                 ui.add_space(6.0);
