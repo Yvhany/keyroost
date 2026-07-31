@@ -76,9 +76,10 @@ pub enum LanguageSetting {
 
 impl From<Language> for LanguageSetting {
     fn from(l: Language) -> Self {
-        match l {
-            Language::En => LanguageSetting::En,
-            Language::ZhCn => LanguageSetting::ZhCn,
+        if l.code == "en" {
+            LanguageSetting::En
+        } else {
+            LanguageSetting::ZhCn
         }
     }
 }
@@ -86,8 +87,8 @@ impl From<Language> for LanguageSetting {
 impl From<LanguageSetting> for Language {
     fn from(l: LanguageSetting) -> Self {
         match l {
-            LanguageSetting::En => Language::En,
-            LanguageSetting::ZhCn => Language::ZhCn,
+            LanguageSetting::En => Language::new("en"),
+            LanguageSetting::ZhCn => Language::new("zh-CN"),
         }
     }
 }

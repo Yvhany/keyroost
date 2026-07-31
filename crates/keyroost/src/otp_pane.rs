@@ -356,7 +356,8 @@ impl App {
             );
         }
         let for_device = self.selected_device.clone();
-        self.spawn_job(&t!("reading_entries").to_string(), move || {
+        let __job_label = crate::locales::Translations::load("en").ui_string("reading_entries").unwrap_or("reading_entries").to_string();
+        self.spawn_job(&__job_label, move || {
             let result =
                 (|| -> Result<OtpLoad, OtpTransportError> {
                     let mut session = target.open()?;
@@ -505,7 +506,7 @@ impl App {
             return;
         }
         if self.otp.add.secret.trim().is_empty() {
-            self.otp.error = Some(t!("secret_empty").to_string().into());
+            self.otp.error = Some(self.translations.ui_string("secret_empty").unwrap_or("secret_empty").to_string().into());
             return;
         }
         let secret = zeroize::Zeroizing::new(self.otp.add.secret.clone());
@@ -523,7 +524,8 @@ impl App {
         };
         let for_device = self.selected_device.clone();
 
-        self.spawn_job(&format!("{}…", t!("adding_credential").to_string()), move || {
+        let __job_label = format!("{}…", crate::locales::Translations::load("en").ui_string("adding_credential").unwrap_or("adding_credential").to_string());
+        self.spawn_job(&__job_label, move || {
             let result = (|| -> Result<(), String> {
                 let seed = keyroost_token2otp::decode_base32_seed(secret.trim())
                     .map_err(|m| format!("invalid Base32 secret: {m}"))?;
@@ -598,7 +600,8 @@ impl App {
         };
         let for_device = self.selected_device.clone();
 
-        self.spawn_job(&format!("{}…", t!("configure_hid_hotp").to_string()), move || {
+        let __job_label = format!("{}…", crate::locales::Translations::load("en").ui_string("configure_hid_hotp").unwrap_or("configure_hid_hotp").to_string());
+        self.spawn_job(&__job_label, move || {
             let result = (|| -> Result<(), String> {
                 let seed = keyroost_token2otp::decode_base32_seed(secret.trim())
                     .map_err(|m| format!("invalid Base32 secret: {m}"))?;
@@ -614,7 +617,7 @@ impl App {
                 match result {
                     Ok(()) => {
                         app.otp.button_hotp = ButtonHotpDialog::default();
-                        app.otp.info = Some(t!("seed_configured").to_string() + ".");
+                        app.otp.info = Some(app.translations.ui_string("seed_configured").unwrap_or("seed_configured").to_string() + ".");
                         // Re-read the config so the "seed configured" status and
                         // the settings-only editor reflect the new slot.
                         app.load_otp_entries();
@@ -665,7 +668,9 @@ impl App {
             }
         };
         let for_device = self.selected_device.clone();
-        self.spawn_job(&format!("{}…", t!("toggle").to_string()), move || {
+        let __job_label = format!("{}…", crate::locales::Translations::load("en").ui_string("toggle").unwrap_or("toggle").to_string());
+        let keyboard_reconfigure_msg = self.translations.ui_string("keyboard_reconfigure_warning").unwrap_or("keyboard_reconfigure_warning").to_string();
+        self.spawn_job(&__job_label, move || {
             let result = (|| -> Result<(), String> {
                 let mut session = target.open().map_err(|e| e.to_string())?;
                 session.set_device_type(disable).map_err(|e| e.to_string())
@@ -676,9 +681,7 @@ impl App {
                 }
                 match result {
                     Ok(()) => {
-                        app.otp.info = Some(
-                            t!("keyboard_reconfigure_warning").to_string(),
-                        );
+                        app.otp.info = Some(keyboard_reconfigure_msg);
                         // Reflect the change locally; a refresh re-reads from hardware.
                         app.otp.iface = Some(next);
                     }
@@ -699,7 +702,9 @@ impl App {
             }
         };
         let for_device = self.selected_device.clone();
-        self.spawn_job(&format!("{}…", t!("clear_slot").to_string()), move || {
+        let __job_label = format!("{}…", crate::locales::Translations::load("en").ui_string("clear_slot").unwrap_or("clear_slot").to_string());
+        let no_seed_msg = self.translations.ui_string("no_seed_configured").unwrap_or("no_seed_configured").to_string() + ".";
+        self.spawn_job(&__job_label, move || {
             let result = (|| -> Result<(), String> {
                 let mut session = target.open().map_err(|e| e.to_string())?;
                 session.delete_button_hotp().map_err(|e| e.to_string())
@@ -710,7 +715,7 @@ impl App {
                 }
                 match result {
                     Ok(()) => {
-                        app.otp.info = Some(t!("no_seed_configured").to_string() + ".");
+                        app.otp.info = Some(no_seed_msg);
                         app.load_otp_entries();
                     }
                     Err(e) => app.otp.error = Some(e.to_string()),
@@ -730,7 +735,8 @@ impl App {
             }
         };
         let for_device = self.selected_device.clone();
-        self.spawn_job(&format!("{}…", t!("delete").to_string()), move || {
+        let __job_label = format!("{}…", crate::locales::Translations::load("en").ui_string("delete").unwrap_or("delete").to_string());
+        self.spawn_job(&__job_label, move || {
             let result = (|| -> Result<(), OtpTransportError> {
                 let mut session = target.open()?;
                 session.delete_entry(&app_name, &account_name)
@@ -765,7 +771,7 @@ impl App {
         };
         let for_device = self.selected_device.clone();
         let key = (app_name.clone(), account_name.clone());
-        self.spawn_job(&format!("{} \u{2014} {}", t!("read_code").to_string(), t!("touch_the_key").to_string()), move || {
+        self.spawn_job(&format!("{} \u{2014} {}", self.translations.ui_string("read_code").unwrap_or("read_code").to_string(), self.translations.ui_string("touch_the_key").unwrap_or("touch_the_key").to_string()), move || {
             let result = (|| -> Result<Option<String>, String> {
                 let mut session = target.open().map_err(|e| e.to_string())?;
                 let now = unix_now();
@@ -808,7 +814,9 @@ impl App {
             }
         };
         let for_device = self.selected_device.clone();
-        self.spawn_job(&format!("{}…", t!("toggle").to_string()), move || {
+        let __job_label = format!("{}…", crate::locales::Translations::load("en").ui_string("toggle").unwrap_or("toggle").to_string());
+        let seed_configured_msg = self.translations.ui_string("seed_configured").unwrap_or("seed_configured").to_string() + ".";
+        self.spawn_job(&__job_label, move || {
             let result = (|| -> Result<(), String> {
                 let mut session = target.open().map_err(|e| e.to_string())?;
                 session
@@ -821,7 +829,7 @@ impl App {
                 }
                 match result {
                     Ok(()) => {
-                        app.otp.info = Some(t!("seed_configured").to_string() + ".");
+                        app.otp.info = Some(seed_configured_msg);
                         if let Some(st) = app.otp.button_hotp_status.as_mut() {
                             st.send_enter = send_enter;
                             st.long_touch = long_touch;
@@ -845,8 +853,10 @@ impl App {
             }
         };
         let for_device = self.selected_device.clone();
+        let erase_all_label = format!("{} \u{2014} {}", crate::locales::Translations::load("en").ui_string("erase_all").unwrap_or("erase_all").to_string(), crate::locales::Translations::load("en").ui_string("touch_the_key").unwrap_or("touch_the_key").to_string());
+        let erase_all_msg = crate::locales::Translations::load("en").ui_string("erase_all").unwrap_or("erase_all").to_string() + ".";
         self.spawn_job(
-            &format!("{} \u{2014} {}", t!("erase_all").to_string(), t!("touch_the_key").to_string()),
+            &erase_all_label,
             move || {
                 let result = (|| -> Result<(), OtpTransportError> {
                     let mut session = target.open()?;
@@ -858,7 +868,7 @@ impl App {
                     }
                     match result {
                         Ok(()) => {
-                            app.otp.info = Some(t!("erase_all").to_string() + ".");
+                            app.otp.info = Some(erase_all_msg);
                             app.load_otp_entries();
                         }
                         Err(e) => app.otp.error = Some(e.to_string()),
@@ -878,7 +888,7 @@ impl App {
 
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new(t!("on_device_otp").to_string())
+                egui::RichText::new(self.translations.ui_string("on_device_otp").unwrap_or("on_device_otp").to_string())
                     .font(theme::f_sb(14.5))
                     .color(p.txt),
             );
@@ -896,7 +906,7 @@ impl App {
                 let mut new_transport: Option<OtpTransportSel> = None;
 
                 let menu_btn =
-                    theme::button(ui, p, BtnKind::Default, "...").on_hover_text(t!("more_actions").to_string());
+                    theme::button(ui, p, BtnKind::Default, "...").on_hover_text(self.translations.ui_string("more_actions").unwrap_or("more_actions").to_string());
                 let menu_id = ui.make_persistent_id("otp_more_menu");
                 egui::Popup::menu(&menu_btn)
                     .id(menu_id)
@@ -906,7 +916,7 @@ impl App {
 
                         // Transport selector.
                         ui.label(
-                            egui::RichText::new(t!("transport").to_string())
+                            egui::RichText::new(self.translations.ui_string("transport").unwrap_or("transport").to_string())
                                 .font(theme::f_reg(11.0))
                                 .color(p.txt3),
                         );
@@ -928,7 +938,7 @@ impl App {
                         // keyboard interface is off or unsupported.
                         let touch_blocked = self.otp.touch_hotp_ok == Some(false);
                         ui.add_enabled_ui(!touch_blocked, |ui| {
-                            let r = ui.selectable_label(false, t!("configure_hid_hotp").to_string() + "\u{2026}");
+                            let r = ui.selectable_label(false, self.translations.ui_string("configure_hid_hotp").unwrap_or("configure_hid_hotp").to_string() + "\u{2026}");
                             let r = match self.otp.touch_hotp_why {
                                 Some(why) if touch_blocked => r.on_disabled_hover_text(why),
                                 _ => r,
@@ -941,9 +951,9 @@ impl App {
                         // Enable/Disable the keyboard-HID interface.
                         if let Some(iface) = self.otp.iface {
                             let (label, target) = if iface.keyboard {
-                                (t!("disable_hid_hotp").to_string(), false)
+                                (self.translations.ui_string("disable_hid_hotp").unwrap_or("disable_hid_hotp").to_string(), false)
                             } else {
-                                (t!("enable_hid_hotp").to_string(), true)
+                                (self.translations.ui_string("enable_hid_hotp").unwrap_or("enable_hid_hotp").to_string(), true)
                             };
                             let would_underflow = !target && {
                                 let after = IfaceState {
@@ -1008,7 +1018,7 @@ impl App {
                 // Primary actions, to the left of the overflow menu (added after
                 // it so they sit left of it in this right-to-left layout).
                 ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Primary, &format!("{} {}", "+", t!("add_entry").to_string())).clicked() {
+                if theme::button(ui, p, BtnKind::Primary, &format!("{} {}", "+", self.translations.ui_string("add_entry").unwrap_or("add_entry").to_string())).clicked() {
                     // OtpAddDialog has a Drop impl (wipes the typed seed), so
                     // `..Default` struct-update isn't allowed; build via default()
                     // then flip `open`.
@@ -1020,7 +1030,7 @@ impl App {
                     self.secret_reveal.insert("otp-add-secret", false);
                 }
                 ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, &t!("refresh").to_string()).clicked() {
+                if theme::button(ui, p, BtnKind::Default, &self.translations.ui_string("refresh").unwrap_or("refresh").to_string()).clicked() {
                     self.otp.active = None;
                     self.otp.serial = None;
                     self.load_otp_entries();
@@ -1061,7 +1071,7 @@ impl App {
 
         if !self.otp.loaded {
             ui.label(
-                egui::RichText::new(t!("reading_entries").to_string())
+                egui::RichText::new(self.translations.ui_string("reading_entries").unwrap_or("reading_entries").to_string())
                     .font(theme::f_reg(13.0))
                     .color(p.txt3),
             );
@@ -1069,7 +1079,7 @@ impl App {
         }
         if self.otp.rows.is_empty() && self.otp.error.is_none() {
             ui.label(
-                egui::RichText::new(t!("no_otp_entries").to_string())
+                egui::RichText::new(self.translations.ui_string("no_otp_entries").unwrap_or("no_otp_entries").to_string())
                     .font(theme::f_reg(13.0))
                     .color(p.txt3),
             );
@@ -1103,13 +1113,13 @@ impl App {
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Default, &t!("delete").to_string()).clicked() {
+                        if theme::button(ui, p, BtnKind::Default, &self.translations.ui_string("delete").unwrap_or("delete").to_string()).clicked() {
                             delete = Some((row.app_name.clone(), row.account_name.clone()));
                         }
                         ui.add_space(8.0);
                         match &row.code {
                             Some(code) => {
-                                if theme::button(ui, p, BtnKind::Default, &t!("copy").to_string()).clicked() {
+                                if theme::button(ui, p, BtnKind::Default, &self.translations.ui_string("copy").unwrap_or("copy").to_string()).clicked() {
                                     copy = Some(code.clone());
                                 }
                                 ui.add_space(8.0);
@@ -1141,7 +1151,7 @@ impl App {
                                     theme::ring(ui, pct, 18.0, ring_color, p.line);
                                     ui.add_space(6.0);
                                     ui.label(
-                                        egui::RichText::new(format!("{secs}s"))
+                                        egui::RichText::new(self.translations.ui_string("{secs}s").unwrap_or("{secs}s"))
                                             .font(theme::f_reg(11.0))
                                             .color(p.txt3),
                                     );
@@ -1153,7 +1163,7 @@ impl App {
                                     // Already read on touch this session — show it
                                     // (TOTP touch entries still have a window, but
                                     // the device gives no countdown for them here).
-                                    if theme::button(ui, p, BtnKind::Default, &t!("copy").to_string()).clicked() {
+                                    if theme::button(ui, p, BtnKind::Default, &self.translations.ui_string("copy").unwrap_or("copy").to_string()).clicked() {
                                         copy = Some(code.clone());
                                     }
                                     ui.add_space(8.0);
@@ -1163,8 +1173,8 @@ impl App {
                                             .color(p.txt),
                                     );
                                 } else if row.button_required {
-                                    if theme::button(ui, p, BtnKind::Default, &t!("read_code").to_string())
-                                        .on_hover_text(t!("touch_the_key").to_string())
+                                    if theme::button(ui, p, BtnKind::Default, &self.translations.ui_string("read_code").unwrap_or("read_code").to_string())
+                                        .on_hover_text(self.translations.ui_string("touch_the_key").unwrap_or("touch_the_key").to_string())
                                         .clicked()
                                     {
                                         read_touch = Some(rkey);
@@ -1195,7 +1205,7 @@ impl App {
 
         ui.add_space(10.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if theme::button(ui, p, BtnKind::Danger, &format!("{}\u{2026}", t!("erase_all").to_string())).clicked() {
+            if theme::button(ui, p, BtnKind::Danger, &format!("{}\u{2026}", self.translations.ui_string("erase_all").unwrap_or("erase_all").to_string())).clicked() {
                 self.otp.confirm_delete = Some((String::new(), String::new())); // sentinel = erase-all
             }
         });
@@ -1221,7 +1231,7 @@ impl App {
         let mut cancel = false;
         theme::card_frame(p).show(ui, |ui| {
             ui.label(
-                egui::RichText::new(t!("otp_add_title").to_string())
+                egui::RichText::new(self.translations.ui_string("otp_add_title").unwrap_or("otp_add_title").to_string())
                     .font(theme::f_sb(13.5))
                     .color(p.txt),
             );
@@ -1230,15 +1240,15 @@ impl App {
                 .num_columns(2)
                 .spacing([10.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label(t!("issuer_app").to_string());
+                    ui.label(self.translations.ui_string("issuer_app").unwrap_or("issuer_app").to_string());
                     ui.text_edit_singleline(&mut self.otp.add.app_name);
                     ui.end_row();
 
-                    ui.label(t!("account").to_string());
+                    ui.label(self.translations.ui_string("account").unwrap_or("account").to_string());
                     ui.text_edit_singleline(&mut self.otp.add.account_name);
                     ui.end_row();
 
-                    ui.label(t!("secret_base32").to_string());
+                    ui.label(self.translations.ui_string("secret_base32").unwrap_or("secret_base32").to_string());
                     {
                         let mut rev = self
                             .secret_reveal
@@ -1259,41 +1269,41 @@ impl App {
                         ui.end_row();
                     }
 
-                    ui.label(t!("otp_type").to_string());
+                    ui.label(self.translations.ui_string("otp_type").unwrap_or("otp_type").to_string());
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.otp.add.totp, true, "TOTP");
                         ui.selectable_value(&mut self.otp.add.totp, false, "HOTP");
                     });
                     ui.end_row();
 
-                    ui.label(t!("algorithm").to_string());
+                    ui.label(self.translations.ui_string("algorithm").unwrap_or("algorithm").to_string());
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.otp.add.sha256, false, "SHA1");
                         ui.selectable_value(&mut self.otp.add.sha256, true, "SHA256");
                     });
                     ui.end_row();
 
-                    ui.label(t!("digits").to_string());
+                    ui.label(self.translations.ui_string("digits").unwrap_or("digits").to_string());
                     ui.add(egui::DragValue::new(&mut self.otp.add.digits).range(4..=10));
                     ui.end_row();
 
                     if self.otp.add.totp {
-                        ui.label(t!("period_seconds").to_string());
+                        ui.label(self.translations.ui_string("period_seconds").unwrap_or("period_seconds").to_string());
                         ui.add(egui::DragValue::new(&mut self.otp.add.period).range(1..=120));
                         ui.end_row();
                     }
 
-                    ui.label(t!("require_touch").to_string());
+                    ui.label(self.translations.ui_string("require_touch").unwrap_or("require_touch").to_string());
                     ui.checkbox(&mut self.otp.add.require_touch, "");
                     ui.end_row();
                 });
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if theme::button(ui, p, BtnKind::Primary, &t!("add").to_string()).clicked() {
+                if theme::button(ui, p, BtnKind::Primary, &self.translations.ui_string("add").unwrap_or("add").to_string()).clicked() {
                     submit = true;
                 }
                 ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, &t!("cancel").to_string()).clicked() {
+                if theme::button(ui, p, BtnKind::Default, &self.translations.ui_string("cancel").unwrap_or("cancel").to_string()).clicked() {
                     cancel = true;
                 }
             });
@@ -1319,7 +1329,7 @@ impl App {
         theme::card_frame(p).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(t!("hide_hotp_title").to_string())
+                    egui::RichText::new(self.translations.ui_string("hide_hotp_title").unwrap_or("hide_hotp_title").to_string())
                         .font(theme::f_sb(13.5))
                         .color(p.txt),
                 );
@@ -1329,7 +1339,7 @@ impl App {
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(
-                    t!("hide_hotp_desc").to_string(),
+                    self.translations.ui_string("hide_hotp_desc").unwrap_or("hide_hotp_desc").to_string(),
                 )
                 .font(theme::f_reg(11.5))
                 .color(p.txt3),
@@ -1337,25 +1347,25 @@ impl App {
             ui.add_space(8.0);
             match self.otp.button_hotp_status {
                 Some(st) if st.configured => {
-                    theme::pill(ui, &t!("seed_configured").to_string(), p.ok, p.ok_soft());
+                    theme::pill(ui, &self.translations.ui_string("seed_configured").unwrap_or("seed_configured").to_string(), p.ok, p.ok_soft());
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(
-                            t!("seed_configured_hint").to_string(),
+                            self.translations.ui_string("seed_configured_hint").unwrap_or("seed_configured_hint").to_string(),
                         )
                         .font(theme::f_reg(11.0))
                         .color(p.txt3),
                     );
                 }
                 Some(_) => {
-                    theme::pill(ui, &t!("no_seed_configured").to_string(), p.txt3, p.line);
+                    theme::pill(ui, &self.translations.ui_string("no_seed_configured").unwrap_or("no_seed_configured").to_string(), p.txt3, p.line);
                 }
                 None => {
-                    theme::pill(ui, &t!("slot_status_unknown").to_string(), p.txt3, p.line);
+                    theme::pill(ui, &self.translations.ui_string("slot_status_unknown").unwrap_or("slot_status_unknown").to_string(), p.txt3, p.line);
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(
-                            t!("slot_status_hint").to_string(),
+                            self.translations.ui_string("slot_status_hint").unwrap_or("slot_status_hint").to_string(),
                         )
                         .font(theme::f_reg(11.0))
                         .color(p.txt3),
@@ -1372,12 +1382,12 @@ impl App {
                         Some(st) if st.configured
                     );
                     ui.label(if configured {
-                        t!("new_secret_base32").to_string()
+                        self.translations.ui_string("new_secret_base32").unwrap_or("new_secret_base32").to_string()
                     } else {
-                        t!("secret_base32").to_string()
+                        self.translations.ui_string("secret_base32").unwrap_or("secret_base32").to_string()
                     });
                     let bh_hint = if configured {
-                        t!("leave_blank_hint").to_string()
+                        self.translations.ui_string("leave_blank_hint").unwrap_or("leave_blank_hint").to_string()
                     } else {
                         "".to_string()
                     };
@@ -1404,7 +1414,7 @@ impl App {
                     // only editable when a secret is being entered — with a blank
                     // secret (options-only Save) the existing length is kept.
                     let seed_present = !self.otp.button_hotp.secret.trim().is_empty();
-                    ui.label(t!("digits").to_string());
+                    ui.label(self.translations.ui_string("digits").unwrap_or("digits").to_string());
                     ui.add_enabled_ui(seed_present, |ui| {
                         ui.horizontal(|ui| {
                             ui.selectable_value(&mut self.otp.button_hotp.digits, 6u8, "6");
@@ -1413,33 +1423,33 @@ impl App {
                     })
                     .response
                     .on_disabled_hover_text(
-                        t!("digit_length_hint").to_string(),
+                        self.translations.ui_string("digit_length_hint").unwrap_or("digit_length_hint").to_string(),
                     );
                     ui.end_row();
 
-                    ui.label(t!("send_enter").to_string());
+                    ui.label(self.translations.ui_string("send_enter").unwrap_or("send_enter").to_string());
                     ui.checkbox(&mut self.otp.button_hotp.send_enter, "");
                     ui.end_row();
 
-                    ui.label(t!("long_touch").to_string());
+                    ui.label(self.translations.ui_string("long_touch").unwrap_or("long_touch").to_string());
                     ui.checkbox(&mut self.otp.button_hotp.long_touch, "");
                     ui.end_row();
 
-                    ui.label(t!("numeric_keypad").to_string());
+                    ui.label(self.translations.ui_string("numeric_keypad").unwrap_or("numeric_keypad").to_string());
                     ui.checkbox(&mut self.otp.button_hotp.numpad, "");
                     ui.end_row();
                 });
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if theme::button(ui, p, BtnKind::Primary, &t!("save").to_string()).clicked() {
+                if theme::button(ui, p, BtnKind::Primary, &self.translations.ui_string("save").unwrap_or("save").to_string()).clicked() {
                     submit = true;
                 }
                 ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, &t!("cancel").to_string()).clicked() {
+                if theme::button(ui, p, BtnKind::Default, &self.translations.ui_string("cancel").unwrap_or("cancel").to_string()).clicked() {
                     cancel = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Danger, &t!("clear_slot").to_string()).clicked() {
+                    if theme::button(ui, p, BtnKind::Danger, &self.translations.ui_string("clear_slot").unwrap_or("clear_slot").to_string()).clicked() {
                         clear = true;
                     }
                 });
@@ -1470,22 +1480,22 @@ impl App {
         let mut cancel = false;
         theme::card_frame(p).show(ui, |ui| {
             let title = if enable {
-                t!("enable_hid_hotp_confirm").to_string()
+                self.translations.ui_string("enable_hid_hotp_confirm").unwrap_or("enable_hid_hotp_confirm").to_string()
             } else {
-                t!("disable_hid_hotp_confirm").to_string()
+                self.translations.ui_string("disable_hid_hotp_confirm").unwrap_or("disable_hid_hotp_confirm").to_string()
             };
             ui.colored_label(p.err, title);
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(
-                    t!("keyboard_reconfigure_warning").to_string(),
+                    self.translations.ui_string("keyboard_reconfigure_warning").unwrap_or("keyboard_reconfigure_warning").to_string(),
                 )
                 .font(theme::f_reg(11.5))
                 .color(p.txt3),
             );
             ui.add_space(8.0);
             ui.label(
-                egui::RichText::new(t!("type_change_interface").to_string())
+                egui::RichText::new(self.translations.ui_string("type_change_interface").unwrap_or("type_change_interface").to_string())
                     .font(theme::f_reg(12.0))
                     .color(p.txt2),
             );
@@ -1500,12 +1510,12 @@ impl App {
                 .is_some_and(|t| t.typed.trim() == PHRASE);
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(matched, |ui| {
-                    if theme::button(ui, p, BtnKind::Danger, &t!("apply").to_string()).clicked() {
+                    if theme::button(ui, p, BtnKind::Danger, &self.translations.ui_string("apply").unwrap_or("apply").to_string()).clicked() {
                         apply = true;
                     }
                 });
                 ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, &t!("cancel").to_string()).clicked() {
+                if theme::button(ui, p, BtnKind::Default, &self.translations.ui_string("cancel").unwrap_or("cancel").to_string()).clicked() {
                     cancel = true;
                 }
             });
@@ -1529,18 +1539,18 @@ impl App {
         let mut cancel = false;
         theme::card_frame(p).show(ui, |ui| {
             let msg = if erase_all {
-                t!("otp_cannot_be_undone").to_string()
+                self.translations.ui_string("otp_cannot_be_undone").unwrap_or("otp_cannot_be_undone").to_string()
             } else if app_name.is_empty() {
-                format!("{} \"{}\"", t!("otp_delete_entry").to_string(), account_name)
+                format!("{} \"{}\"", self.translations.ui_string("otp_delete_entry").unwrap_or("otp_delete_entry").to_string(), account_name)
             } else {
-                format!("{} \"{}:{}\"", t!("otp_delete_entry").to_string(), app_name, account_name)
+                format!("{} \"{}:{}\"", self.translations.ui_string("otp_delete_entry").unwrap_or("otp_delete_entry").to_string(), app_name, account_name)
             };
             ui.colored_label(p.err, msg);
             if erase_all {
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(
-                        t!("otp_touch_sensor").to_string(),
+                        self.translations.ui_string("otp_touch_sensor").unwrap_or("otp_touch_sensor").to_string(),
                     )
                     .font(theme::f_reg(11.5))
                     .color(p.txt3),
@@ -1548,12 +1558,12 @@ impl App {
             }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                let label = if erase_all { &t!("erase_all").to_string() } else { &t!("delete").to_string() };
+                let label = if erase_all { &self.translations.ui_string("erase_all").unwrap_or("erase_all").to_string() } else { &self.translations.ui_string("delete").unwrap_or("delete").to_string() };
                 if theme::button(ui, p, BtnKind::Danger, label).clicked() {
                     confirm = true;
                 }
                 ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, &t!("cancel").to_string()).clicked() {
+                if theme::button(ui, p, BtnKind::Default, &self.translations.ui_string("cancel").unwrap_or("cancel").to_string()).clicked() {
                     cancel = true;
                 }
             });
