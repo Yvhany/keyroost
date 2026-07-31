@@ -119,7 +119,17 @@ impl Translations {
         ui_strings.insert("scan_devices", "Scan for devices".to_string());
         ui_strings.insert("supported_devices", "Supported devices".to_string());
         ui_strings.insert("settings", "Settings".to_string());
+        ui_strings.insert("general", "General".to_string());
         ui_strings.insert("language", "Language".to_string());
+        ui_strings.insert("text_size", "Text size".to_string());
+        ui_strings.insert("dark_mode", "Dark mode".to_string());
+        ui_strings.insert("light", "Light".to_string());
+        ui_strings.insert("dark", "Dark".to_string());
+        ui_strings.insert("follow_system", "Follow system".to_string());
+        ui_strings.insert("about", "About".to_string());
+        ui_strings.insert("learn", "Learn".to_string());
+        ui_strings.insert("activity_log", "Activity log".to_string());
+        ui_strings.insert("name_save_desc", "Saves this key's serial with the name to keys.json on this computer \u{2014} nothing leaves your machine. Up to 64 characters.".to_string());
         ui_strings.insert("refresh", "Refresh".to_string());
         ui_strings.insert("devices", "DEVICES".to_string());
         ui_strings.insert("no_keys", "No keys detected yet.".to_string());
@@ -142,7 +152,7 @@ impl Translations {
         ui_strings.insert("connected", "Connected".to_string());
         ui_strings.insert("name_this_key", "Name this key".to_string());
         ui_strings.insert("manage", "Manage".to_string());
-        ui_strings.insert("several_keys", "Several keys plugged in? Give them names".to_string());
+        ui_strings.insert("several_keys", "Several keys plugged in?".to_string());
         ui_strings.insert("generate_key", "Generate key".to_string());
         ui_strings.insert("certificate", "Certificate".to_string());
         ui_strings.insert("name", "Name".to_string());
@@ -166,6 +176,25 @@ impl Translations {
         ui_strings.insert("reset_applet_desc", "Wipes ALL PIV keys, certificates, and PINs. Only works when both the PIN and PUK are already blocked.".to_string());
         ui_strings.insert("state_empty", "State: empty".to_string());
         ui_strings.insert("generate", "Generate...".to_string());
+        // 9.42 new translation keys
+        ui_strings.insert("historical_devices", "Historical devices".to_string());
+        ui_strings.insert("connected_count", "Connected ({})".to_string());
+        ui_strings.insert("rescan", "Rescan".to_string());
+        ui_strings.insert("edit_device", "Edit device".to_string());
+        ui_strings.insert("name_key", "Name key".to_string());
+        ui_strings.insert("view_serial", "View serial number".to_string());
+        ui_strings.insert("remove_from_history", "Remove from history".to_string());
+        ui_strings.insert("device_name", "Device name".to_string());
+        ui_strings.insert("notes", "Notes".to_string());
+        ui_strings.insert("serial_number", "Serial number".to_string());
+        ui_strings.insert("save_key", "Save key".to_string());
+        ui_strings.insert("key_saved", "Key saved".to_string());
+        ui_strings.insert("key_recognized", "Recognized saved key".to_string());
+        // 10.23 新增翻译键
+        ui_strings.insert("vendor", "Vendor".to_string());
+        ui_strings.insert("first_connected", "First connected".to_string());
+        ui_strings.insert("device_type", "Device type".to_string());
+        ui_strings.insert("theme", "Theme".to_string());
 
         Self {
             help_titles,
@@ -241,7 +270,17 @@ impl Translations {
         ui_strings.insert("scan_devices", "扫描设备".to_string());
         ui_strings.insert("supported_devices", "支持的设备".to_string());
         ui_strings.insert("settings", "设置".to_string());
+        ui_strings.insert("general", "通用".to_string());
         ui_strings.insert("language", "语言".to_string());
+        ui_strings.insert("text_size", "文字大小".to_string());
+        ui_strings.insert("dark_mode", "深色模式".to_string());
+        ui_strings.insert("light", "亮".to_string());
+        ui_strings.insert("dark", "暗".to_string());
+        ui_strings.insert("follow_system", "跟随系统".to_string());
+        ui_strings.insert("about", "关于".to_string());
+        ui_strings.insert("learn", "学习".to_string());
+        ui_strings.insert("activity_log", "活动日志".to_string());
+        ui_strings.insert("name_save_desc", "将此密钥的序列号与名称一起保存到本机的 keys.json 中 \u{2014} 数据不会离开您的电脑。最多 64 个字符。".to_string());
         ui_strings.insert("refresh", "刷新".to_string());
         ui_strings.insert("devices", "设备".to_string());
         ui_strings.insert("no_keys", "尚未检测到密钥。".to_string());
@@ -264,7 +303,7 @@ impl Translations {
         ui_strings.insert("connected", "已连接".to_string());
         ui_strings.insert("name_this_key", "命名此密钥".to_string());
         ui_strings.insert("manage", "管理".to_string());
-        ui_strings.insert("several_keys", "插入了多个密钥？为它们命名".to_string());
+        ui_strings.insert("several_keys", "插入了多个密钥？".to_string());
         ui_strings.insert("generate_key", "生成密钥".to_string());
         ui_strings.insert("certificate", "证书".to_string());
         ui_strings.insert("name", "名称".to_string());
@@ -377,6 +416,25 @@ impl Translations {
         ui_strings.insert("open_windows_settings", "打开 Windows 安全密钥设置".to_string());
         ui_strings.insert("restart_as_admin", "以管理员身份重启".to_string());
         ui_strings.insert("unlock_this_key", "解锁此密钥".to_string());
+        // 9.42 新增翻译键
+        ui_strings.insert("historical_devices", "历史设备".to_string());
+        ui_strings.insert("connected_count", "已连接({})".to_string());
+        ui_strings.insert("rescan", "重新扫描".to_string());
+        ui_strings.insert("edit_device", "编辑设备".to_string());
+        ui_strings.insert("name_key", "命名密钥".to_string());
+        ui_strings.insert("view_serial", "查看序列号".to_string());
+        ui_strings.insert("remove_from_history", "从历史记录中移除".to_string());
+        ui_strings.insert("device_name", "设备名称".to_string());
+        ui_strings.insert("notes", "备注".to_string());
+        ui_strings.insert("serial_number", "序列号".to_string());
+        ui_strings.insert("save_key", "保存密钥".to_string());
+        ui_strings.insert("key_saved", "密钥已保存".to_string());
+        ui_strings.insert("key_recognized", "已识别已保存的密钥".to_string());
+        // 10.23 新增翻译键
+        ui_strings.insert("vendor", "厂商".to_string());
+        ui_strings.insert("first_connected", "首次连接".to_string());
+        ui_strings.insert("device_type", "设备类型".to_string());
+        ui_strings.insert("theme", "主题".to_string());
         ui_strings.insert("enter_pin_unlock", "输入 PIN 以解锁此密钥".to_string());
         ui_strings.insert("unlock", "解锁".to_string());
         ui_strings.insert("unlock_manage", "解锁以管理通行密钥、指纹和设置".to_string());
@@ -504,7 +562,7 @@ impl Translations {
         ui_strings.insert("reset_applet", "重置小程序".to_string());
         ui_strings.insert("state_label", "状态".to_string());
         ui_strings.insert("state_read_status", "读取状态以查看此密钥".to_string());
-        ui_strings.insert("several_keys", "插入了多个密钥".to_string());
+        ui_strings.insert("several_keys", "插入了多个密钥？".to_string());
         ui_strings.insert("give_names", "为它们命名".to_string());
         ui_strings.insert("name_save_desc", "将此密钥的序列号与名称一起保存到本机的 keys.json 中 — 数据不会离开您的电脑。最多 64 个字符。".to_string());
         ui_strings.insert("name_save_desc_token", "将此令牌的序列号与名称一起保存到本机的 keys.json 中 — 数据不会离开您的电脑。".to_string());

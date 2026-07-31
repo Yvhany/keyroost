@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // Initialize rust-i18n
 #[macro_use]
 extern crate rust_i18n;
-i18n!("locales", fallback = "en");
+i18n!("language", fallback = "en");
 
 mod locales;
 mod otp_pane;
@@ -40,13 +40,12 @@ use keyroost_ctap::cred_mgmt::{Credential, CredsMetadata, RelyingParty};
 use keyroost_ctap::{AuthenticatorInfo, CtapHidDevice, InitResponse};
 
 /// Add ellipsis to button text for non-Chinese locales.
-/// Chinese buttons should not have trailing ellipsis.
 fn btn_label(text: &str) -> String {
     let locale = rust_i18n::locale();
     if locale.starts_with("zh") {
         text.to_string()
     } else {
-        btn_label(text)
+        format!("{}\u{2026}", text)
     }
 }
 
@@ -1510,7 +1509,16 @@ impl PivSlotSel {
         }
     }
     fn label(self) -> String {
-        self.to_slot().label()
+        match self {
+            PivSlotSel::Auth => t!("authentication_9a").to_string(),
+            PivSlotSel::Sign => t!("signature_9c").to_string(),
+            PivSlotSel::KeyMgmt => t!("key_management_9d").to_string(),
+            PivSlotSel::CardAuth => t!("card_authentication_9e").to_string(),
+            PivSlotSel::Retired(n) => {
+                let slot = self.to_slot();
+                slot.label()
+            }
+        }
     }
 }
 
@@ -1709,7 +1717,10 @@ fn main() -> eframe::Result<()> {
                 reader_watch: Some(reader_watch),
                 mds: ui::mds::MdsDb::load_bundled(),
                 language: saved.language.into(),
+                pending_language: saved.language.into(),
                 translations: Translations::new(saved.language.into()),
+                saved_keys: SavedKey::load(),
+                app_config: AppConfig::load(),
                 ..Default::default()
             };
             // Set the rust-i18n locale based on saved language
@@ -1933,8 +1944,194 @@ struct App {
     translations: Translations,
     /// Current language setting.
     language: Language,
+    /// Pending language selection in settings dialog.
+    pending_language: Language,
+    /// Current settings tab (0=Language, 1=Appearance, 2=About).
+    settings_tab: u8,
     /// Whether the settings dialog is open.
     settings_open: bool,
+    /// Flag to apply language change on next frame.
+    apply_language_change: bool,
+    /// 已保存的密钥列表
+    saved_keys: Vec<SavedKey>,
+    /// 编辑设备对话框是否打开
+    edit_device_open: bool,
+    /// 当前编辑的设备ID
+    edit_device_id: Option<String>,
+    /// 设备名称编辑缓冲区
+    edit_device_name: String,
+    /// 设备注释编辑缓冲区
+    edit_device_notes: String,
+    /// 应用配置
+    app_config: AppConfig,
+}
+
+/// 已保存的密钥信息
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct SavedKey {
+    /// 设备ID
+    #[serde(default)]
+    id: String,
+    /// 设备名称
+    #[serde(default)]
+    name: String,
+    /// 设备序列号
+    #[serde(default)]
+    serial: String,
+    /// 设备厂商
+    #[serde(default)]
+    vendor: String,
+    /// 设备型号
+    #[serde(default)]
+    model: String,
+    /// 备注信息
+    #[serde(default)]
+    notes: String,
+    /// 保存时间戳
+    #[serde(default)]
+    saved_at: u64,
+    /// 首次连接时间
+    #[serde(default)]
+    first_connected_at: u64,
+    /// 设备类型
+    #[serde(default)]
+    device_type: String,
+}
+
+/// 配置文件结构
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct AppConfig {
+    /// 语言设置
+    #[serde(default = "default_language")]
+    language: String,
+    /// 深色模式
+    #[serde(default = "default_dark_mode")]
+    dark_mode: bool,
+    /// 字体大小
+    #[serde(default = "default_font_size")]
+    font_size: f32,
+}
+
+fn default_language() -> String {
+    "zh-CN".to_string()
+}
+
+fn default_dark_mode() -> bool {
+    true
+}
+
+fn default_font_size() -> f32 {
+    1.0
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            language: default_language(),
+            dark_mode: default_dark_mode(),
+            font_size: default_font_size(),
+        }
+    }
+}
+
+impl AppConfig {
+    /// 获取配置文件路径
+    fn file_path() -> std::path::PathBuf {
+        std::path::PathBuf::from("config").join("settings.json")
+    }
+
+    /// 加载配置文件
+    fn load() -> Self {
+        let path = Self::file_path();
+        if !path.exists() {
+            return Self::default();
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// 保存配置文件
+    fn save(&self) -> Result<(), String> {
+        let path = Self::file_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let content = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        std::fs::write(&path, content).map_err(|e| e.to_string())
+    }
+}
+
+impl SavedKey {
+    /// 获取缓存目录路径
+    fn cache_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from("cache")
+    }
+
+    /// 获取单个设备的缓存文件路径
+    fn device_file_path(vendor: &str, serial: &str) -> std::path::PathBuf {
+        let cache_dir = Self::cache_dir();
+        let filename = if serial.is_empty() {
+            format!("{}.json", vendor)
+        } else {
+            format!("{}_{}.json", vendor, serial)
+        };
+        cache_dir.join(filename)
+    }
+
+    /// 加载所有已保存的密钥
+    fn load() -> Vec<SavedKey> {
+        let cache_dir = Self::cache_dir();
+        if !cache_dir.exists() {
+            return Vec::new();
+        }
+        let mut keys = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        if let Ok(key) = serde_json::from_str::<SavedKey>(&content) {
+                            keys.push(key);
+                        }
+                    }
+                }
+            }
+        }
+        keys
+    }
+
+    /// 保存单个密钥到缓存文件
+    fn save_key(key: &SavedKey) -> Result<(), String> {
+        let cache_dir = Self::cache_dir();
+        std::fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
+        let path = Self::device_file_path(&key.vendor, &key.serial);
+        let content = serde_json::to_string_pretty(key).map_err(|e| e.to_string())?;
+        std::fs::write(&path, content).map_err(|e| e.to_string())
+    }
+
+    /// 删除密钥缓存文件
+    fn remove_key(vendor: &str, serial: &str) -> Result<(), String> {
+        let path = Self::device_file_path(vendor, serial);
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// 根据厂商和序列号查找已保存的密钥
+    fn find_by_vendor_serial(vendor: &str, serial: &str) -> Option<SavedKey> {
+        let path = Self::device_file_path(vendor, serial);
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(key) = serde_json::from_str::<SavedKey>(&content) {
+                    return Some(key);
+                }
+            }
+        }
+        None
+    }
 }
 
 /// Which path text field a resolved file-chooser result should populate. Keeps
@@ -2419,6 +2616,14 @@ impl App {
             let overflow = self.log.len() - 200;
             self.log.drain(0..overflow);
         }
+    }
+
+    fn log_info(&mut self, text: &str) {
+        self.log(Severity::Info, text.to_string());
+    }
+
+    fn log_error(&mut self, text: &str) {
+        self.log(Severity::Err, text.to_string());
     }
 
     fn customer_key_bytes(&self) -> Result<Vec<u8>, String> {
@@ -4684,79 +4889,397 @@ impl App {
         }
     }
 
-    /// Settings dialog for language selection and other preferences.
+    /// Settings dialog with left sidebar and right content panel.
     fn render_settings_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
         let mut close = false;
-        let mut apply = false;
-        let mut new_language = self.language;
+        let prev_language = self.pending_language;
+        let prev_mode = self.mode;
+        let prev_colorblind = self.colorblind;
 
-        egui::Window::new(self.translations.ui_string("settings").unwrap_or("Settings"))
+        let total_width = 500.0;
+        let total_height = 350.0;
+        let sidebar_width = 130.0;
+        let content_width = total_width - sidebar_width - 1.0;
+
+        egui::Window::new("settings_window")
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
-            .max_width(250.0)
+            .fixed_size(egui::vec2(total_width, total_height))
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(egui::Frame {
+                inner_margin: egui::Margin::ZERO,
+                corner_radius: egui::CornerRadius::same(8),
+                fill: p.panel,
+                stroke: egui::Stroke::new(1.0, p.line),
+                ..Default::default()
+            })
             .show(ctx, |ui| {
+                // Title bar with close button
                 ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(self.translations.ui_string("language").unwrap_or("Language"))
-                        .font(theme::f_bold(14.0))
-                        .color(p.txt),
-                );
-                ui.add_space(8.0);
-
-                // Language selection
                 ui.horizontal(|ui| {
-                    let en_selected = self.language == Language::En;
-                    let zh_selected = self.language == Language::ZhCn;
-
-                    if ui
-                        .selectable_label(en_selected, "English")
-                        .clicked()
-                    {
-                        new_language = Language::En;
-                    }
-                    if ui
-                        .selectable_label(zh_selected, "简体中文")
-                        .clicked()
-                    {
-                        new_language = Language::ZhCn;
-                    }
-                });
-
-                ui.add_space(16.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                // Bottom buttons
-                ui.horizontal(|ui| {
-                    if theme::button(ui, p, BtnKind::Ghost, &t!("cancel").to_string()).clicked() {
-                        close = true;
-                    }
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(self.translations.ui_string("settings").unwrap_or("Settings"))
+                            .font(theme::f_bold(14.0))
+                            .color(p.txt),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Default, &t!("ok").to_string()).clicked() {
+                        ui.add_space(8.0);
+                        let close_btn = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("\u{2715}").font(theme::f_reg(12.0)).color(p.txt3)
+                            ).fill(egui::Color32::TRANSPARENT).stroke(egui::Stroke::NONE)
+                        );
+                        if close_btn.clicked() {
                             close = true;
-                            apply = true;
                         }
                     });
                 });
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // Main content: sidebar + right panel
+                ui.horizontal(|ui| {
+                    // Left sidebar
+                    ui.allocate_ui(egui::vec2(sidebar_width, total_height - 60.0), |ui| {
+                        ui.add_space(8.0);
+                        ui.vertical(|ui| {
+                            let items = [
+                                (0, self.translations.ui_string("general").unwrap_or("General")),
+                                (1, self.translations.ui_string("about").unwrap_or("About")),
+                            ];
+                            for (idx, label) in items.iter() {
+                                let selected = self.settings_tab == *idx;
+                                let label_str = label.to_string();
+                                let resp = ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new(&label_str)
+                                            .font(theme::f_reg(13.0))
+                                            .color(if selected { p.accent } else { p.txt })
+                                    ).fill(if selected { p.raised } else { egui::Color32::TRANSPARENT })
+                                    .stroke(egui::Stroke::NONE)
+                                    .min_size(egui::vec2(sidebar_width - 8.0, 28.0))
+                                );
+                                if resp.clicked() {
+                                    self.settings_tab = *idx;
+                                }
+                            }
+                        });
+                    });
+
+                    // Vertical separator
+                    let separator_rect = ui.cursor().min;
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(separator_rect.x, separator_rect.y),
+                            egui::pos2(separator_rect.x, separator_rect.y + 280.0),
+                        ],
+                        egui::Stroke::new(1.0, p.line_soft),
+                    );
+                    ui.add_space(1.0);
+
+                    // Right content panel
+                    ui.allocate_ui(egui::vec2(content_width, total_height - 60.0), |ui| {
+                        ui.add_space(4.0);
+                        match self.settings_tab {
+                            0 => {
+                                // General settings
+                                ui.vertical(|ui| {
+                                    ui.add_space(4.0);
+
+                                    // Language
+                                    ui.label(
+                                        egui::RichText::new(self.translations.ui_string("language").unwrap_or("Language"))
+                                            .font(theme::f_reg(13.0))
+                                            .color(p.txt2),
+                                    );
+                                    ui.add_space(4.0);
+                                    let lang_text = match self.pending_language {
+                                        Language::En => "English",
+                                        Language::ZhCn => "简体中文",
+                                    };
+                                    egui::ComboBox::from_id_salt("language_combo")
+                                        .selected_text(lang_text)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut self.pending_language, Language::En, "English");
+                                            ui.selectable_value(&mut self.pending_language, Language::ZhCn, "简体中文");
+                                        });
+                                    ui.add_space(12.0);
+
+                                    // Text size - compact style with +/- and percentage
+                                    ui.label(
+                                        egui::RichText::new(self.translations.ui_string("text_size").unwrap_or("Text size"))
+                                            .font(theme::f_reg(13.0))
+                                            .color(p.txt2),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        let zoom = theme::clamp_zoom(ui.ctx().zoom_factor());
+                                        let mut factor = self.zoom_pending.unwrap_or(zoom);
+
+                                        // [-] button
+                                        let (minus_rect, minus_resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+                                        let minus_hot = minus_resp.hovered();
+                                        ui.painter().rect_filled(minus_rect, 3.0, if minus_hot { p.raised } else { p.raised2 });
+                                        ui.painter().text(minus_rect.center(), egui::Align2::CENTER_CENTER, "\u{2212}", theme::f_sb(13.0), if minus_hot { p.txt } else { p.txt2 });
+                                        if minus_resp.clicked() {
+                                            factor = (factor - 0.05).max(0.80);
+                                        }
+
+                                        ui.add_space(4.0);
+
+                                        // Slider
+                                        let resp = ui.add(
+                                            egui::Slider::new(&mut factor, 0.80..=1.25)
+                                                .show_value(false)
+                                                .trailing_fill(true),
+                                        );
+                                        if resp.dragged() {
+                                            self.zoom_pending = Some(factor.clamp(0.80, 1.25));
+                                        } else if resp.drag_stopped() || resp.changed() {
+                                            ui.ctx().set_zoom_factor(factor.clamp(0.80, 1.25));
+                                            self.zoom_pending = None;
+                                        }
+
+                                        ui.add_space(4.0);
+
+                                        // [+] button
+                                        let (plus_rect, plus_resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+                                        let plus_hot = plus_resp.hovered();
+                                        ui.painter().rect_filled(plus_rect, 3.0, if plus_hot { p.raised } else { p.raised2 });
+                                        ui.painter().text(plus_rect.center(), egui::Align2::CENTER_CENTER, "+", theme::f_sb(13.0), if plus_hot { p.txt } else { p.txt2 });
+                                        if plus_resp.clicked() {
+                                            factor = (factor + 0.05).min(1.25);
+                                        }
+
+                                        ui.add_space(4.0);
+
+                                        // Percentage readout
+                                        ui.label(
+                                            egui::RichText::new(format!("{}%", (factor * 100.0).round() as i32))
+                                                .font(theme::f_sb(12.0))
+                                                .color(p.txt2),
+                                        );
+
+                                        // Apply +/- button changes
+                                        if minus_resp.clicked() || plus_resp.clicked() {
+                                            ui.ctx().set_zoom_factor(factor.clamp(0.80, 1.25));
+                                            self.zoom_pending = None;
+                                        }
+                                    });
+                                    ui.add_space(12.0);
+
+                                    // Dark mode - list selection
+                                    ui.label(
+                                        egui::RichText::new(self.translations.ui_string("dark_mode").unwrap_or("Dark mode"))
+                                            .font(theme::f_reg(13.0))
+                                            .color(p.txt2),
+                                    );
+                                    ui.add_space(4.0);
+                                    let mode_text = match self.mode {
+                                        ui::theme::Mode::Dark => self.translations.ui_string("dark").unwrap_or("Dark"),
+                                        ui::theme::Mode::Light => self.translations.ui_string("light").unwrap_or("Light"),
+                                    };
+                                    egui::ComboBox::from_id_salt("dark_mode_combo")
+                                        .selected_text(mode_text)
+                                        .show_ui(ui, |ui| {
+                                            if ui.selectable_label(self.mode == ui::theme::Mode::Light, self.translations.ui_string("light").unwrap_or("Light")).clicked() {
+                                                self.mode = ui::theme::Mode::Light;
+                                                self.persist_settings();
+                                            }
+                                            if ui.selectable_label(self.mode == ui::theme::Mode::Dark, self.translations.ui_string("dark").unwrap_or("Dark")).clicked() {
+                                                self.mode = ui::theme::Mode::Dark;
+                                                self.persist_settings();
+                                            }
+                                            if ui.selectable_label(false, self.translations.ui_string("follow_system").unwrap_or("Follow system")).clicked() {
+                                                self.persist_settings();
+                                            }
+                                        });
+                                });
+                            }
+                            _ => {
+                                // About
+                                ui.vertical(|ui| {
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new("keyroost v0.7.8-zh-CN")
+                                            .font(theme::f_reg(13.0))
+                                            .color(p.txt2),
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.hyperlink_to(
+                                        egui::RichText::new(self.translations.ui_string("learn").unwrap_or("Learn"))
+                                            .font(theme::f_reg(13.0))
+                                            .color(p.accent),
+                                        ui::help::LEARN_BASE,
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.hyperlink_to(
+                                        egui::RichText::new("GitHub")
+                                            .font(theme::f_reg(13.0))
+                                            .color(p.accent),
+                                        "https://github.com/Yvhany/keyroost",
+                                    );
+                                    ui.add_space(12.0);
+                                    ui.label(
+                                        egui::RichText::new(self.translations.ui_string("activity_log").unwrap_or("Activity log"))
+                                            .font(theme::f_reg(13.0))
+                                            .color(p.txt2),
+                                    );
+                                    ui.add_space(4.0);
+                                    if self.log_open {
+                                        for line in self.log.iter().take(10) {
+                                            ui.label(
+                                                egui::RichText::new(&line.text)
+                                                    .font(theme::f_mono(11.0))
+                                                    .color(p.txt3),
+                                            );
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    });
+                });
+
+                // Bottom OK button
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(total_width - 90.0);
+                    if theme::button(ui, p, BtnKind::Default, &self.translations.ui_string("ok").unwrap_or("OK")).clicked() {
+                        close = true;
+                    }
+                });
+                ui.add_space(8.0);
             });
 
         if close {
             self.settings_open = false;
         }
 
-        // Apply language change only when OK is clicked
-        if apply && new_language != self.language {
-            self.language = new_language;
-            self.translations = Translations::new(new_language);
-            // Set the rust-i18n locale
-            match new_language {
+        // Flag language change for next frame
+        if self.pending_language != prev_language {
+            self.language = self.pending_language;
+            self.apply_language_change = true;
+            match self.language {
                 Language::En => rust_i18n::set_locale("en"),
                 Language::ZhCn => rust_i18n::set_locale("zh-CN"),
             }
             self.persist_settings();
-            // Force UI refresh to apply new language
-            ctx.request_repaint();
+        }
+
+        // Flag other settings changes
+        if self.mode != prev_mode || self.colorblind != prev_colorblind {
+            self.persist_settings();
+        }
+    }
+
+    /// 渲染编辑设备对话框
+    fn render_edit_device_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
+        let mut close = false;
+        let mut save = false;
+
+        egui::Window::new("edit_device_window")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size(egui::vec2(400.0, 300.0))
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(egui::Frame {
+                inner_margin: egui::Margin::ZERO,
+                corner_radius: egui::CornerRadius::same(8),
+                fill: p.panel,
+                stroke: egui::Stroke::new(1.0, p.line),
+                ..Default::default()
+            })
+            .show(ctx, |ui| {
+                // 标题栏
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(self.translations.ui_string("edit_device").unwrap_or("Edit device"))
+                            .font(theme::f_bold(14.0))
+                            .color(p.txt),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(8.0);
+                        let close_btn = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("\u{2715}").font(theme::f_reg(12.0)).color(p.txt3)
+                            ).fill(egui::Color32::TRANSPARENT).stroke(egui::Stroke::NONE)
+                        );
+                        if close_btn.clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                // 内容
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(self.translations.ui_string("device_name").unwrap_or("Device name"))
+                            .font(theme::f_reg(12.0))
+                            .color(p.txt2),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.edit_device_name)
+                            .desired_width(350.0)
+                            .hint_text(self.translations.ui_string("device_name").unwrap_or("Device name"))
+                    );
+                });
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(self.translations.ui_string("notes").unwrap_or("Notes"))
+                            .font(theme::f_reg(12.0))
+                            .color(p.txt2),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.edit_device_notes)
+                            .desired_width(350.0)
+                            .desired_rows(3)
+                            .hint_text(self.translations.ui_string("notes").unwrap_or("Notes"))
+                    );
+                });
+                ui.add_space(12.0);
+
+                // 按钮
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    if theme::button(ui, p, BtnKind::Ghost, &self.translations.ui_string("cancel").unwrap_or("Cancel").to_string()).clicked() {
+                        close = true;
+                    }
+                    ui.add_space(8.0);
+                    if theme::button(ui, p, BtnKind::Primary, &self.translations.ui_string("save").unwrap_or("Save").to_string()).clicked() {
+                        save = true;
+                        close = true;
+                    }
+                });
+                ui.add_space(8.0);
+            });
+
+        if close {
+            self.edit_device_open = false;
+        }
+        if save {
+            self.save_edit_device();
         }
     }
 
@@ -5777,6 +6300,23 @@ fn unix_now() -> u32 {
         .unwrap_or(0)
 }
 
+/// 解析设备类型字符串为 Caps
+fn parse_device_type(device_type: &str) -> keyroost_resolve::Caps {
+    let mut caps = keyroost_resolve::Caps::default();
+    for part in device_type.split(',') {
+        match part.trim() {
+            "FIDO2" => caps.insert(keyroost_resolve::Caps::FIDO2),
+            "OATH" => caps.insert(keyroost_resolve::Caps::OATH),
+            "PGP" => caps.insert(keyroost_resolve::Caps::PGP),
+            "PIV" => caps.insert(keyroost_resolve::Caps::PIV),
+            "OTP" => caps.insert(keyroost_resolve::Caps::OTP),
+            "TOTP token" => caps.insert(keyroost_resolve::Caps::TOTP),
+            _ => {}
+        }
+    }
+    caps
+}
+
 // --- Device-centric coordination (selection, theme, per-device loads) --------
 impl App {
     /// The palette for the current theme + accent.
@@ -5808,6 +6348,104 @@ impl App {
         }
         current.save();
         self.last_saved_settings = Some(current);
+
+        // 保存应用配置到 config/settings.json
+        self.app_config.language = match self.language {
+            Language::En => "en".to_string(),
+            Language::ZhCn => "zh-CN".to_string(),
+        };
+        self.app_config.dark_mode = self.mode == Mode::Dark;
+        self.app_config.font_size = self.zoom;
+        let _ = self.app_config.save();
+    }
+
+    /// 保存当前选中的设备
+    fn save_current_device(&mut self) {
+        if let Some(dev) = self.selected_device() {
+            let key = SavedKey {
+                id: dev.id.clone(),
+                name: dev.name.clone().unwrap_or_default(),
+                serial: dev.serial.clone(),
+                vendor: dev.vendor.clone(),
+                model: dev.model.clone(),
+                notes: String::new(),
+                saved_at: unix_now() as u64,
+                first_connected_at: unix_now() as u64,
+                device_type: dev.cap_badges().join(","),
+            };
+            if let Err(e) = SavedKey::save_key(&key) {
+                self.log_error(&format!("Failed to save key: {}", e));
+            } else {
+                self.log_info("Key saved successfully");
+                self.saved_keys = SavedKey::load();
+            }
+        }
+    }
+
+    /// 打开编辑设备对话框
+    fn open_edit_device_dialog(&mut self) {
+        if let Some(dev) = self.selected_device().cloned() {
+            self.edit_device_id = Some(dev.id.clone());
+            self.edit_device_name = dev.name.clone().unwrap_or_default();
+            self.edit_device_notes = String::new();
+            // 查找已保存的备注
+            if let Some(saved) = SavedKey::find_by_vendor_serial(&dev.vendor, &dev.serial) {
+                self.edit_device_notes = saved.notes.clone();
+                self.edit_device_name = if saved.name.is_empty() {
+                    dev.name.clone().unwrap_or_default()
+                } else {
+                    saved.name.clone()
+                };
+            }
+            self.edit_device_open = true;
+        }
+    }
+
+    /// 保存编辑后的设备信息
+    fn save_edit_device(&mut self) {
+        if let Some(id) = self.edit_device_id.clone() {
+            if let Some(dev) = self.devices.iter_mut().find(|d| d.id == id) {
+                dev.name = if self.edit_device_name.is_empty() {
+                    None
+                } else {
+                    Some(self.edit_device_name.clone())
+                };
+            }
+            // 更新已保存的密钥
+            if let Some(dev) = self.devices.iter().find(|d| d.id == id) {
+                let existing = SavedKey::find_by_vendor_serial(&dev.vendor, &dev.serial);
+                let key = SavedKey {
+                    id: dev.id.clone(),
+                    name: self.edit_device_name.clone(),
+                    serial: dev.serial.clone(),
+                    vendor: dev.vendor.clone(),
+                    model: dev.model.clone(),
+                    notes: self.edit_device_notes.clone(),
+                    saved_at: unix_now() as u64,
+                    first_connected_at: existing.as_ref().map(|k| k.first_connected_at).unwrap_or_else(|| unix_now() as u64),
+                    device_type: dev.cap_badges().join(","),
+                };
+                if let Err(e) = SavedKey::save_key(&key) {
+                    self.log_error(&format!("Failed to save key: {}", e));
+                } else {
+                    self.log_info("Device info saved");
+                    self.saved_keys = SavedKey::load();
+                }
+            }
+            self.edit_device_open = false;
+        }
+    }
+
+    /// 从历史记录中移除设备
+    fn remove_device_from_history(&mut self, id: &str) {
+        if let Some(dev) = self.devices.iter().find(|d| d.id == id) {
+            if let Err(e) = SavedKey::remove_key(&dev.vendor, &dev.serial) {
+                self.log_error(&format!("Failed to remove key: {}", e));
+            } else {
+                self.log_info("Device removed from history");
+                self.saved_keys = SavedKey::load();
+            }
+        }
     }
 
     /// The currently selected device, if the id still resolves to a present one.
@@ -5911,7 +6549,72 @@ impl App {
                     let devices_changed = app.devices.len() != devices.len()
                         || app.devices.iter().zip(devices.iter()).any(|(a, b)| a.id != b.id);
                     if devices_changed {
-                        app.devices = devices;
+                        // 保存当前连接的设备到缓存
+                        for dev in &devices {
+                            if dev.kind == DeviceKind::Key && !dev.serial.is_empty() {
+                                let existing = SavedKey::find_by_vendor_serial(&dev.vendor, &dev.serial);
+                                let key = SavedKey {
+                                    id: dev.id.clone(),
+                                    name: dev.name.clone().unwrap_or_default(),
+                                    serial: dev.serial.clone(),
+                                    vendor: dev.vendor.clone(),
+                                    model: dev.model.clone(),
+                                    notes: existing.as_ref().map(|e| e.notes.clone()).unwrap_or_default(),
+                                    saved_at: unix_now() as u64,
+                                    first_connected_at: existing.as_ref().map(|e| e.first_connected_at).unwrap_or_else(|| unix_now() as u64),
+                                    device_type: dev.cap_badges().join(","),
+                                };
+                                // 如果已存在且有名称，保留名称
+                                let key = if let Some(ref existing) = existing {
+                                    if !existing.name.is_empty() {
+                                        SavedKey { name: existing.name.clone(), ..key }
+                                    } else {
+                                        key
+                                    }
+                                } else {
+                                    key
+                                };
+                                let _ = SavedKey::save_key(&key);
+                            }
+                        }
+
+                        // 加载历史设备（不在当前连接列表中的）
+                        let saved_keys = SavedKey::load();
+                        let mut all_devices = devices;
+                        for saved in &saved_keys {
+                            // 检查是否已在当前连接列表中
+                            let already_connected = all_devices.iter().any(|d| {
+                                d.vendor == saved.vendor && d.serial == saved.serial
+                            });
+                            if !already_connected && !saved.serial.is_empty() {
+                                // 创建历史设备条目
+                                let caps = parse_device_type(&saved.device_type);
+                                all_devices.push(Device {
+                                    id: format!("history:{}:{}", saved.vendor, saved.serial),
+                                    name: if saved.name.is_empty() { None } else { Some(saved.name.clone()) },
+                                    vendor: saved.vendor.clone(),
+                                    model: saved.model.clone(),
+                                    serial: saved.serial.clone(),
+                                    transport: "历史设备".into(),
+                                    firmware: String::new(),
+                                    caps,
+                                    kind: DeviceKind::Key,
+                                    hid_path: None,
+                                    reader: None,
+                                });
+                            }
+                        }
+
+                        // 按连接状态排序：已连接设备排前面，未连接设备按字母排序
+                        all_devices.sort_by(|a, b| {
+                            // 历史设备排后面
+                            let a_is_history = a.id.starts_with("history:");
+                            let b_is_history = b.id.starts_with("history:");
+                            a_is_history.cmp(&b_is_history)
+                                .then_with(|| a.vendor.cmp(&b.vendor))
+                                .then_with(|| a.model.cmp(&b.model))
+                        });
+                        app.devices = all_devices;
                     }
                     if changed {
                         app.on_device_selected();
@@ -7588,7 +8291,7 @@ fn paint_x_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
 /// Paint one selectable device row. The whole row is a single painter-drawn
 /// click target (no nested widgets), so clicking anywhere in it selects the
 /// device — fixing the "only the gaps are clickable" inconsistency.
-fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> bool {
+fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> (bool, egui::Response) {
     let w = ui.available_width();
     let h = 68.0;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
@@ -7699,7 +8402,7 @@ fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> b
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    resp.clicked()
+    (resp.clicked(), resp)
 }
 
 impl eframe::App for App {
@@ -7710,6 +8413,12 @@ impl eframe::App for App {
     // see the `settings` module.
 
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Apply pending language change at the start of the frame
+        if self.apply_language_change {
+            self.apply_language_change = false;
+            self.translations = Translations::new(self.language);
+        }
+
         // eframe 0.35 drives the app through `App::ui` with a root `Ui` rather
         // than the old `update(ctx)`. Our layout is panel-based: the four panels
         // below are shown into `root_ui`, while the dialogs/popovers (which still
@@ -7902,6 +8611,11 @@ impl eframe::App for App {
             self.render_settings_dialog(ctx, &p);
         }
 
+        // 编辑设备对话框
+        if self.edit_device_open {
+            self.render_edit_device_dialog(ctx, &p);
+        }
+
         // Help popover, painted last so it sits above everything.
         if let Some(topic) = self.help_open {
             if ui::help_popover(ctx, &p, topic, self.help_anchor, &self.translations) {
@@ -8004,13 +8718,40 @@ impl App {
                             .color(p.txt),
                     );
                     ui.add_space(12.0);
-                    theme::status_dot(ui, p.ok, 7.0);
-                    ui.add_space(5.0);
+
+                    // "设备" 标签
                     ui.label(
-                        egui::RichText::new(t!("connected_count").to_string().replace("{}", &self.devices.len().to_string()))
+                        egui::RichText::new(self.translations.ui_string("devices").unwrap_or("Devices"))
                             .font(theme::f_reg(12.0))
                             .color(p.txt2),
                     );
+                    ui.add_space(8.0);
+
+                    // 当前设备名称（如果有选中设备）
+                    if let Some(dev) = self.selected_device() {
+                        // 已连接设备显示绿色圆点
+                        let is_connected = !dev.id.starts_with("history:");
+                        if is_connected {
+                            theme::status_dot(ui, p.ok, 5.0);
+                            ui.add_space(4.0);
+                        }
+                        let display_name = dev.name.as_deref().unwrap_or(&dev.model);
+                        ui.label(
+                            egui::RichText::new(display_name)
+                                .font(theme::f_sb(12.0))
+                                .color(p.txt),
+                        );
+                        ui.add_space(8.0);
+                    }
+
+                    // 设备数量
+                    let total_count = self.devices.len();
+                    ui.label(
+                        egui::RichText::new(format!("（{}）", total_count))
+                            .font(theme::f_reg(12.0))
+                            .color(p.txt3),
+                    );
+
                     if self.busy() {
                         ui.add_space(12.0);
                         ui.spinner();
@@ -8030,69 +8771,6 @@ impl App {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Ghost, self.translations.ui_string("refresh").unwrap_or("Refresh")).clicked() {
-                            self.schedule_scan_burst();
-                        }
-                        ui.add_space(4.0);
-                        // Settings button
-                        if theme::button(ui, p, BtnKind::Ghost, self.translations.ui_string("settings").unwrap_or("Settings")).clicked() {
-                            self.settings_open = !self.settings_open;
-                        }
-                        ui.add_space(4.0);
-                        let log_color = if self.log_open { p.accent } else { p.txt2 };
-                        if ui
-                            .add(
-                                egui::Label::new(
-                                    egui::RichText::new(t!("activity_log").to_string())
-                                        .font(theme::f_sb(12.5))
-                                        .color(log_color),
-                                )
-                                .sense(egui::Sense::click()),
-                            )
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .clicked()
-                        {
-                            self.log_open = !self.log_open;
-                        }
-                        ui.add_space(10.0);
-                        ui.hyperlink_to(
-                            egui::RichText::new(t!("learn_arrow").to_string())
-                                .font(theme::f_sb(12.5))
-                                .color(p.txt2),
-                            ui::help::LEARN_BASE,
-                        );
-                        ui.add_space(10.0);
-                        let (trect, tresp) =
-                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-                        paint_theme_icon(ui, trect.center(), 7.0, p.txt2);
-                        if tresp
-                            .on_hover_text(t!("toggle_light_dark").to_string())
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .clicked()
-                        {
-                            self.mode = match self.mode {
-                                Mode::Dark => Mode::Light,
-                                Mode::Light => Mode::Dark,
-                            };
-                            self.persist_settings();
-                        }
-                        ui.add_space(10.0);
-                        let (erect, eresp) =
-                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-                        paint_eye_icon(
-                            ui,
-                            erect.center(),
-                            if self.colorblind { p.accent } else { p.txt2 },
-                        );
-                        if eresp
-                            .on_hover_text(t!("colorblind_safe").to_string())
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .clicked()
-                        {
-                            self.colorblind = !self.colorblind;
-                            self.persist_settings();
-                        }
-                        ui.add_space(10.0);
                         // "Text size" (issue #42): a compact UI-scale control.
                         // The slider drives egui's global zoom factor, which
                         // scales fonts AND painted symbols uniformly. A live "%"
@@ -8326,8 +9004,16 @@ impl App {
                             .font(theme::f_bold(11.0))
                             .color(p.txt3),
                     );
-                    ui.add_space(6.0);
+                    ui.add_space(4.0);
                     theme::pill(ui, &self.devices.len().to_string(), p.txt2, p.raised2);
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            format!("({})", t!("connected_count").to_string().replace("{}", &self.devices.len().to_string()))
+                        )
+                            .font(theme::f_reg(10.0))
+                            .color(p.txt3),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (rrect, rresp) =
                             ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
@@ -8338,6 +9024,11 @@ impl App {
                             .clicked()
                         {
                             self.schedule_scan_burst();
+                        }
+                        ui.add_space(6.0);
+                        // Settings button
+                        if theme::button(ui, p, BtnKind::Ghost, self.translations.ui_string("settings").unwrap_or("Settings")).clicked() {
+                            self.settings_open = !self.settings_open;
                         }
                     });
                 });
@@ -8368,15 +9059,52 @@ impl App {
                                 );
                             });
                         }
-                        for dev in self
+                        let device_ids: Vec<(String, DeviceKind)> = self
                             .devices
                             .iter()
                             .filter(|d| matches_filter(d, &self.filter))
-                        {
-                            let selected = self.selected_device.as_deref() == Some(dev.id.as_str());
-                            if device_row(ui, p, dev, selected) {
-                                clicked = Some(dev.id.clone());
+                            .map(|d| (d.id.clone(), d.kind))
+                            .collect();
+                        for (dev_id, dev_kind) in device_ids {
+                            let selected = self.selected_device.as_deref() == Some(dev_id.as_str());
+                            let (clicked_row, resp) = {
+                                let dev = self.devices.iter().find(|d| d.id == dev_id).unwrap();
+                                device_row(ui, p, dev, selected)
+                            };
+                            if clicked_row {
+                                clicked = Some(dev_id.clone());
                             }
+                            // 右键菜单
+                            resp.context_menu(|ui| {
+                                ui.set_min_width(150.0);
+                                if ui.button(self.translations.ui_string("edit_device").unwrap_or("Edit device")).clicked() {
+                                    ui.close();
+                                    self.open_edit_device_dialog();
+                                }
+                                if ui.button(self.translations.ui_string("name_key").unwrap_or("Name key")).clicked() {
+                                    ui.close();
+                                    self.open_edit_device_dialog();
+                                }
+                                if ui.button(self.translations.ui_string("view_serial").unwrap_or("View serial number")).clicked() {
+                                    ui.close();
+                                    // 显示序列号信息
+                                    if let Some(dev) = self.devices.iter().find(|d| d.id == dev_id) {
+                                        let serial = if dev.serial.is_empty() {
+                                            "N/A".to_string()
+                                        } else {
+                                            dev.serial.clone()
+                                        };
+                                        self.log_info(&format!("Serial: {}", serial));
+                                    }
+                                }
+                                if dev_kind == DeviceKind::Key {
+                                    ui.separator();
+                                    if ui.button(self.translations.ui_string("remove_from_history").unwrap_or("Remove from history")).clicked() {
+                                        ui.close();
+                                        self.remove_device_from_history(&dev_id);
+                                    }
+                                }
+                            });
                             ui.add_space(2.0);
                         }
                     });
@@ -8662,7 +9390,7 @@ impl App {
                     ui.add_space(3.0);
                     ui.label(
                         egui::RichText::new(
-                            "Saves this key's serial with the name to keys.json on this computer \u{2014} nothing leaves your machine. Up to 64 characters.",
+                            self.translations.ui_string("name_save_desc").unwrap_or("Saves this key's serial with the name to keys.json on this computer \u{2014} nothing leaves your machine. Up to 64 characters."),
                         )
                         .font(theme::f_reg(11.5))
                         .color(p.txt3),
@@ -9190,7 +9918,7 @@ impl App {
                                             ui,
                                             p,
                                             BtnKind::Danger,
-                                            &btn_label(self.translations.ui_string("factory_reset").unwrap_or("Factory reset")),
+                                            &format!("{}\u{2026}", self.translations.ui_string("factory_reset").unwrap_or("Factory reset")),
                                         )
                                         .clicked()
                                         {
@@ -10122,7 +10850,7 @@ impl App {
                     ui.add_space(6.0);
                     self.help_dot(ui, p, "reset");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Danger, &btn_label(&self.translations.ui_string("reset_key").unwrap_or("Reset key"))).clicked() {
+                        if theme::button(ui, p, BtnKind::Danger, &format!("{}\u{2026}", self.translations.ui_string("reset_key").unwrap_or("Reset key"))).clicked() {
                             arm_reset = true;
                         }
                     });
@@ -10783,7 +11511,7 @@ impl App {
                         }
                         // Export is read-only, so it's always available
                         // regardless of session lock state.
-                        if theme::button(ui, p, BtnKind::Ghost, &btn_label(&t!("export_entry").to_string())).clicked() {
+                        if theme::button(ui, p, BtnKind::Ghost, &format!("{}\u{2026}", t!("export_entry").to_string())).clicked() {
                             let is_cert =
                                 matches!(classification, EntryKind::SshCert { .. });
                             let default_name = if is_cert {
@@ -12343,7 +13071,7 @@ impl App {
                 });
                 ui.label(
                     egui::RichText::new(
-                        "擦除所有身份验证器凭证并清除密码。无需密码即可使用——这是遗忘密码时的恢复方式。此操作无法撤销。",
+                        self.translations.ui_string("reset_oath_desc").unwrap_or("Wipes ALL authenticator credentials and clears the password. Usable without the password — this is the recovery path for a forgotten password. This action cannot be undone."),
                     )
                     .font(theme::f_reg(12.5))
                     .color(p.txt2),
@@ -12453,11 +13181,11 @@ impl App {
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "pgp-card-details");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, &btn_label(&t!("openpgp_set_url").to_string())).clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("openpgp_set_url").to_string())).clicked() {
                         open_modal = Some(OpenPgpCredKind::SetUrl);
                     }
                     ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, &btn_label(&t!("openpgp_set_name").to_string())).clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("openpgp_set_name").to_string())).clicked() {
                         open_modal = Some(OpenPgpCredKind::SetName);
                     }
                 });
@@ -12493,17 +13221,17 @@ impl App {
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "pin");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, &btn_label(&t!("openpgp_unblock_user_pin").to_string())).clicked()
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("openpgp_unblock_user_pin").to_string())).clicked()
                     {
                         open_modal = Some(OpenPgpCredKind::UnblockUserPin);
                     }
                     ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, &btn_label(&t!("openpgp_change_admin_pin").to_string())).clicked()
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("openpgp_change_admin_pin").to_string())).clicked()
                     {
                         open_modal = Some(OpenPgpCredKind::ChangeAdminPin);
                     }
                     ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, &btn_label(&t!("openpgp_change_user_pin").to_string())).clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("openpgp_change_user_pin").to_string())).clicked() {
                         open_modal = Some(OpenPgpCredKind::ChangeUserPin);
                     }
                 });
@@ -12601,7 +13329,7 @@ impl App {
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "pgp-keys");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("generate").unwrap_or("Generate"))).clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("generate").unwrap_or("Generate"))).clicked() {
                         open_modal = Some(OpenPgpCredKind::GenerateKey);
                     }
                 });
@@ -12635,19 +13363,19 @@ impl App {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     browse_import_key =
-                        theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("browse").unwrap_or("Browse"))).clicked();
+                        theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("browse").unwrap_or("Browse"))).clicked();
                 });
             });
             let have_path = !self.openpgp.import_path.trim().is_empty();
             ui.add_space(6.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("import_file").unwrap_or("Import file"))).clicked()
+                if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("import_file").unwrap_or("Import file"))).clicked()
                     && have_path
                 {
                     open_modal = Some(OpenPgpCredKind::ImportKeyFile);
                 }
                 ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("generate_import").unwrap_or("Generate & import"))).clicked() {
+                if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("generate_import").unwrap_or("Generate & import"))).clicked() {
                     open_modal = Some(OpenPgpCredKind::GenerateImportKey);
                 }
             });
@@ -12677,7 +13405,7 @@ impl App {
                 });
                 ui.label(
                     egui::RichText::new(
-                        "擦除所有 OpenPGP 密钥并恢复默认 PIN。即使 PIN 已遗忘也可使用。",
+                        self.translations.ui_string("reset_openpgp_desc").unwrap_or("Wipes ALL OpenPGP keys and restores the default PIN. Usable even when the PIN is forgotten."),
                     )
                     .font(theme::f_reg(12.5))
                     .color(p.txt2),
@@ -12812,15 +13540,15 @@ impl App {
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "pin");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("unblock_pin").unwrap_or("Unblock PIN"))).clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("unblock_pin").unwrap_or("Unblock PIN"))).clicked() {
                         open_unblock = true;
                     }
                     ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("change_puk").unwrap_or("Change PUK"))).clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("change_puk").unwrap_or("Change PUK"))).clicked() {
                         open_change_puk = true;
                     }
                     ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("change_pin").unwrap_or("Change PIN"))).clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("change_pin").unwrap_or("Change PIN"))).clicked() {
                         open_change_pin = true;
                     }
                 });
@@ -12838,7 +13566,7 @@ impl App {
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "piv-admin");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("set_retry_counts").unwrap_or("Set retry counts"))).clicked()
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("set_retry_counts").unwrap_or("Set retry counts"))).clicked()
                     {
                         open_set_retries = true;
                     }
@@ -12871,7 +13599,7 @@ impl App {
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "piv-admin");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("change_management_key").unwrap_or("Change management key")))
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("change_management_key").unwrap_or("Change management key")))
                         .clicked()
                     {
                         open_change_mgmt = true;
@@ -13104,7 +13832,7 @@ impl App {
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "piv-generate");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("generate").unwrap_or("Generate"))).clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("generate").unwrap_or("Generate"))).clicked() {
                         open_generate = true;
                     }
                     ui.add_space(8.0);
@@ -13182,7 +13910,7 @@ impl App {
                         open_csr = true;
                     }
                     ui.add_space(8.0);
-                    save_csr = theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("save").unwrap_or("Save"))).clicked();
+                    save_csr = theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("save").unwrap_or("Save"))).clicked();
                 });
             });
             if save_csr {
@@ -13222,7 +13950,7 @@ impl App {
                     }
                     ui.add_space(8.0);
                     browse_cert =
-                        theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("browse").unwrap_or("Browse"))).clicked();
+                        theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("browse").unwrap_or("Browse"))).clicked();
                 });
             });
             if browse_cert {
@@ -13264,7 +13992,7 @@ impl App {
                         go_export = true;
                     }
                     ui.add_space(8.0);
-                    save_export = theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("save").unwrap_or("Save"))).clicked();
+                    save_export = theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("save").unwrap_or("Save"))).clicked();
                 });
             });
             if save_export {
@@ -13295,18 +14023,18 @@ impl App {
                     // Move key: relocate the slot's key to an empty slot. Needs
                     // 5.7+ (same gate as delete) and a key in the active slot.
                     if can_delete_key && selected_has_key {
-                        if theme::button(ui, p, BtnKind::Default, &btn_label("移动密钥")).clicked() {
+                        if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", "移动密钥")).clicked() {
                             open_move_key = true;
                         }
                         ui.add_space(6.0);
                     }
                     if can_delete_key {
-                        if theme::button(ui, p, BtnKind::Danger, &btn_label(self.translations.ui_string("delete_key").unwrap_or("Delete key"))).clicked() {
+                        if theme::button(ui, p, BtnKind::Danger, &format!("{}\u{2026}", self.translations.ui_string("delete_key").unwrap_or("Delete key"))).clicked() {
                             open_delete_key = true;
                         }
                         ui.add_space(6.0);
                     }
-                    if theme::button(ui, p, BtnKind::Default, &btn_label(self.translations.ui_string("delete_certificate").unwrap_or("Delete certificate")))
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("delete_certificate").unwrap_or("Delete certificate")))
                         .clicked()
                     {
                         open_delete_cert = true;
@@ -13587,12 +14315,12 @@ impl App {
                             self.sync_time_all();
                         }
                         ui.add_space(6.0);
-                        if theme::button(ui, p, BtnKind::Default, &btn_label(&t!("bulk_import").to_string())).clicked() {
+                        if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("bulk_import").to_string())).clicked() {
                             self.bulk_dialog.open = true;
                             self.bulk_dialog.start = self.slot;
                         }
                         ui.add_space(6.0);
-                        if theme::button(ui, p, BtnKind::Danger, &btn_label(&t!("factory_reset").to_string())).clicked() {
+                        if theme::button(ui, p, BtnKind::Danger, &format!("{}\u{2026}", t!("factory_reset").to_string())).clicked() {
                             self.molto_reset_confirm = true;
                         }
                     });
@@ -13794,11 +14522,11 @@ impl App {
                                     self.apply_title_only();
                                 }
                                 ui.add_space(6.0);
-                                if theme::button(ui, p, BtnKind::Danger, &btn_label(&t!("delete_seed").to_string())).clicked() {
+                                if theme::button(ui, p, BtnKind::Danger, &format!("{}\u{2026}", t!("delete_seed").to_string())).clicked() {
                                     self.molto_delete_confirm = true;
                                 }
                                 ui.add_space(6.0);
-                                if theme::button(ui, p, BtnKind::Default, &btn_label(&t!("import_otpauth").to_string())).clicked() {
+                                if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("import_otpauth").to_string())).clicked() {
                                     self.import_dialog.open = true;
                                 }
                                 ui.add_space(6.0);
