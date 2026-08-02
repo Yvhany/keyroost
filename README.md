@@ -1,127 +1,199 @@
-# keyroost - 中文版
+# Keyroost L10N v1.0.15
 
-基于 [framefilter/keyroost](https://github.com/framefilter/keyroost) 原仓库 `main` 分支创建的完整中文翻译版本。
+多语言硬件安全密钥管理工具
+A multilingual hardware security key management tool
 
-其功能未作完整测试,目前仅进行简体中文翻译,如遇bug会尝试修复
+---
 
-## 本分支更改内容
+## 项目简介
 
-### 1. 完整中文本地化
-- **界面翻译**: 所有菜单、标签、按钮、提示信息
-- **对话框翻译**: 所有弹窗标题、内容、按钮
-- **状态消息**: 操作反馈、错误提示
-- **帮助文本**: 所有帮助主题
+Keyroost L10N 是 Keyroost 的多语言本地化分支，支持 FIDO2、OATH、OpenPGP、PIV 等安全密钥操作。项目采用分层架构设计，基于 Rust + egui/eframe 构建，提供完整的多语言界面支持。
 
-### 2. i18n 国际化系统
-- `crates/keyroost/locales/app.yml` - 主翻译文件 (YAML格式)
-- `crates/keyroost/locales/zh-CN.json` - 中文翻译 (JSON格式)
-- `crates/keyroost/locales/en.json` - 英文翻译 (JSON格式)
-- 使用 rust-i18n 框架，支持运行时语言切换
+Keyroost L10N is a multilingual localization branch of Keyroost, supporting FIDO2, OATH, OpenPGP, PIV and other security key operations. The project adopts a layered architecture, built with Rust + egui/eframe, providing complete multilingual interface support.
 
-### 3. 翻译覆盖模块
-- **FIDO2**: 通行密钥、指纹、设置、存储
-- **OpenPGP**: 卡片详情、密钥槽位、对话框
-- **PIV**: 插槽标签、对话框、证书管理
-- **OATH**: 验证码、凭证管理
-- **OTP**: 设备端 OTP 管理
+---
 
-### 4. UI 优化
-- 统一对话框外观 (使用 `modal_window` 辅助函数)
-- 统一按钮样式 (使用 `theme::button` 函数)
-- 修复花括号占位符显示问题
+## 主要功能
 
-## 使用方法
+- **FIDO2/CTAP2**: 通行密钥管理、指纹注册、安全策略配置
+- **OATH**: TOTP/HOTP 凭证管理
+- **OpenPGP**: 卡片信息、密钥管理、PIN 管理
+- **PIV**: 插槽管理、证书操作、PIN/PUK 管理
+- **设备缓存**: 自动保存和识别已连接的密钥
+- **多语言支持**: 中文、英文，可扩展更多语言
 
-### 设置中文语言
-程序启动后，在设置界面选择「简体中文」即可。
+---
 
-或通过环境变量：
-```bash
-set KEYROOST_LANG=zh-CN
-```
+## Features
+
+- **FIDO2/CTAP2**: Passkey management, fingerprint enrollment, security policy configuration
+- **OATH**: TOTP/HOTP credential management
+- **OpenPGP**: Card information, key management, PIN management
+- **PIV**: Slot management, certificate operations, PIN/PUK management
+- **Device Caching**: Automatic save and recognition of connected keys
+- **Multilingual Support**: Chinese, English, extensible to more languages
+
+---
+
+## v1.0.15 更新内容
+
+### 多语言架构重构
+进行了语言包语言加载的重构。从之前的添加语言需要根据源码重新翻译并编译，变成了只需要根据英文语言包的格式进行目标语言的翻译即可。
+
+Refactored the language pack loading system. Previously, adding a new language required retranslating and recompiling from source code. Now, you only need to translate based on the English language pack format.
+
+### 新增多语言适配
+- 新增 `language/` 目录，包含 `en.json` 和 `zh-CN.json`
+- 支持运行时语言切换，无需重新编译
+- 添加新语言只需创建对应的 JSON 翻译文件
+
+### Multilingual Adaptation
+- Added `language/` directory with `en.json` and `zh-CN.json`
+- Runtime language switching without recompilation
+- Adding new languages only requires creating a corresponding JSON translation file
+
+### 显示逻辑改进
+- 刷新按钮现在会完整重载所有设备数据（名称、槽位、凭证等）
+- 修复了多处硬编码中文字符串，统一使用翻译键
+- 同步中英文语言包至 713 个翻译键
+
+### Display Logic Improvements
+- Refresh button now fully reloads all device data (names, slots, credentials, etc.)
+- Fixed multiple hardcoded Chinese strings, unified to use translation keys
+- Synchronized Chinese and English language packs to 713 translation keys
+
+### 文件版本信息
+- 文件说明: keyroost_l10n
+- 文件版本: 1.0.15
+- 产品名称: keyroost_l10n
+- 产品版本: 1.0.15
+
+### File Version Information
+- File Description: keyroost_l10n
+- File Version: 1.0.15
+- Product Name: keyroost_l10n
+- Product Version: 1.0.15
+
+---
 
 ## 下载
 
-从 [Releases](https://github.com/Yvhany/keyroost/releases) 页面下载：
-- `keyroost.exe` - Windows x64 中文版
+从 GitHub Releases 下载最新版本：
 
-## 编译
+- [keyroost_l10n-v1.0.15-x64.zip](https://github.com/Yvhany/keyroost_l10n/releases/download/v1.0.15/keyroost_l10n-v1.0.15-x64.zip) (Windows 64位)
+- [keyroost_l10n-v1.0.15-x86.zip](https://github.com/Yvhany/keyroost_l10n/releases/download/v1.0.15/keyroost_l10n-v1.0.15-x86.zip) (Windows 32位)
 
-### 环境要求
-- Rust 工具链 (MSRV 1.92)
-- Windows: `libpcsclite-dev` (可选，用于 PC/SC 支持)
+## Download
 
-### 编译命令
-```bash
-# 编译 release 版本
-cargo build --release --package keyroost
+Download the latest version from GitHub Releases:
 
-# 输出位置
-target/release/keyroost.exe
+- [keyroost_l10n-v1.0.15-x64.zip](https://github.com/Yvhany/keyroost_l10n/releases/download/v1.0.15/keyroost_l10n-v1.0.15-x64.zip) (Windows 64-bit)
+- [keyroost_l10n-v1.0.15-x86.zip](https://github.com/Yvhany/keyroost_l10n/releases/download/v1.0.15/keyroost_l10n-v1.0.15-x86.zip) (Windows 32-bit)
+
+---
+
+## 添加新语言
+
+只需在 `language/` 目录下创建新的 JSON 文件，参考 `en.json` 的格式进行翻译即可。
+
+To add a new language, simply create a new JSON file in the `language/` directory, following the format of `en.json`.
+
+### 示例 / Example
+
+```json
+{
+  "language": "ja",
+  "language_name": "日本語",
+  "settings": "設定",
+  "cancel": "キャンセル",
+  "ok": "OK"
+}
 ```
 
-### 交叉编译 (Windows)
+---
+
+## 技术栈
+
+- **语言**: Rust
+- **GUI 框架**: egui/eframe
+- **国际化**: JSON 语言包
+- **构建系统**: Cargo
+
+## Tech Stack
+
+- **Language**: Rust
+- **GUI Framework**: egui/eframe
+- **Internationalization**: JSON language packs
+- **Build System**: Cargo
+
+---
+
+## 构建
+
 ```bash
-# 在 Linux 上编译 Windows 版本
+# 64位版本
 cargo build --release --package keyroost --target x86_64-pc-windows-msvc
+
+# 32位版本
+cargo build --release --package keyroost --target i686-pc-windows-msvc
 ```
+
+## Build
+
+```bash
+# 64-bit version
+cargo build --release --package keyroost --target x86_64-pc-windows-msvc
+
+# 32-bit version
+cargo build --release --package keyroost --target i686-pc-windows-msvc
+```
+
+---
 
 ## 项目结构
 
 ```
-keyroost-zh-CN/
-├── crates/
-│   ├── keyroost/           # 主 GUI 应用
-│   │   ├── src/
-│   │   │   ├── main.rs     # 主代码
-│   │   │   ├── locales.rs  # 翻译模块
-│   │   │   └── settings.rs # 设置模块
-│   │   └── locales/        # 翻译文件
-│   │       ├── app.yml     # 主翻译文件
-│   │       ├── zh-CN.json  # 中文翻译
-│   │       └── en.json     # 英文翻译
-│   ├── keyroost-piv/       # PIV 模块
-│   ├── keyroost-transport/ # 传输层
-│   ├── keyroost-ctap/      # FIDO2/CTAP 模块
-│   └── ...
-└── docs/                   # 文档
+keyroost_l10n/
+├── language/           # 语言包目录
+│   ├── en.json         # 英文翻译
+│   └── zh-CN.json      # 中文翻译
+├── cache/              # 设备缓存目录
+├── config/             # 配置文件目录
+├── crates/             # 源代码
+│   └── keyroost/       # 主程序
+└── keyroost_l10n.exe   # 可执行文件
 ```
 
-## 翻译键命名规范
+## Project Structure
 
-- 使用蛇形命名法 (snake_case)
-- 语义化命名 (如 `reset_wipes_all`)
-- 保持与英文键名一致
-- 技术术语保持英文 (FIDO2, PIV, OpenPGP 等)
-
-## 如何添加新翻译
-
-1. 在 `locales/app.yml` 中添加新键：
-```yaml
-new_key:
-  en: "New English text"
-  zh-CN: "新的中文文本"
 ```
-
-2. 在 `locales/en.json` 中添加：
-```json
-"new_key": "New English text"
+keyroost_l10n/
+├── language/           # Language packs
+│   ├── en.json         # English translations
+│   └── zh-CN.json      # Chinese translations
+├── cache/              # Device cache
+├── config/             # Configuration files
+├── crates/             # Source code
+│   └── keyroost/       # Main application
+└── keyroost_l10n.exe   # Executable
 ```
-
-3. 在 `locales/zh-CN.json` 中添加：
-```json
-"new_key": "新的中文文本"
-```
-
-4. 在代码中使用：
-```rust
-let text = t!("new_key").to_string();
-```
-
-## 许可证
-
-与原项目相同：Apache-2.0 / MIT 双许可
 
 ---
 
-*基于 framefilter/keyroost v0.7.6，由 Mimo V2.5 与人工审查完成中文本地化*
+## 许可证
+
+本项目基于 MIT 和 Apache-2.0 双重许可。
+
+This project is licensed under MIT and Apache-2.0.
+
+---
+
+## 链接
+
+- [GitHub 仓库](https://github.com/Yvhany/keyroost_l10n)
+- [原始项目 Keyroost](https://github.com/framefilter/keyroost)
+
+## Links
+
+- [GitHub Repository](https://github.com/Yvhany/keyroost_l10n)
+- [Original Project Keyroost](https://github.com/framefilter/keyroost)
