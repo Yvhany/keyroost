@@ -1,0 +1,75 @@
+[package]
+name = "keyroostctl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line tool for programming Token2 Molto2 / Molto2v2 TOTP tokens."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "keyroostctl"
+path = "src/main.rs"
+
+[dependencies]
+keyroost-proto = { path = "../keyroost-proto", version = "1.0.15" }
+keyroost-transport = { path = "../keyroost-transport", version = "1.0.15" }
+keyroost-piv = { path = "../keyroost-piv", version = "1.0.15" }
+keyroost-hid = { path = "../keyroost-hid", version = "1.0.15" }
+keyroost-ctap = { path = "../keyroost-ctap", version = "1.0.15" }
+keyroost-keyring = { path = "../keyroost-keyring", version = "1.0.15" }
+keyroost-resolve = { path = "../keyroost-resolve", version = "1.0.15" }
+keyroost-oath = { path = "../keyroost-oath", version = "1.0.15" }
+keyroost-token2otp = { path = "../keyroost-token2otp", version = "1.0.15" }
+keyroost-token2prog = { path = "../keyroost-token2prog", version = "1.0.15" }
+keyroost-openpgp = { path = "../keyroost-openpgp", version = "1.0.15" }
+keyroost-qr = { path = "../keyroost-qr", version = "1.0.15" }
+keyroost-import = { path = "../keyroost-import", version = "1.0.15", features = ["bulk", "encrypted"] }
+# Host-side RSA keygen / key-file loading for OpenPGP on-card import. Shared with
+# keyroost; owns the workspace's scoped `rsa` dependency exception so the protocol
+# crates stay dependency-free (see that crate's Cargo.toml).
+keyroost-rsakey = { path = "../keyroost-rsakey", version = "1.0.15" }
+clap = { version = "4", features = ["derive"] }
+# Same project family as clap; generate shell completions / a man page at
+# runtime (`completions` / `manpage` subcommands) rather than from a build
+# script, so nothing in this crate is generated at compile time. (The only
+# build script in the workspace is the Windows-gated one in `keyroost`, which
+# embeds the app icon and version resource and generates no code.)
+clap_complete = "4"
+clap_mangen = "0.3"
+# Already in the workspace tree (via rsa and p256); wraps PINs/seeds read from
+# env/stdin so they're scrubbed from memory on drop.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# Structured output for the global `--json` flag (status/query commands).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Approved dev-only exception (tests only, never in release builds):
+# randomized property coverage for the pure device-selection and
+# terminal-sanitizing helpers (resolve_otp_target, reader_for_name,
+# sanitize_terminal, sanitize_multiline) that the libfuzzer workspace can't
+# reach inside a binary crate.
+proptest = "1"
+
+# cargo-binstall support: `cargo binstall` fetches the existing attested
+# GitHub release archives (same artifacts, same SHA256SUMS/provenance)
+# instead of compiling. Targets without a prebuilt archive fall back to a
+# source build automatically.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/keyroost-v{ version }-linux-x86_64{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/keyroost-v{ version }-macos-universal2{ archive-suffix }"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/keyroost-v{ version }-macos-universal2{ archive-suffix }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/keyroost-v{ version }-windows-x86_64{ archive-suffix }"
+pkg-fmt = "zip"

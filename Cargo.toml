@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+# The cargo-fuzz harness is its own workspace so libfuzzer-sys (and its
+# nightly requirement) never enters the main dependency tree.
+exclude = ["fuzz"]
+members = [
+    "crates/keyroost-proto",
+    "crates/keyroost-transport",
+    "crates/keyroost-hid",
+    "crates/keyroost-ctap",
+    "crates/keyroost-keyring",
+    "crates/keyroost-resolve",
+    "crates/keyroost-oath",
+    "crates/keyroost-openpgp",
+    "crates/keyroost-piv",
+    "crates/keyroost-token2otp",
+    "crates/keyroost-token2prog",
+    "crates/keyroost-rsakey",
+    "crates/keyroost-qr",
+    "crates/keyroost-import",
+    "crates/keyroost-winwebauthn",
+    "crates/keyroost-screengrab",
+    "crates/keyroostctl",
+    "crates/keyroost",
+]
+
+[workspace.package]
+version = "1.0.15"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/framefilter/keyroost"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+# This workspace spends its time parsing device- and file-supplied bytes;
+# a length-arithmetic bug should panic loudly in release builds, not wrap
+# silently into an exploitable miscalculation. The cost is negligible for
+# a tool that is I/O-bound on a smart card.
+[profile.release]
+overflow-checks = true

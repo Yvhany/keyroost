@@ -1,0 +1,222 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# CI only reads the repo; never hand build steps (or the proc-macros they
+# compile) a write-capable token.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # KEY-001 regression guard: release/packaging files must not fetch or execute
+  # anything from a mutable ref (master/continuous/:latest/bare image tag)
+  # unless a checksum step content-pins it (marked `# pinned-verified:`).
+  pinned-inputs:
+    name: Release inputs are immutable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Check release/packaging inputs are pinned
+        run: bash packaging/ci/check-pinned-inputs.sh
+
+      # #80 regression guard: the AppStream <releases> block is generated from
+      # CHANGELOG.md at bundle build time; verify here that the generation is
+      # possible and that the newest changelog entry matches the workspace
+      # version, so version/changelog drift fails the PR, not the release.
+      - name: AppStream releases derive cleanly from CHANGELOG
+        run: python3 packaging/flatpak/gen-metainfo-releases.py --check
+
+  # One source tree, compiled and tested three ways. This matrix is what keeps
+  # the macOS/Windows code (the cfg-gated hidapi HID backend) from rotting: a
+  # Linux-only change that breaks another platform fails the PR here, so we never
+  # need separate per-OS branches. `fail-fast: false` so one platform failing
+  # still lets the others report.
+  test:
+    name: clippy + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Linux links against system libraries the other platforms provide natively:
+      #  - libpcsclite-dev: the `pcsc` crate (keyroost-transport). macOS uses the
+      #    PCSC framework and Windows uses WinSCard, both already present.
+      #  - the X11/Wayland/XKB/GL set: eframe/egui/winit/glow (the `keyroost` GUI).
+      #    macOS (Cocoa) and Windows (Win32) need no extra packages.
+      # The Linux build uses the dependency-free sysfs HID backend, so no libudev.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpcsclite-dev \
+            libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libgl1-mesa-dev libssl-dev
+
+      # Third-party actions are pinned to commit SHAs: a hijacked tag or branch
+      # in either upstream repo would otherwise run arbitrary code here. When
+      # pinned by SHA, dtolnay/rust-toolchain no longer gets the toolchain from
+      # its ref name, so it must be passed explicitly.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # Formatting is platform-independent; check it once on Linux.
+      - name: Format check
+        if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+
+      # On macOS/Windows this compiles the cfg(not(target_os = "linux")) hidapi
+      # backend for real — the coverage the `hidapi-backend` feature only fakes.
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      # The `qr` screen-capture backend is cfg-gated per OS, and the matrix build
+      # above uses default features — so the Windows GDI path (hand-rolled Win32
+      # FFI in keyroost-screengrab) is otherwise compiled only by release.yml at
+      # tag time. Compile + lint it here so that FFI can't rot between releases.
+      - name: Clippy — qr screen-capture backend (Windows)
+        if: runner.os == 'Windows'
+        run: cargo clippy -p keyroost --features qr --all-targets --locked -- -D warnings
+
+  # Enforce the declared MSRV so an accidental use of a newer language/library
+  # feature (or a dependency that bumped its own MSRV) can't ship silently to
+  # distro/crates.io consumers. The workspace floor is rust-version = "1.85"; the
+  # `keyroost` GUI overrides to 1.92 (its eframe/egui stack needs it), so it is
+  # excluded here and covered by the stable `test` job above instead.
+  msrv:
+    name: MSRV (1.85, libs + CLI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Only the pcsc link is needed: the excluded GUI is what pulls the
+      # X11/Wayland/GL set, and everything else here is pure Rust.
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpcsclite-dev
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
+        with:
+          toolchain: "1.85"
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # `--locked` so a dependency update that raises its MSRV above 1.85 is
+      # caught here too, not just our own code.
+      - name: Check on the MSRV toolchain (workspace minus the GUI)
+        run: cargo +1.85 check --workspace --exclude keyroost --all-targets --locked
+
+  # Surface dependencies the compiler will reject in a future Rust release.
+  # Builds `--all-features` so every opt-in dep is covered — including the `qr`
+  # feature's screen-capture backend and keyroost-hid's `hidapi-backend`, whose
+  # `hidapi` needs `libudev-dev` (installed below). *Warns* rather than fails: a
+  # flagged crate is tracked for replacement, not an immediate breakage. Closes
+  # the gap dependabot/cargo-audit don't cover: a crate abandoned-then-renamed,
+  # plus compiler future-incompat notices.
+  future-incompat:
+    name: Future-incompatibility report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpcsclite-dev \
+            libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libx11-dev libxrandr-dev libxcb1-dev libdbus-1-dev \
+            libgl1-mesa-dev libssl-dev \
+            libudev-dev
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Build (all features) and report future-incompatibilities
+        run: |
+          set -o pipefail
+          cargo build --workspace --all-features --locked 2>&1 | tee build.log
+          if grep -qi 'will be rejected by a future version of Rust' build.log; then
+            crates="$(grep -i 'will be rejected by a future version of Rust' build.log \
+              | sed 's/.*future version of Rust: //' | sort -u | tr '\n' ' ')"
+            echo "::warning title=Future-incompatible dependency::Will be rejected by a future Rust; replace before then: ${crates}"
+            {
+              echo "### ⚠️ Future-incompatible dependencies"
+              echo ""
+              echo "These crates contain code a future Rust will reject — replace them before that lands:"
+              echo ""
+              echo "    ${crates}"
+              echo ""
+              echo "Run \`cargo report future-incompatibilities\` for detail."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No future-incompatibility warnings — clean."
+          fi
+
+  # Build + test inside Fedora and Arch containers so the README's per-distro
+  # package lists are verified, not assumed, and a distro-specific build break is
+  # caught here. Linux is distro-neutral (sysfs/hidraw + PC/SC), so this is a
+  # smoke build, not a second clippy pass — the os matrix above already enforces
+  # lints. Distro toolchains (both well past our 1.85 MSRV) stand in for rustup.
+  linux-distros:
+    name: build + test (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: fedora
+            image: fedora:latest
+          - distro: arch
+            image: archlinux:latest
+    steps:
+      # Deps don't need the repo, so install them (incl. git for checkout and the
+      # distro Rust) before checking out.
+      - name: Install dependencies (Fedora)
+        if: matrix.distro == 'fedora'
+        run: |
+          dnf install -y git gcc pkgconf-pkg-config \
+            pcsc-lite-devel \
+            libxkbcommon-devel libxkbcommon-x11-devel wayland-devel \
+            libxcb-devel mesa-libGL-devel \
+            rust cargo
+
+      - name: Install dependencies (Arch)
+        if: matrix.distro == 'arch'
+        run: |
+          pacman -Sy --noconfirm --needed git gcc pkgconf \
+            pcsclite ccid \
+            libxkbcommon libxcb wayland mesa \
+            rust
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked

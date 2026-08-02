@@ -1,0 +1,10 @@
+# Version manifest — template for the FIRST manual submission to
+# microsoft/winget-pkgs. Later versions are PR'd by wingetcreate in
+# .github/workflows/publish.yml, but only once the Token2-signed zip is
+# attached to the release and the fanout is re-dispatched (see the installer
+# template alongside this one). Replace @VERSION@ (e.g. 0.7.6, no leading `v`).
+PackageIdentifier: Framefilter.Keyroost
+PackageVersion: "@VERSION@"
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0

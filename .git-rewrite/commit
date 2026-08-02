@@ -1,0 +1,13 @@
+tree 14ba3ff934950cafcf83f5b8d40d174bd316d58f
+parent 077383b2a98f1c6f1e40cdd57cc8ee736590a61a
+author framefilter <247916643+framefilter@users.noreply.github.com> 1781999752 -0400
+committer framefilter <247916643+framefilter@users.noreply.github.com> 1782000501 -0400
+gpgsig -----BEGIN SSH SIGNATURE-----
+ U1NIU0lHAAAAAQAAAEoAAAAac2stc3NoLWVkMjU1MTlAb3BlbnNzaC5jb20AAAAgdy96fL
+ 6v/EiBMX4ZGswg2ZNbsnql3od646BeljDpwJQAAAAEc3NoOgAAAANnaXQAAAAAAAAABnNo
+ YTUxMgAAAGcAAAAac2stc3NoLWVkMjU1MTlAb3BlbnNzaC5jb20AAABAmN9aDwqYni3nVo
+ KWXE56CDTCOqfVvT9rv0C+uzju5RUlmiK2NmviDfgvfa9g2qojvychfNDM5w1azMJ7m1BM
+ BgUAAAS9
+ -----END SSH SIGNATURE-----
+
+packaging: trust-pin the Flatpak repo signing key in the .flatpakrepo descriptor

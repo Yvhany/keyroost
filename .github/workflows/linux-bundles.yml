@@ -1,0 +1,438 @@
+name: Linux bundles (AppImage + Flatpak)
+
+# Builds the two Linux GUI bundles when a version tag is pushed (the same trigger
+# release.yml uses: `git tag v0.7.0 && git push origin v0.7.0`), and attaches
+# them to the GitHub Release that release.yml publishes for that tag.
+#
+#   * appimage — a single self-contained keyroost-x86_64.AppImage (GUI), uploaded
+#                as a release asset.
+#   * flatpak  — builds io.github.framefilter.keyroost from the manifest, then:
+#                  - attaches a single-file keyroost.flatpak BUNDLE to the release
+#                    (offline / one-off install), and
+#                  - publishes the OSTree repo to the dedicated repo
+#                    framefilter/keyroost-flatpak (its own Pages = the auto-update
+#                    remote), via the FLATPAK_REPO_TOKEN secret.
+#
+# This is a SEPARATE workflow from release.yml / publish.yml by design — it never
+# edits those. It runs in parallel with release.yml on the same tag; the upload
+# steps target the Release release.yml creates, retrying briefly in case this
+# workflow wins the race and the Release does not exist yet.
+#
+# DECIDED (see packaging/LINUX-BUNDLES.md):
+#   * Flatpak distribution = self-hosted OSTree repo on GitHub Pages (auto-update)
+#     PLUS a .flatpak bundle attached to each release (offline fallback). NOT Flathub.
+#   * AppImage = GUI AppImage attached to each release.
+#   * App-id = io.github.framefilter.keyroost.
+#
+# OUT-OF-BAND RUNS (workflow_dispatch), mirroring publish.yml's tag-input model:
+#   * probe (no tag input): both bundles build and upload as workflow
+#     artifacts; every attach/publish step skips. Safe to run from any branch —
+#     this is the pre-release packaging proof required by CLAUDE.md.
+#   * republish (tag input set): builds from the dispatched ref and publishes
+#     into that tag's existing release — attach steps clobber idempotently and
+#     the OSTree push no-ops when the tree is already current. A version guard
+#     fails the run if the ref's workspace version doesn't match the tag.
+#     `flatpak_only: true` skips the AppImage job (e.g. the #80 AppStream
+#     republish, where only the flatpak needed to move).
+# Every run still passes the release-publish environment approval.
+#
+# ONE-TIME MAINTAINER SETUP required before this produces working bundles:
+#   1. Icon — DONE: the dark-on-amber set is committed in packaging/icons/.
+#   2. pcsc-lite sha256 — DONE: 2.5.1 (.tar.xz) is pinned + hashed in the manifest.
+#   3. (Optional, recommended) Add repo-signing secrets FLATPAK_GPG_KEY (the
+#      ASCII-armored PRIVATE key) and FLATPAK_GPG_KEY_ID. When unset, the repo is
+#      published UNSIGNED and the signing steps no-op cleanly (see the guard
+#      pattern below, mirrored from publish.yml).
+#   4. Create the dedicated repo framefilter/keyroost-flatpak (one initial commit),
+#      enable its Pages (Deploy from a branch, / root), place the static descriptors
+#      (keyroost.flatpakrepo + icon) in its root, and add a fine-grained PAT scoped
+#      to that repo as the FLATPAK_REPO_TOKEN secret. A separate repo because this
+#      repo's main requires verified-signed commits a CI bot can't make; this keeps
+#      the Learn site (this repo's docs/) untouched. When the token is unset, the
+#      OSTree publish skips cleanly (the .flatpak bundle still attaches).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Existing release tag to publish into (e.g. v0.7.5). Leave EMPTY for a
+          build-only probe: bundles build and upload as workflow artifacts, but
+          nothing attaches to the release and the OSTree repo is not pushed.
+          When set, the bundles build from the DISPATCHED ref (pick the branch
+          in the run dialog / --ref) — a version guard refuses to publish if
+          that tree's workspace version does not match this tag.
+        required: false
+        default: ''
+      flatpak_only:
+        description: Skip the AppImage job (flatpak-only republish, e.g. #80)
+        type: boolean
+        required: false
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  APP_ID: io.github.framefilter.keyroost
+  # The release this run publishes into: the pushed tag, or the dispatch
+  # input; empty means build-only. Mirrors publish.yml's
+  # `release.tag_name || inputs.tag` model, adapted to this workflow's
+  # tag-push trigger.
+  TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+
+# Read-only by default. The flatpak job's Pages push escalates to contents:write
+# only on that job. Build jobs compile third-party code (proc-macros run at build
+# time) and must never hold a write-capable token.
+permissions:
+  contents: read
+
+jobs:
+  # ===========================================================================
+  # AppImage — build the GUI binary, bundle it with linuxdeploy, attach to the
+  # release.
+  # ===========================================================================
+  appimage:
+    name: AppImage (GUI, x86_64)
+    # Skippable for flatpak-only republishes; push (tag) runs always include it.
+    if: github.event_name == 'push' || !inputs.flatpak_only
+    # Gate behind the same manual-approval environment publish.yml uses, so the
+    # whole release fanout waits for one approval before anything goes out.
+    environment: release-publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release upload writes a release asset
+      id-token: write # attest-build-provenance signs the AppImage
+      attestations: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # A dispatch builds from an arbitrary ref but publishes into $TAG's
+      # release. Refuse the combination when the tree disagrees with the tag,
+      # so a stale/newer branch can never overwrite a release's bundles.
+      - name: Check tree version matches the target tag
+        if: env.TAG != ''
+        run: |
+          set -euo pipefail
+          v="$(sed -n 's/^version = "\([0-9.]*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [ "v${v}" != "${TAG}" ]; then
+            echo "::error::workspace version v${v} != target tag ${TAG}; refusing to publish mismatched bundles"
+            exit 1
+          fi
+
+      # Same build deps release.yml uses for the GUI (GL/wayland/xcb + pcsc).
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpcsclite-dev \
+            libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libx11-dev libxrandr-dev libxcb1-dev libdbus-1-dev \
+            libgl1-mesa-dev libssl-dev \
+            libfuse2
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
+        with:
+          toolchain: stable
+
+      # build-appimage.sh builds `keyroost` (release), fetches linuxdeploy +
+      # its appimage plugin, stages the AppDir, and emits keyroost-x86_64.AppImage
+      # into target/appimage/. APPIMAGE_EXTRACT_AND_RUN avoids needing FUSE for the
+      # tools themselves inside CI.
+      - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: bash packaging/appimage/build-appimage.sh
+
+      - name: Locate AppImage
+        id: find
+        run: |
+          set -euo pipefail
+          img="$(ls target/appimage/*.AppImage | head -n1)"
+          echo "path=${img}" >> "$GITHUB_OUTPUT"
+          echo "found ${img}"
+          # zsync sidecar for AppImageUpdate delta updates (#53), if produced.
+          zsync="$(ls target/appimage/*.AppImage.zsync 2>/dev/null | head -n1 || true)"
+          echo "zsync=${zsync}" >> "$GITHUB_OUTPUT"
+          echo "zsync ${zsync:-<none>}"
+
+      # Give the AppImage the same provenance + checksum treatment the main
+      # release archives get in release.yml.
+      - name: Attest AppImage provenance
+        if: env.TAG != ''
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: ${{ steps.find.outputs.path }}
+
+      - name: Checksum AppImage
+        run: |
+          set -euo pipefail
+          img="${{ steps.find.outputs.path }}"
+          ( cd "$(dirname "${img}")" && sha256sum "$(basename "${img}")" > "$(basename "${img}").sha256" )
+
+      - name: Upload AppImage as artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: keyroost-appimage
+          path: |
+            target/appimage/*.AppImage
+            target/appimage/*.AppImage.zsync
+
+      # Attach to the Release for $TAG (release.yml's on a tag push, an
+      # existing one on a dispatch republish). Retry patiently (20×30s — v0.7.6
+      # lost the old 2-minute window by 16 seconds): on a tag push
+      # this workflow and release.yml run concurrently, so the Release may not
+      # exist for the first few seconds. `--clobber` makes re-runs idempotent.
+      # Skipped when no tag is named (build-only probe).
+      - name: Attach AppImage to release
+        if: env.TAG != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          img="${{ steps.find.outputs.path }}"
+          zsync="${{ steps.find.outputs.zsync }}"
+          for i in $(seq 1 20); do
+            if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              gh release upload "${TAG}" "${img}" "${img}.sha256" ${zsync:+"${zsync}"} \
+                --repo "${GITHUB_REPOSITORY}" --clobber
+              exit 0
+            fi
+            echo "release ${TAG} not ready yet (attempt ${i}); waiting…"
+            sleep 30
+          done
+          echo "::error::release ${TAG} never appeared; AppImage left as a build artifact only"
+          exit 1
+
+  # ===========================================================================
+  # Flatpak — build from the manifest into an OSTree repo, attach a single-file
+  # .flatpak bundle to the release, and publish the OSTree repo to Pages.
+  # ===========================================================================
+  flatpak:
+    name: Flatpak (OSTree repo + bundle)
+    environment: release-publish
+    runs-on: ubuntu-latest
+    # The official flatpak-builder action expects to run inside the freedesktop
+    # flatpak image so the runtime/SDK + flatpak-builder are present.
+    container:
+      # freedesktop-25.08, pinned to the immutable index digest (KEY-001). To
+      # take an upstream refresh, re-resolve the tag's digest and update here;
+      # the pinned-inputs CI job rejects a return to the floating tag.
+      image: ghcr.io/flathub-infra/flatpak-github-actions@sha256:bfd8c547d9607860b39ead830f13dfa2b712bd3edd4965ce5473e000f8c37a5b
+      options: --privileged
+    # Read-only token here: this job only BUILDS. The dependent flatpak-publish
+    # job (on a normal ubuntu runner, where gh + git are guaranteed present)
+    # holds contents:write and does the release-attach + Pages push. The
+    # freedesktop container image is Fedora-based and does not ship the gh CLI,
+    # so publishing from inside it would be fragile.
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # A dispatch builds from an arbitrary ref but publishes into $TAG's
+      # release. Refuse the combination when the tree disagrees with the tag,
+      # so a stale/newer branch can never overwrite a release's bundles.
+      - name: Check tree version matches the target tag
+        if: env.TAG != ''
+        run: |
+          set -euo pipefail
+          v="$(sed -n 's/^version = "\([0-9.]*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [ "v${v}" != "${TAG}" ]; then
+            echo "::error::workspace version v${v} != target tag ${TAG}; refusing to publish mismatched bundles"
+            exit 1
+          fi
+
+      # Generate the offline cargo sources from the committed Cargo.lock. This is
+      # done on the runner every build so it can never go stale (the file is large,
+      # machine-generated, and lock-specific — intentionally NOT committed). The
+      # generator pulls each crate's sha256 from static.crates.io.
+      - name: Generate cargo-sources.json
+        run: |
+          set -euo pipefail
+          pip install --require-hashes -r packaging/flatpak/requirements.txt
+          gen_sha256="b373c8ab1a05378ec5d8ed0645c7b127bcec7d2f7a1798694fbc627d570d856c"
+          curl -fsSLO "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/737c0085912f9f7dabf9341d4608e2a77a51a73a/cargo/flatpak-cargo-generator.py"
+          echo "${gen_sha256}  flatpak-cargo-generator.py" | sha256sum -c -
+          python3 flatpak-cargo-generator.py Cargo.lock \
+            -o packaging/flatpak/cargo-sources.json
+          echo "generated $(python3 -c 'import json,sys; print(len(json.load(open("packaging/flatpak/cargo-sources.json"))))') source entries"
+
+      # Fill the AppStream <releases> block from CHANGELOG.md — the committed
+      # block is intentionally empty (single source of truth; #80). The
+      # manifest consumes the working tree (type: dir), so this pre-build edit
+      # is exactly what ships. The generator fails the build if CHANGELOG.md
+      # was not updated for the current workspace version.
+      - name: Generate AppStream releases from CHANGELOG
+        run: python3 packaging/flatpak/gen-metainfo-releases.py
+
+      # Build the app and a single-file bundle. flatpak/flatpak-github-actions
+      # v6.7 (pinned to its commit). `bundle` is the .flatpak filename;
+      # build-bundle defaults true. The action writes the OSTree repo to ./repo
+      # by default; we publish that tree to Pages below.
+      - name: Build Flatpak
+        uses: flatpak/flatpak-github-actions/flatpak-builder@401fe28a8384095fc1531b9d320b292f0ee45adb # v6.7
+        with:
+          manifest-path: packaging/flatpak/${{ env.APP_ID }}.yml
+          bundle: keyroost.flatpak
+          cache-key: flatpak-builder-${{ github.sha }}
+
+      # GPG-sign the OSTree repo metadata IF the signing secrets are configured.
+      # Mirrors publish.yml's unset-secret-skips-cleanly pattern: with no
+      # FLATPAK_GPG_KEY the repo is published UNSIGNED and this step no-ops.
+      - name: Sign OSTree repo (if signing key configured)
+        id: gpgsign
+        env:
+          GPG_PRIVATE: ${{ secrets.FLATPAK_GPG_KEY }}
+          GPG_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GPG_PRIVATE:-}" ] || [ -z "${GPG_ID:-}" ]; then
+            echo "::notice::FLATPAK_GPG_KEY / FLATPAK_GPG_KEY_ID not configured — publishing the Flatpak repo UNSIGNED. See packaging/LINUX-BUNDLES.md for the one-time setup."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          export GNUPGHOME="$(mktemp -d)"
+          printf '%s\n' "${GPG_PRIVATE}" | gpg --batch --import
+          # Sign the COMMIT OBJECTS first, then refresh + sign the summary.
+          # build-update-repo signs ONLY the summary; without a prior build-sign
+          # the commits stay unsigned and `flatpak install` fails with "GPG
+          # verification enabled, but no signatures found" — even though
+          # `remote-info` (which checks only the summary) passes. This bit v0.7.0
+          # (issue #46). Then export the public key next to the repo so the
+          # .flatpakrepo can trust-pin it.
+          flatpak build-sign repo "${APP_ID}" --gpg-sign="${GPG_ID}" --gpg-homedir="${GNUPGHOME}"
+          flatpak build-update-repo --gpg-sign="${GPG_ID}" --gpg-homedir="${GNUPGHOME}" repo
+          gpg --homedir "${GNUPGHOME}" --export "${GPG_ID}" > repo/keyroost.gpg
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      # Hand both products to the publish job as artifacts: the single-file
+      # bundle and the whole OSTree repo tree (already GPG-signed above if the
+      # secret was set). `include-hidden-files` keeps OSTree's metadata.
+      - name: Stage publish payload
+        run: |
+          set -euo pipefail
+          test -f keyroost.flatpak || { echo "::error::keyroost.flatpak not produced"; exit 1; }
+          mkdir -p out
+          cp keyroost.flatpak out/
+          # Bundle the OSTree repo + the install descriptor for the publish job.
+          cp -a repo out/repo
+          cp packaging/flatpak/keyroost.flatpakrepo out/repo/keyroost.flatpakrepo
+          touch out/repo/.nojekyll
+
+      - name: Upload flatpak payload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: keyroost-flatpak
+          path: out
+          include-hidden-files: true
+
+  # ===========================================================================
+  # Flatpak publish — runs on a normal ubuntu runner (gh + git present) to attach
+  # the .flatpak bundle to the release and push the OSTree repo to Pages.
+  # ===========================================================================
+  flatpak-publish:
+    name: Flatpak (attach bundle + publish to keyroost-flatpak)
+    environment: release-publish
+    needs: flatpak
+    # Runs for a tag push OR a dispatch that names a release tag; a tag-less
+    # dispatch stays build-only (artifacts uploaded, nothing published).
+    if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release upload + git push of the OSTree tree to Pages
+      id-token: write # attest-build-provenance signs the .flatpak
+      attestations: write
+    steps:
+      - name: Download flatpak payload
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: keyroost-flatpak
+          path: out
+
+      # Same provenance + checksum treatment the main release archives get.
+      - name: Attest .flatpak provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: out/keyroost.flatpak
+
+      - name: Checksum .flatpak
+        run: ( cd out && sha256sum keyroost.flatpak > keyroost.flatpak.sha256 )
+
+      # Attach the single-file bundle to the release (offline / one-off install).
+      # Retry-and-clobber, patiently (20×30s): this workflow and release.yml run
+      # concurrently on the same tag, and the Release only exists once
+      # release.yml finishes all three platform builds plus its approval gate —
+      # v0.7.6 lost the old 2-minute window by 16 seconds.
+      - name: Attach .flatpak bundle to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 20); do
+            if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              gh release upload "${TAG}" out/keyroost.flatpak out/keyroost.flatpak.sha256 \
+                --repo "${GITHUB_REPOSITORY}" --clobber
+              exit 0
+            fi
+            echo "release ${TAG} not ready yet (attempt ${i}); waiting…"
+            sleep 30
+          done
+          echo "::error::release ${TAG} never appeared; .flatpak left unattached"
+          exit 1
+
+      # Publish the OSTree repo to a DEDICATED repo, framefilter/keyroost-flatpak,
+      # whose own GitHub Pages serves it at https://framefilter.github.io/keyroost-flatpak/.
+      #
+      # Why a separate repo and NOT this repo's docs/flatpak: this repo's `main`
+      # requires verified-signed commits, so a CI bot can't push to it. A dedicated
+      # repo sidesteps that, keeps the Learn site (served from this repo's docs/)
+      # completely untouched, and is the conventional way to host a Flatpak OSTree
+      # repo. Needs a cross-repo write token (the default GITHUB_TOKEN is scoped to
+      # this repo only) supplied as the FLATPAK_REPO_TOKEN secret.
+      #
+      # Skips cleanly (bundle is still attached above) when the token is unset, so a
+      # release before the one-time setup doesn't fail. One-time setup — create the
+      # repo with an initial commit, enable its Pages (branch: default, / root), and
+      # add the token — is in packaging/LINUX-BUNDLES.md.
+      #
+      # NOTE: an OSTree repo accumulates history; `flatpak build-update-repo
+      # --prune` periodically (see the runbook) if it grows past Pages' ~1 GB.
+      - name: Publish OSTree repo to framefilter/keyroost-flatpak
+        env:
+          REPO_TOKEN: ${{ secrets.FLATPAK_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REPO_TOKEN:-}" ]; then
+            echo "::warning::FLATPAK_REPO_TOKEN not set — skipping the OSTree publish."
+            echo "The .flatpak bundle is still attached to the release; the auto-update"
+            echo "remote just won't refresh. See packaging/LINUX-BUNDLES.md to enable it."
+            exit 0
+          fi
+          tmp="$(mktemp -d)"
+          if ! git clone --depth 1 \
+            "https://x-access-token:${REPO_TOKEN}@github.com/framefilter/keyroost-flatpak.git" \
+            "${tmp}/repo"; then
+            echo "::error::could not clone framefilter/keyroost-flatpak — create it (with one"
+            echo "initial commit), enable its Pages, and grant FLATPAK_REPO_TOKEN write access."
+            echo "See packaging/LINUX-BUNDLES.md."
+            exit 1
+          fi
+          # Overlay the freshly built OSTree tree onto the served repo. We do NOT
+          # wipe-and-replace: the repo root also holds the static descriptors the
+          # maintainer commits once (keyroost.flatpakrepo, the icon, keyroost.gpg)
+          # and those must survive. cp overlays/overwrites the OSTree files
+          # (config/summary/objects/refs); OSTree objects are content-addressed and
+          # accumulate harmlessly — prune periodically (see packaging/LINUX-BUNDLES.md).
+          cp -a out/repo/. "${tmp}/repo/"
+          # .nojekyll so Pages serves the tree verbatim (no Jekyll processing).
+          touch "${tmp}/repo/.nojekyll"
+          cd "${tmp}/repo"
+          git config user.name "keyroost release bot"
+          git config user.email "release@invalid.local"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Flatpak OSTree repo already current"
+            exit 0
+          fi
+          git commit -m "flatpak: publish ${TAG} OSTree repo"
+          git push origin HEAD

@@ -1,0 +1,66 @@
+# Keeps the SHA-pinned actions in .github/workflows fresh: Dependabot
+# understands `uses: owner/repo@<sha> # vX.Y.Z` lines and PRs bumps with the
+# comment updated, so pinning doesn't mean freezing.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+  # Surfaces RustSec-relevant dependency bumps as PRs. Grouped so routine
+  # transitive churn (the eframe/wgpu tree) arrives as one reviewable PR.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      cargo-minor:
+        update-types: [minor, patch]
+    ignore:
+      # The CTAP crypto stack (p256, aes-gcm, scrypt, sha2) is built on the
+      # cipher 0.4 / digest 0.10 RustCrypto trait generation. aes 0.9+,
+      # cbc 0.2+, and hmac 0.13+ belong to the next generation and cannot
+      # interoperate with it; drop these ignores when bumping the whole
+      # RustCrypto stack together.
+      - dependency-name: aes
+        versions: ['>=0.9']
+      - dependency-name: cbc
+        versions: ['>=0.2']
+      - dependency-name: hmac
+        versions: ['>=0.13']
+      - dependency-name: sha2
+        versions: ['>=0.11']
+      # rsa 0.9 (keyroost-rsakey's scoped exception) requires the rand 0.8 /
+      # rand_core 0.6 interfaces; drop when a rand-0.9+-compatible rsa ships.
+      - dependency-name: rand
+        versions: ['>=0.9']
+      # des and cipher are the same block-cipher generation as aes/cbc above:
+      # des 0.9 / cipher 0.5 use the cipher-0.5 traits and cannot interoperate
+      # with the pinned aes 0.8 / cbc 0.1, so they must move with the whole stack.
+      # getrandom 0.3 needs the rand 0.9 interfaces (rand is pinned just above).
+      - dependency-name: des
+        versions: ['>=0.9']
+      - dependency-name: cipher
+        versions: ['>=0.5']
+      - dependency-name: getrandom
+        versions: ['>=0.3']
+      # aes-gcm 0.11, scrypt 0.12, and p256 0.14 are the same next-generation
+      # wave (aes 0.9 / cipher 0.5 / digest 0.11 / elliptic-curve 0.14): the
+      # comment above already names them as part of the coupled stack, but they
+      # had no entries of their own, so dependabot kept proposing them solo
+      # (aes-gcm 0.11 arrived with CI red across the board). Move them with the
+      # whole stack, not one crate at a time.
+      - dependency-name: aes-gcm
+        versions: ['>=0.11']
+      - dependency-name: scrypt
+        versions: ['>=0.12']
+      - dependency-name: p256
+        versions: ['>=0.14']
+      # eframe pins its own egui version, so the pair can only move in
+      # lock-step, and a multi-version egui jump needs hand-migration of the
+      # GUI code — an upgrade to do deliberately, not via single-crate bumps.
+      # v0.7.3 already made the deliberate jump to 0.35; defer the next one.
+      - dependency-name: eframe
+        versions: ['>=0.36']
+      - dependency-name: egui
+        versions: ['>=0.36']

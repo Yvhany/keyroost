@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Migration notes — breaking changes — keyroost</title>
+<meta name="description" content="Breaking changes in keyroost by release, with the exact before → after for scripts and library consumers — the v0.7.5 --name → --device rename and the v0.6.0 command regrouping.">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="keyroost">
+<meta property="og:title" content="Migration notes — breaking changes — keyroost">
+<meta property="og:description" content="Breaking changes in keyroost by release, with the exact before → after for scripts and library consumers — the v0.7.5 --name → --device rename and the v0.6.0 command regrouping.">
+<meta property="og:url" content="https://framefilter.github.io/keyroost/migration.html">
+<meta property="og:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Migration notes — breaking changes — keyroost">
+<meta name="twitter:description" content="Breaking changes in keyroost by release, with the exact before → after for scripts and library consumers — the v0.7.5 --name → --device rename and the v0.6.0 command regrouping.">
+<meta name="twitter:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
+
+<link rel="icon" type="image/png" href="assets/keyroost-logo.png">
+<link rel="stylesheet" href="assets/keyroost-theme.css">
+<link rel="stylesheet" href="assets/site.css">
+<script>(function(){try{var t=localStorage.getItem('kr-theme');if(t==='light'||(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches))document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
+</head>
+<body>
+
+<header class="kr-topbar">
+  <div class="kr-wrap kr-topbar-inner">
+    <a class="kr-wordmark" href="index.html" aria-label="keyroost — home"><span class="kr-mark mono">k</span><span>keyroost</span></a>
+    <nav class="kr-nav" aria-label="Learn topics">
+      <a href="security-keys.html">Security keys</a>
+      <a href="fido2.html">FIDO2</a>
+      <a href="oath.html">OATH</a>
+      <a href="otp.html">On-device OTP</a>
+      <a href="fingerprint.html">Fingerprints</a>
+      <a href="mds.html">Device metadata</a>
+      <a href="settings.html">Settings</a>
+      <a href="storage.html">Storage</a>
+      <a href="openpgp.html">OpenPGP</a>
+      <a href="piv.html">PIV</a>
+      <a href="molto2.html">Molto2</a>
+      <a href="naming.html">Naming</a>
+      <a href="reset.html">Reset</a>
+      <a href="migration.html">Migration</a>
+    </nav>
+    <button class="kr-theme-toggle" id="kr-theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<section class="kr-hero">
+  <div class="kr-wrap">
+    <p class="kr-label">Reference · Migration</p>
+    <h1>Migration notes</h1>
+    <p class="kr-lede">Breaking changes by release, with the exact before → after for
+      scripts and library consumers. Newest first; each release's notes link back here.</p>
+  </div>
+</section>
+
+<main class="kr-wrap">
+
+  <section class="kr-section" id="v0-7-7">
+    <h2>v0.7.7 <span class="kr-pill kr-pill-warn">unreleased</span></h2>
+    <p>No flag or API renames. One reused name to watch for, and three additions that break
+      nothing:</p>
+    <ul>
+      <li><code>keyroostctl factory-reset</code> is a <strong>new top-level command</strong>
+        that resets every applet on a key. It reuses a name that was removed in v0.6.0 with a
+        different meaning — see the warning under v0.6.0 below.</li>
+      <li><code>keyroostctl piv move-key --from &lt;slot&gt; --to &lt;slot&gt;</code> — new;
+        the 20 retired PIV slots (82–95) are now accepted anywhere <code>--slot</code> is.</li>
+      <li><code>keyroostctl fido ssh-cert list|extract</code> — new; read-only.</li>
+    </ul>
+  </section>
+
+  <section class="kr-section" id="v0-7-6">
+    <h2>v0.7.6</h2>
+    <p class="kr-muted">Bug-fix release — no breaking changes for scripts or library
+      consumers.</p>
+  </section>
+
+  <section class="kr-section" id="v0-7-5">
+    <h2>v0.7.5</h2>
+
+    <h3>CLI: the global device selector is now <code>--device</code></h3>
+    <p>The global flag that selects a key by its friendly name was renamed:</p>
+<pre><code>keyroostctl --name mykey fido info      # ≤ 0.7.4
+keyroostctl --device mykey fido info    # 0.7.5+</code></pre>
+    <p><code>--name</code> collided with the <code>--name</code> option of the fingerprint
+      subcommands (<code>fido fingerprint-enroll</code> / <code>fingerprint-rename</code>),
+      where it names the <em>fingerprint</em>. No compatibility alias is provided — an
+      alias would recreate the exact collision the rename fixes.</p>
+    <div class="kr-callout note">
+      <div class="kr-callout-title note">Watch out</div>
+      <p>Under the fingerprint subcommands, <code>--name</code> still parses — it means the
+        fingerprint's <em>label</em>, not the device. A script that passes the old global
+        spelling there won't error; it will name the fingerprint instead. Everywhere else
+        the old spelling fails loudly with an "unexpected argument" error.</p>
+    </div>
+
+    <h3>OATH: partial listings are now reported</h3>
+    <p><code>oath list</code> prints a <strong>stderr</strong> warning when the key holds
+      entries that could not be decoded (written by another tool, or with a non-UTF-8
+      name) — previously they were silently omitted. The stdout / <code>--json</code>
+      output format is unchanged, so scripts that only read stdout are unaffected.</p>
+
+    <h3>Library (crates.io) API changes</h3>
+    <p class="kr-muted">For consumers of the published crates — CLI and GUI users are
+      unaffected.</p>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Crate</th><th>Change</th></tr>
+      <tr><td><code>keyroost-oath</code></td>
+        <td><code>parse_list</code> returns <code>Listing { credentials, skipped }</code>
+          instead of <code>Vec&lt;CredentialInfo&gt;</code>; <code>skipped &gt; 0</code>
+          means the listing is partial.</td></tr>
+      <tr><td><code>keyroost-transport</code></td>
+        <td><code>OathSession::list</code> returns <code>oath::Listing</code>;
+          <code>TransportError::AuthFailed.tries_remaining</code> is now
+          <code>Option&lt;u8&gt;</code> (<code>None</code> = the card gave no count —
+          don't render it as 0).</td></tr>
+      <tr><td><code>keyroost-piv</code></td>
+        <td><code>pad_pin</code> (and the VERIFY / CHANGE / UNBLOCK builders using it)
+          asserts a 6–8 byte PIN instead of silently truncating longer input. Validate
+          length before calling, as the in-tree transport does.</td></tr>
+      <tr><td><code>keyroost-ctap</code></td>
+        <td>The <code>CtapTransport</code> trait gains <code>read_timeout()</code> (a
+          default impl is provided, so existing implementations keep compiling).
+          <code>reset()</code> and the bio-enroll operations now restore the
+          <em>caller's</em> timeout rather than the crate default.</td></tr>
+    </table>
+    </div>
+  </section>
+
+  <section class="kr-section" id="v0-6-0">
+    <h2>v0.6.0 — command names moved under <code>molto</code> / <code>fido</code></h2>
+    <p>The Molto2 and FIDO commands were nested under <code>molto</code> and
+      <code>fido</code> groups. The old flat names were removed — update scripts as
+      follows:</p>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Old (≤ 0.5.x)</th><th>New (0.6.0+)</th></tr>
+      <tr><td><code>keyroostctl info</code></td><td><code>keyroostctl molto info</code></td></tr>
+      <tr><td><code>keyroostctl set-seed …</code></td><td><code>keyroostctl molto seed …</code></td></tr>
+      <tr><td><code>keyroostctl set-title …</code></td><td><code>keyroostctl molto title …</code></td></tr>
+      <tr><td><code>keyroostctl configure …</code></td><td><code>keyroostctl molto config …</code></td></tr>
+      <tr><td><code>keyroostctl sync-time …</code></td><td><code>keyroostctl molto sync-time …</code></td></tr>
+      <tr><td><code>keyroostctl set-customer-key …</code></td><td><code>keyroostctl molto customer-key …</code></td></tr>
+      <tr><td><code>keyroostctl import …</code></td><td><code>keyroostctl molto import …</code></td></tr>
+      <tr><td><code>keyroostctl import-file …</code></td><td><code>keyroostctl molto import-file …</code></td></tr>
+      <tr><td><code>keyroostctl factory-reset …</code></td><td><code>keyroostctl molto reset …</code> — <strong>see the warning below</strong></td></tr>
+      <tr><td><code>keyroostctl fido-info</code></td><td><code>keyroostctl fido info</code></td></tr>
+      <tr><td><code>keyroostctl fido-reset …</code></td><td><code>keyroostctl fido reset …</code></td></tr>
+      <tr><td><code>keyroostctl fido-pin-set …</code></td><td><code>keyroostctl fido pin-set …</code></td></tr>
+      <tr><td><code>keyroostctl fido-pin-change …</code></td><td><code>keyroostctl fido pin-change …</code></td></tr>
+      <tr><td><code>keyroostctl fido-pin-retries</code></td><td><code>keyroostctl fido pin-retries</code></td></tr>
+      <tr><td><code>keyroostctl fido-creds-list …</code></td><td><code>keyroostctl fido creds-list …</code></td></tr>
+      <tr><td><code>keyroostctl fido-creds-metadata …</code></td><td><code>keyroostctl fido creds-metadata …</code></td></tr>
+      <tr><td><code>keyroostctl fido-creds-delete …</code></td><td><code>keyroostctl fido creds-delete …</code></td></tr>
+      <tr><td><code>keyroostctl manpage &gt; x.1</code></td><td><code>keyroostctl manpage ./man</code></td></tr>
+    </table>
+    </div>
+    <div class="kr-callout danger">
+      <div class="kr-callout-title danger">Danger: <code>factory-reset</code> was reused</div>
+      <p>Since v0.7.7 <code>keyroostctl factory-reset</code> exists again as a top-level
+        command — but it is <strong>not</strong> the old Molto2 reset. It wipes
+        <em>every resettable applet</em> on the selected key: OATH, OpenPGP, PIV, Token2 OTP,
+        then FIDO2. Both the old flat command and the new one are confirmed with
+        <code>--yes</code>, so a stale <code>keyroostctl factory-reset --yes</code> will
+        <strong>not</strong> fail with "unknown subcommand" — it will run and destroy far more
+        than the script intended. Audit any script from ≤&nbsp;0.5.x for that exact string and
+        change it to <code>keyroostctl molto reset</code>.</p>
+    </div>
+    <p>The customer-key flags (<code>--key</code>, <code>--key-ascii</code>,
+      <code>--key-env</code>, <code>--key-ascii-env</code>) moved under
+      <code>molto</code> — e.g. <code>keyroostctl molto customer-key --key-env K</code>.
+      The <code>piv</code>, <code>oath</code>, <code>openpgp</code>, <code>otp</code>,
+      <code>key-name</code>, <code>list</code>, <code>doctor</code>, and
+      <code>completions</code> commands were unchanged.</p>
+  </section>
+
+  <section class="kr-section kr-res-section">
+    <h2>Related</h2>
+    <div class="kr-res">
+      <a href="https://github.com/framefilter/keyroost/releases"><span class="who">GitHub</span>Release notes by version</a>
+      <a href="https://github.com/framefilter/keyroost#readme"><span class="who">GitHub</span>README — install &amp; reference</a>
+    </div>
+    <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="naming.html">Device naming (--device) →</a></p>
+  </section>
+
+</main>
+
+<footer class="kr-footer">
+  <div class="kr-wrap">
+    <p><span class="kr-pill kr-pill-brand">keyroost</span> &nbsp;Independent, open-source Rust toolchain for hardware security keys. <a href="https://github.com/framefilter/keyroost">Source →</a></p>
+    <p class="kr-small">Not affiliated with or endorsed by any vendor; product names are descriptive and remain their owners' trademarks.</p>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>
