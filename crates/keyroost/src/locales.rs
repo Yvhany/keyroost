@@ -57,14 +57,13 @@ pub fn init_language() {
     let available = available_languages();
     eprintln!("[i18n] Available languages: {:?}", available.iter().map(|l| l.code.clone()).collect::<Vec<_>>());
     
-    // 尝试匹配系统语言（精确匹配，不是前缀匹配）
-    let selected = if let Some(lang) = available.iter().find(|l| sys_lang == l.code || sys_lang.starts_with(&format!("{}-", l.code))) {
-        lang.code.clone()
-    } else if available.iter().any(|l| l.code == "zh-CN") {
-        // 没有匹配的系统语言，优先用中文
+    // 始终优先使用中文，除非系统语言明确匹配其他语言
+    let selected = if sys_lang == "zh-CN" || sys_lang.starts_with("zh") {
+        // 系统语言是中文，用中文
         "zh-CN".to_string()
-    } else if available.iter().any(|l| l.code == "en") {
-        "en".to_string()
+    } else if available.iter().any(|l| l.code == "zh-CN") {
+        // 有中文可用，优先用中文
+        "zh-CN".to_string()
     } else if let Some(lang) = available.first() {
         lang.code.clone()
     } else {
@@ -112,6 +111,7 @@ pub fn available_languages() -> Vec<LanguageInfo> {
                 if path.extension().and_then(|e| e.to_str()) == Some("json") {
                     if let Ok(content) = std::fs::read_to_string(&path) {
                         if let Ok(file) = serde_json::from_str::<LanguageFile>(&content) {
+                            eprintln!("[i18n] Found language file: {} -> code={}", path.display(), file.language);
                             langs.push(LanguageInfo {
                                 code: file.language,
                                 name: file.language_name,
@@ -170,7 +170,7 @@ impl Default for Translations {
 }
 
 impl Translations {
-    /// 加载指定语言的翻译（从文件头读取语言代码）
+    /// 加载指定语言的翻译（从文件名加载）
     pub fn load(lang_code: &str) -> Self {
         let exe_dir = std::env::current_exe()
             .ok()
@@ -179,27 +179,19 @@ impl Translations {
         
         let lang_dir = exe_dir.join("language");
         if !lang_dir.exists() {
-            eprintln!("[i18n] Language directory not found: {:?}", lang_dir);
             return Self { lang: lang_code.to_string(), ui_strings: HashMap::new() };
         }
 
-        if let Ok(entries) = std::fs::read_dir(&lang_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        if let Ok(file) = serde_json::from_str::<LanguageFile>(&content) {
-                            if file.language == lang_code {
-                                eprintln!("[i18n] Found language '{}' in {:?}", lang_code, path);
-                                return Self { lang: lang_code.to_string(), ui_strings: file.translations };
-                            }
-                        }
-                    }
+        // 直接按文件名查找
+        let path = lang_dir.join(format!("{}.json", lang_code));
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(file) = serde_json::from_str::<LanguageFile>(&content) {
+                    return Self { lang: lang_code.to_string(), ui_strings: file.translations };
                 }
             }
         }
 
-        eprintln!("[i18n] Language '{}' not found, using empty", lang_code);
         Self { lang: lang_code.to_string(), ui_strings: HashMap::new() }
     }
 
@@ -212,7 +204,11 @@ impl Translations {
     }
 
     pub fn ui_string(&self, key: &str) -> Option<&str> {
-        self.ui_strings.get(key).map(|s| s.as_str())
+        let result = self.ui_strings.get(key).map(|s| s.as_str());
+        if result.is_none() {
+            eprintln!("[i18n] Missing key: '{}' (language: {})", key, self.lang);
+        }
+        result
     }
 
     pub fn help_title(&self, key: &str) -> Option<&str> {

@@ -1,4 +1,4 @@
-﻿//! keyroost — desktop GUI for programming Token2 Molto2 / Molto2v2 tokens.
+//! keyroost — desktop GUI for programming Token2 Molto2 / Molto2v2 tokens.
 //!
 //! Dark-themed by default, modeled loosely on Token2's PyQt5 layout: device
 //! status across the top, slot list on the left, edit form on the right.
@@ -918,30 +918,89 @@ fn resolve_pending_fido_reset_row(
 fn piv_force_reset_message(e: TransportError) -> String {
     match e {
         TransportError::PivForceResetUnsupported => {
-            "PIV 重置不受支持：此密钥不支持 PIV 强制重置功能。\n\n\
-             该密钥的 PIV 小程序无法通过软件重置。PIV 重置是 Yubico 的供应商扩展，\
-             不是所有密钥都支持。PIV 部分的密钥和证书仍然存在，但无法通过 keyroost 清除。\n\n\
-             其他小程序（FIDO、OATH、OpenPGP）不受影响，可以正常重置。".to_string()
+            crate::locales::t("piv_reset_unsupported").to_string()
         }
         TransportError::PivForceResetIncomplete(reason) => {
-            format!(
-                "PIV 重置未完成：{}\n\n\
-                 PIN 和 PUK 已被阻止，但卡片拒绝了重置指令。\n\
-                 PIV 小程序未被擦除，密钥和证书仍然存在。\n\
-                 无法通过 keyroost 完成此操作。\n\n\
-                 其他小程序（FIDO、OATH、OpenPGP）不受影响。"
-            , reason)
+            crate::locales::t("piv_reset_incomplete").replace("{}", reason)
         }
         TransportError::PivPukGuessAccepted => {
-            "PIV PUK 猜测成功：PUK 是正确的，PIN 已被重置。\n\n\
-             这意味着 PUK 没有被阻止，重置无法继续。\n\
-             请先使用正确的 PUK 阻止 PIN，然后再尝试重置。".to_string()
+            crate::locales::t("piv_puk_guess_accepted").to_string()
         }
-        other => format!(
-            "{} (重置会在擦除前阻止 PIN 和 PUK，所以 PIV 可能已被锁定但未被擦除——这不是砖机：\
-             再次运行出厂重置即可完成)",
-            other
-        )
+        other => {
+            crate::locales::t("piv_reset_partial_note").replace("{}", &other.to_string())
+        }
+    }
+}
+
+/// 将 TransportError 翻译为当前语言的错误消息
+fn translate_transport_error(e: &TransportError, translations: &Translations) -> String {
+    match e {
+        TransportError::PivBadKeyLength => {
+            translations.ui_string("error_piv_bad_key_length")
+                .unwrap_or("PIV management key has the wrong length for its algorithm")
+                .to_string()
+        }
+        TransportError::PivBadPinLength => {
+            translations.ui_string("error_piv_bad_pin_length")
+                .unwrap_or("PIV PIN/PUK must be 6-8 characters")
+                .to_string()
+        }
+        TransportError::PivResetNotAllowed => {
+            translations.ui_string("error_piv_reset_not_allowed")
+                .unwrap_or("PIV reset refused: the PIN and PUK must both be blocked first")
+                .to_string()
+        }
+        TransportError::PivManagementAuthFailed => {
+            translations.ui_string("error_piv_management_auth_failed")
+                .unwrap_or("PIV management-key authentication failed (wrong key)")
+                .to_string()
+        }
+        TransportError::PivSecurityNotSatisfied => {
+            translations.ui_string("error_piv_security_not_satisfied")
+                .unwrap_or("PIV operation needs a management-key auth or PIN that wasn't satisfied")
+                .to_string()
+        }
+        TransportError::PivPinRejected { tries_remaining: Some(n) } => {
+            translations.ui_string("error_piv_pin_rejected")
+                .unwrap_or("PIV PIN/PUK rejected ({} tries remaining)")
+                .replace("{}", &n.to_string())
+        }
+        TransportError::PivPinRejected { tries_remaining: None } => {
+            translations.ui_string("error_piv_pin_rejected_blocked")
+                .unwrap_or("PIV PIN/PUK rejected (may be blocked)")
+                .to_string()
+        }
+        TransportError::NoPivApplet => {
+            translations.ui_string("error_no_piv_applet")
+                .unwrap_or("no PIV applet on this card")
+                .to_string()
+        }
+        TransportError::OpenPgpPinRejected { tries_remaining } => {
+            match tries_remaining {
+                Some(0) => translations.ui_string("error_openpgp_pin_blocked")
+                    .unwrap_or("OpenPGP PIN rejected, please reset OpenPGP")
+                    .to_string(),
+                _ => translations.ui_string("error_openpgp_pin_rejected")
+                    .unwrap_or("OpenPGP PIN rejected; {} attempt(s) remaining")
+                    .replace("{}", &tries_remaining.map(|n| n.to_string()).unwrap_or_else(|| "unknown".to_string())),
+            }
+        }
+        TransportError::OathPasswordRejected => {
+            translations.ui_string("error_oath_password_rejected")
+                .unwrap_or("OATH applet rejected the password (wrong password)")
+                .to_string()
+        }
+        TransportError::OathParse(e) => {
+            translations.ui_string("error_oath_parse")
+                .unwrap_or("OATH response parse error: {}")
+                .replace("{}", &e.to_string())
+        }
+        TransportError::MalformedResponse(_) => {
+            translations.ui_string("error_malformed_response")
+                .unwrap_or("malformed response: cannot read certificate file")
+                .to_string()
+        }
+        _ => e.to_string(),
     }
 }
 
@@ -1704,9 +1763,6 @@ fn main() -> eframe::Result<()> {
                     egui_ctx.request_repaint();
                 })
             };
-            // Initialize language from system settings
-            crate::locales::init_language();
-            
             let app = App {
                 mode,
                 accent_idx,
@@ -1854,6 +1910,12 @@ struct App {
     molto_reset_confirm: bool,
     /// True while the per-slot seed-delete confirmation card is showing.
     molto_delete_confirm: bool,
+    /// 序列号查看对话框是否打开
+    view_serial_open: bool,
+    /// 当前查看序列号的设备名称
+    view_serial_device_name: Option<String>,
+    /// 当前查看序列号的设备序列号
+    view_serial_number: Option<String>,
     /// Friendly-name draft for the selected device.
     rename_input: String,
     /// The device the open rename field targets, pinned when the field opens:
@@ -1888,6 +1950,8 @@ struct App {
     pending_scans: u8,
     /// When the next burst scan is due.
     next_scan_at: Option<std::time::Instant>,
+    /// 是否需要在扫描完成后完整重载所有设备数据（名称、槽位、凭证等）
+    full_reload_pending: bool,
     /// Background PC/SC hotplug watcher. `None` in tests / if it can't start.
     /// Held only to keep the thread alive; dropped on app exit.
     #[allow(dead_code)]
@@ -1971,6 +2035,8 @@ struct App {
     edit_device_notes: String,
     /// 应用配置
     app_config: AppConfig,
+    /// Flag to track if language has been initialized.
+    language_initialized: bool,
 }
 
 /// 已保存的密钥信息
@@ -4137,7 +4203,7 @@ impl App {
             return;
         }
         if *new != *confirm {
-            self.security_keys.error = Some("the two PINs don't match".into());
+            self.security_keys.error = Some(self.translations.ui_string("error_pins_dont_match").unwrap_or("the two PINs don't match").to_string());
             return;
         }
         self.spawn_job("Changing PIN", move || {
@@ -4183,7 +4249,7 @@ impl App {
             return;
         }
         if *new != *confirm {
-            self.security_keys.error = Some("the two PINs don't match".into());
+            self.security_keys.error = Some(self.translations.ui_string("error_pins_dont_match").unwrap_or("the two PINs don't match").to_string());
             return;
         }
         self.spawn_job("Setting PIN", move || {
@@ -4426,7 +4492,7 @@ impl App {
                         app.oath.locked = true;
                         app.oath.error = Some("wrong OATH password".into());
                     }
-                    Err(e) => app.oath.error = Some(e.to_string()),
+                    Err(e) => app.oath.error = Some(translate_transport_error(&e, &app.translations)),
                 }
             })
         });
@@ -4484,7 +4550,7 @@ impl App {
                 // A transport error says nothing about the password; keep any
                 // retained copy so a transient failure doesn't force a retype.
                 if !modal_busy {
-                    app.oath.error = Some(e.to_string());
+                    app.oath.error = Some(translate_transport_error(&e, &app.translations));
                 }
             }
         }
@@ -5050,7 +5116,8 @@ impl App {
                                         let resp = ui.add(
                                             egui::Slider::new(&mut factor, 0.80..=1.25)
                                                 .show_value(false)
-                                                .trailing_fill(true),
+                                                .trailing_fill(true)
+                                                .step_by(0.05),
                                         );
                                         if resp.dragged() {
                                             self.zoom_pending = Some(factor.clamp(0.80, 1.25));
@@ -5148,7 +5215,7 @@ impl App {
                                 ui.vertical(|ui| {
                                     ui.add_space(4.0);
                                     ui.label(
-                                        egui::RichText::new("keyroost_l10n v1.0.1")
+                                        egui::RichText::new("keyroost_l10n v1.0.15")
                                             .font(theme::f_reg(13.0))
                                             .color(p.txt2),
                                     );
@@ -5310,6 +5377,102 @@ impl App {
         }
         if save {
             self.save_edit_device();
+        }
+    }
+
+    /// 渲染序列号查看对话框
+    fn render_view_serial_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
+        if !self.view_serial_open {
+            return;
+        }
+
+        let mut close = false;
+
+        egui::Window::new("view_serial_window")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size(egui::vec2(350.0, 180.0))
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(egui::Frame {
+                inner_margin: egui::Margin::ZERO,
+                corner_radius: egui::CornerRadius::same(8),
+                fill: p.panel,
+                stroke: egui::Stroke::new(1.0, p.line),
+                ..Default::default()
+            })
+            .show(ctx, |ui| {
+                // 标题栏
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(self.translations.ui_string("serial_number").unwrap_or("Serial number"))
+                            .font(theme::f_bold(14.0))
+                            .color(p.txt),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(8.0);
+                        let close_btn = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("\u{2715}").font(theme::f_reg(12.0)).color(p.txt3)
+                            ).fill(egui::Color32::TRANSPARENT).stroke(egui::Stroke::NONE)
+                        );
+                        if close_btn.clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(12.0);
+
+                // 设备名称
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(self.translations.ui_string("device_name").unwrap_or("Device name"))
+                            .font(theme::f_reg(12.0))
+                            .color(p.txt2),
+                    );
+                    ui.label(
+                        egui::RichText::new(self.view_serial_device_name.as_deref().unwrap_or("N/A"))
+                            .font(theme::f_reg(12.0))
+                            .color(p.txt),
+                    );
+                });
+                ui.add_space(8.0);
+
+                // 序列号
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(self.translations.ui_string("serial_number").unwrap_or("Serial number"))
+                            .font(theme::f_reg(12.0))
+                            .color(p.txt2),
+                    );
+                    ui.label(
+                        egui::RichText::new(self.view_serial_number.as_deref().unwrap_or("N/A"))
+                            .font(theme::f_sb(13.0))
+                            .color(p.txt),
+                    );
+                });
+                ui.add_space(16.0);
+
+                // 关闭按钮
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    if theme::button(ui, p, BtnKind::Default, &self.translations.ui_string("close").unwrap_or("Close").to_string()).clicked() {
+                        close = true;
+                    }
+                });
+                ui.add_space(8.0);
+            });
+
+        if close {
+            self.view_serial_open = false;
+            self.view_serial_device_name = None;
+            self.view_serial_number = None;
         }
     }
 
@@ -5794,7 +5957,7 @@ impl App {
                         app.openpgp.status = Some(status);
                         app.openpgp.loaded = true;
                     }
-                    Err(e) => app.openpgp.error = Some(e.to_string()),
+                    Err(e) => app.openpgp.error = Some(translate_transport_error(&e, &app.translations)),
                 }
             })
         });
@@ -5826,7 +5989,7 @@ impl App {
                 wipe(&mut app.openpgp.admin_pin);
             }
             Err(e) => {
-                app.openpgp.error = Some(e.to_string());
+                app.openpgp.error = Some(translate_transport_error(&e, &app.translations));
                 wipe(&mut app.openpgp.admin_pin);
             }
         }
@@ -5930,7 +6093,7 @@ impl App {
                         wipe(&mut app.openpgp.admin_pin);
                     }
                     Err(e) => {
-                        app.openpgp.error = Some(e.to_string());
+                        app.openpgp.error = Some(translate_transport_error(&e, &app.translations));
                         wipe(&mut app.openpgp.admin_pin);
                     }
                 }
@@ -6498,6 +6661,51 @@ impl App {
         self.next_scan_at = None; // first scan is due immediately
         // 重新加载语言包
         self.translations = Translations::new(self.language.clone());
+        // 标记需要完整重载设备数据
+        self.full_reload_pending = true;
+    }
+
+    /// 完整重载当前选中设备的所有数据（名称、槽位、凭证等）
+    fn reload_all_device_data(&mut self) {
+        let Some(dev) = self.selected_device().cloned() else {
+            return;
+        };
+
+        // 从 keyring 重新加载设备名称
+        if let Ok(keyring) = keyroost_keyring::Keyring::load_default() {
+            if let Some(name) = keyring.name_for(Some(&dev.serial)).map(str::to_owned) {
+                if let Some(d) = self.devices.iter_mut().find(|d| d.id == dev.id) {
+                    d.name = Some(name);
+                }
+            }
+        }
+
+        // 根据设备类型重新加载所有数据
+        match dev.kind {
+            DeviceKind::Token => {
+                // Molto2: 重新打开会话并加载所有槽位数据
+                self.open_molto();
+            }
+            DeviceKind::ProgToken => {
+                // 可编程令牌: 重新打开会话
+                self.open_prog();
+            }
+            DeviceKind::Key => {
+                // FIDO 安全密钥: 重新加载所有支持的数据
+                if dev.caps.has(Caps::FIDO2) {
+                    self.fetch_selected_info();
+                }
+                if dev.caps.has(Caps::OATH) {
+                    self.load_oath_creds();
+                }
+                if dev.caps.has(Caps::PGP) {
+                    self.load_openpgp_status();
+                }
+                if dev.caps.has(Caps::PIV) {
+                    self.load_piv_status();
+                }
+            }
+        }
     }
 
     fn refresh_devices(&mut self) {
@@ -6633,7 +6841,7 @@ impl App {
                                     vendor: saved.vendor.clone(),
                                     model: saved.model.clone(),
                                     serial: saved.serial.clone(),
-                                    transport: "历史设备".into(),
+                                    transport: app.translations.ui_string("historical_device").unwrap_or("Historical device").to_string(),
                                     firmware: String::new(),
                                     caps,
                                     kind: DeviceKind::Key,
@@ -6656,6 +6864,11 @@ impl App {
                     }
                     if changed {
                         app.on_device_selected();
+                    }
+                    // 如果需要完整重载，重新加载当前设备的所有数据
+                    if app.full_reload_pending {
+                        app.full_reload_pending = false;
+                        app.reload_all_device_data();
                     }
                 }
                 Err(e) => App::apply_device_scan_failure(app, e),
@@ -6938,7 +7151,7 @@ impl App {
                         app.piv.slot_keys = slot_keys;
                         app.piv.loaded = true;
                     }
-                    Ok((Err(e), _)) | Err(e) => app.piv.error = Some(e.to_string()),
+                    Ok((Err(e), _)) | Err(e) => app.piv.error = Some(translate_transport_error(&e, &app.translations)),
                 }
             })
         });
@@ -6977,7 +7190,7 @@ impl App {
             }
             Err(e) => {
                 app.piv.notice = None;
-                app.piv.error = Some(e.to_string());
+                app.piv.error = Some(translate_transport_error(&e, &app.translations));
             }
         }
     }
@@ -7005,7 +7218,7 @@ impl App {
         };
         if self.piv.pin_new != self.piv.pin_confirm {
             self.piv.notice = None;
-            self.piv.error = Some("the two new PINs don't match".into());
+            self.piv.error = Some(self.translations.ui_string("error_piv_pins_dont_match").unwrap_or("the two new PINs don't match").to_string());
             return;
         }
         let (old, new) = (self.piv.pin_old.clone(), self.piv.pin_new.clone());
@@ -7032,7 +7245,7 @@ impl App {
         };
         if self.piv.puk_new != self.piv.puk_confirm {
             self.piv.notice = None;
-            self.piv.error = Some("the two new PUKs don't match".into());
+            self.piv.error = Some(self.translations.ui_string("error_piv_puks_dont_match").unwrap_or("the two new PUKs don't match").to_string());
             return;
         }
         let (old, new) = (self.piv.puk_old.clone(), self.piv.puk_new.clone());
@@ -7182,7 +7395,7 @@ impl App {
                     }
                     Err(e) => {
                         app.piv.notice = None;
-                        app.piv.error = Some(e.to_string());
+                        app.piv.error = Some(translate_transport_error(&e, &app.translations));
                     }
                 }
                 Self::apply_piv_cred_result(app);
@@ -7373,7 +7586,7 @@ impl App {
                 }
                 match result {
                     Ok(v) => app.piv.retired_occupancy = Some(v),
-                    Err(e) => app.piv.error = Some(e.to_string()),
+                    Err(e) => app.piv.error = Some(translate_transport_error(&e, &app.translations)),
                 }
             })
         })
@@ -7495,7 +7708,7 @@ impl App {
                         }
                         Err(e) => {
                             app.piv.notice = None;
-                            app.piv.error = Some(e.to_string());
+                            app.piv.error = Some(translate_transport_error(&e, &app.translations));
                         }
                     }
                     Self::apply_piv_cred_result(app);
@@ -7543,7 +7756,7 @@ impl App {
                 }
                 Err(e) => {
                     app.piv.notice = None;
-                    app.piv.error = Some(e.to_string());
+                    app.piv.error = Some(translate_transport_error(&e, &app.translations));
                 }
             })
         });
@@ -8459,6 +8672,16 @@ impl eframe::App for App {
     // see the `settings` module.
 
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Initialize language on first frame
+        if !self.language_initialized {
+            crate::locales::init_language();
+            self.language_initialized = true;
+            // Reload translations with the initialized language
+            let current_lang = crate::locales::current_language();
+            self.language = crate::locales::Language::new(&current_lang);
+            self.translations = crate::locales::Translations::new(self.language.clone());
+        }
+
         // Apply pending language change at the start of the frame
         if self.apply_language_change {
             self.apply_language_change = false;
@@ -8660,6 +8883,9 @@ impl eframe::App for App {
         if self.edit_device_open {
             self.render_edit_device_dialog(ctx, &p);
         }
+
+        // 序列号查看对话框
+        self.render_view_serial_dialog(ctx, &p);
 
         // Help popover, painted last so it sits above everything.
         if let Some(topic) = self.help_open {
@@ -8953,7 +9179,8 @@ impl App {
         let resp = ui.add(
             egui::Slider::new(&mut factor, theme::ZOOM_MIN..=theme::ZOOM_MAX)
                 .show_value(false)
-                .trailing_fill(true),
+                .trailing_fill(true)
+                .step_by(0.05),
         );
         if resp.dragged() {
             // Mid-drag: preview only, don't touch the context (avoids runaway).
@@ -9052,7 +9279,7 @@ impl App {
                         // 设备列表(X)
                         ui.label(
                             egui::RichText::new(format!("{}({})", 
-                                self.translations.ui_string("device_list").unwrap_or("设备列表"),
+                                self.translations.ui_string("device_list").unwrap_or("Device list"),
                                 self.devices.len()))
                                 .font(theme::f_sb(13.0))
                                 .color(p.txt2),
@@ -9062,7 +9289,7 @@ impl App {
                         let connected = self.devices.iter().filter(|d| d.kind == DeviceKind::Key && !d.id.starts_with("history:")).count();
                         ui.label(
                             egui::RichText::new(format!("{}:{}", 
-                                self.translations.ui_string("connected").unwrap_or("已连接"),
+                                self.translations.ui_string("connected").unwrap_or("Connected"),
                                 connected))
                                 .font(theme::f_sb(13.0))
                                 .color(p.txt2),
@@ -9082,7 +9309,7 @@ impl App {
                             }
                             ui.add_space(4.0);
                             // 设置按钮
-                            if theme::button(ui, p, BtnKind::Ghost, self.translations.ui_string("settings").unwrap_or("设置")).clicked() {
+                            if theme::button(ui, p, BtnKind::Ghost, self.translations.ui_string("settings").unwrap_or("Settings")).clicked() {
                                 self.settings_open = !self.settings_open;
                             }
                         });
@@ -9135,7 +9362,7 @@ impl App {
                                         // 标题
                                         ui.label(
                                             egui::RichText::new(
-                                                self.translations.ui_string("touch_key_title").unwrap_or("请触摸密钥")
+                                                self.translations.ui_string("touch_key_title").unwrap_or("Please touch your key")
                                             )
                                             .font(theme::f_bold(16.0))
                                             .color(p.txt),
@@ -9149,7 +9376,7 @@ impl App {
                                         // 提示文字
                                         ui.label(
                                             egui::RichText::new(
-                                                self.translations.ui_string("touch_key_desc").unwrap_or("密钥正在等待您的触摸确认。请触摸密钥上的传感器以继续操作。")
+                                                self.translations.ui_string("touch_key_desc").unwrap_or("Your key is waiting for touch. Please touch the sensor on your key to continue.")
                                             )
                                             .font(theme::f_reg(13.0))
                                             .color(p.txt2),
@@ -9162,7 +9389,7 @@ impl App {
                                             ui.add_space(8.0);
                                             ui.label(
                                                 egui::RichText::new(
-                                                    self.translations.ui_string("touch_key_waiting").unwrap_or("等待触摸中")
+                                                    self.translations.ui_string("touch_key_waiting").unwrap_or("Waiting for touch")
                                                 )
                                                 .font(theme::f_reg(12.0))
                                                 .color(p.txt3),
@@ -9172,7 +9399,7 @@ impl App {
                                         
                                         // 取消按钮
                                         ui.horizontal(|ui| {
-                                            if theme::button(ui, p, BtnKind::Ghost, &self.translations.ui_string("cancel").unwrap_or("取消").to_string()).clicked() {
+                                            if theme::button(ui, p, BtnKind::Ghost, &self.translations.ui_string("cancel").unwrap_or("Cancel").to_string()).clicked() {
                                                 // 取消操作
                                             }
                                         });
@@ -9220,14 +9447,15 @@ impl App {
                                 }
                                 if ui.button(self.translations.ui_string("view_serial").unwrap_or("View serial number")).clicked() {
                                     ui.close();
-                                    // 显示序列号信息
+                                    // 显示序列号对话框
                                     if let Some(dev) = self.devices.iter().find(|d| d.id == dev_id) {
-                                        let serial = if dev.serial.is_empty() {
+                                        self.view_serial_device_name = dev.name.clone().or_else(|| Some(dev.model.clone()));
+                                        self.view_serial_number = Some(if dev.serial.is_empty() {
                                             "N/A".to_string()
                                         } else {
                                             dev.serial.clone()
-                                        };
-                                        self.log_info(&format!("{}: {}", self.translations.ui_string("serial_number").unwrap_or("Serial"), serial));
+                                        });
+                                        self.view_serial_open = true;
                                     }
                                 }
                                 if dev_kind == DeviceKind::Key {
@@ -9630,17 +9858,7 @@ impl App {
             ui.add_space(6.0);
             self.help_dot(ui, p, topic);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(
-                        egui::Label::new(
-                            egui::RichText::new(self.translations.ui_string("manage_arrow").unwrap_or("manage_arrow").to_string())
-                                .font(theme::f_sb(12.5))
-                                .color(p.accent),
-                        )
-                        .sense(egui::Sense::click()),
-                    )
-                    .clicked()
-                {
+                if theme::button(ui, p, BtnKind::Ghost, &self.translations.ui_string("manage_arrow").unwrap_or("Manage →").to_string()).clicked() {
                     go = true;
                 }
             });
@@ -9834,7 +10052,31 @@ impl App {
                     #[cfg(not(windows))]
                     let non_admin = false;
                     if non_admin {
-                        theme::pill(ui, self.translations.ui_string("admin_rights_needed").unwrap_or("Administrator rights needed"), p.warn, p.warn_soft());
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(200.0, 24.0),
+                            egui::Sense::click(),
+                        );
+                        ui.painter().rect_filled(
+                            rect,
+                            egui::CornerRadius::same(12),
+                            p.warn_soft(),
+                        );
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            self.translations.ui_string("admin_rights_needed").unwrap_or("Administrator rights needed"),
+                            theme::f_sb(11.0),
+                            p.warn,
+                        );
+                        if resp.clicked() {
+                            match keyroost_winwebauthn::relaunch_as_admin() {
+                                Ok(()) => std::process::exit(0),
+                                Err(e) => {
+                                    self.security_keys.error =
+                                        Some(format!("Couldn't restart as administrator: {e}"));
+                                }
+                            }
+                        }
                         ui.add_space(6.0);
                         ui.label(
                             egui::RichText::new(self.translations.ui_string("open_fido2_admin").unwrap_or("Open the FIDO2 tab to manage this key via Windows settings or restart as administrator."))
@@ -10310,7 +10552,7 @@ impl App {
                         ui.add_space(8.0);
                         if setting {
                             pin_field(ui, p, self.translations.ui_string("new_pin").unwrap_or("New PIN"), &mut self.security_keys.change_pin.new);
-                            pin_field(ui, p, self.translations.ui_string("confirm").unwrap_or("Confirm"), &mut self.security_keys.change_pin.confirm);
+                            pin_field(ui, p, self.translations.ui_string("confirm_pin").unwrap_or("Confirm PIN"), &mut self.security_keys.change_pin.confirm);
                         } else {
                             pin_field(ui, p, self.translations.ui_string("current_pin").unwrap_or("Current PIN"), &mut self.security_keys.change_pin.old);
                             pin_field(ui, p, self.translations.ui_string("new_pin").unwrap_or("New PIN"), &mut self.security_keys.change_pin.new);
@@ -10424,14 +10666,14 @@ impl App {
                     }
                 });
                 let extras = match (has_bio, settings_available) {
-                    (true, true) => "通行密钥、指纹和设置",
-                    (true, false) => "通行密钥和指纹",
-                    (false, true) => "通行密钥和设置",
-                    (false, false) => "通行密钥",
+                    (true, true) => self.translations.ui_string("unlock_to_manage_bio_settings").unwrap_or("Passkeys, fingerprints and settings"),
+                    (true, false) => self.translations.ui_string("unlock_to_manage_bio").unwrap_or("Passkeys and fingerprints"),
+                    (false, true) => self.translations.ui_string("unlock_to_manage_settings").unwrap_or("Passkeys and settings"),
+                    (false, false) => self.translations.ui_string("unlock_to_manage_passkeys").unwrap_or("Passkeys"),
                 };
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new(format!("解锁以管理{}。", extras))
+                    egui::RichText::new(self.translations.ui_string("unlock_to_manage_fmt").unwrap_or("Unlock to manage {}.").replace("{}", extras))
                         .font(theme::f_reg(11.5))
                         .color(p.txt3),
                 );
@@ -10484,8 +10726,8 @@ impl App {
                         ui,
                         self.translations.ui_string("always_require_uv").unwrap_or("Always require user verification"),
                         match always_uv {
-                            Some(true) => "开启".to_string(),
-                            Some(false) => "关闭".to_string(),
+                            Some(true) => self.translations.ui_string("always_uv_on_short").unwrap_or("On").to_string(),
+                            Some(false) => self.translations.ui_string("always_uv_off_short").unwrap_or("Off").to_string(),
                             None => "\u{2014}".to_string(),
                         },
                     );
@@ -10500,14 +10742,14 @@ impl App {
                     );
                     if force_change == Some(true) {
                         ui.add_space(4.0);
-                        row(ui, "强制更改 PIN", "下次使用时必需".to_string());
+                        row(ui, &self.translations.ui_string("force_pin_change_label").unwrap_or("Force PIN change"), self.translations.ui_string("force_pin_change_hint").unwrap_or("Required on next use").to_string());
                     }
                     if let Some(ep) = ep {
                         ui.add_space(4.0);
                         row(
                             ui,
                             self.translations.ui_string("enterprise_attestation").unwrap_or("Enterprise attestation"),
-                            if ep { "已启用" } else { "已支持" }.to_string(),
+                            if ep { self.translations.ui_string("enterprise_enabled").unwrap_or("Enabled") } else { self.translations.ui_string("enterprise_supported").unwrap_or("Supported") }.to_string(),
                         );
                     }
 
@@ -11979,7 +12221,12 @@ impl App {
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, &self.translations.ui_string("toggle").unwrap_or("toggle").to_string()).clicked() {
+                    let toggle_text = match always_uv {
+                        Some(true) => self.translations.ui_string("disable").unwrap_or("Disable"),
+                        Some(false) => self.translations.ui_string("enable").unwrap_or("Enable"),
+                        None => self.translations.ui_string("toggle").unwrap_or("Toggle"),
+                    };
+                    if theme::button(ui, p, BtnKind::Default, &toggle_text.to_string()).clicked() {
                         arm = Some(AdvancedAction::ToggleAlwaysUv);
                     }
                 });
@@ -12628,7 +12875,7 @@ impl App {
                                 p.err,
                                 egui::RichText::new(
                                     self.translations.ui_string("removes_cert_slot").unwrap_or("removes_cert_slot").to_string()
-                                        .replace("{}", &slot),
+                                        .replace("{slot}", &slot),
                                 )
                                 .font(theme::f_sb(12.5)),
                             );
@@ -12642,7 +12889,7 @@ impl App {
                                 p.err,
                                 egui::RichText::new(
                                     self.translations.ui_string("permanently_erases_key").unwrap_or("permanently_erases_key").to_string()
-                                        .replace("{}", &slot),
+                                        .replace("{slot}", &slot),
                                 )
                                 .font(theme::f_sb(12.5)),
                             );
@@ -13405,7 +13652,7 @@ impl App {
             Some(st) => {
                 let (algo, fpr) = selected.status_fields(st);
                 if fpr.iter().all(|&b| b == 0) {
-                    "无密钥".to_string()
+                    self.translations.ui_string("no_key").unwrap_or("No key").to_string()
                 } else {
                     format!("{} \u{00B7} {} {}", algo_id_label(algo), self.translations.ui_string("fingerprint_abbr").unwrap_or("fingerprint_abbr"), hex_lower(fpr))
                 }
@@ -13923,7 +14170,7 @@ impl App {
                             Some(PivCredKind::MoveKey)
                         );
                         if !occ.iter().any(|(_, has)| *has) && !move_open {
-                            note(ui, "没有已停用插槽持有密钥。");
+                            note(ui, &self.translations.ui_string("no_retired_slots").unwrap_or("No retired slots hold a key."));
                         }
                         for (slot, has_key) in occ {
                             if !has_key && !move_open {
@@ -14182,7 +14429,7 @@ impl App {
                     // Move key: relocate the slot's key to an empty slot. Needs
                     // 5.7+ (same gate as delete) and a key in the active slot.
                     if can_delete_key && selected_has_key {
-                        if theme::button(ui, p, BtnKind::Default, &format!("{}", "移动密钥")).clicked() {
+                        if theme::button(ui, p, BtnKind::Default, &format!("{}", self.translations.ui_string("move_key_btn").unwrap_or("Move key"))).clicked() {
                             open_move_key = true;
                         }
                         ui.add_space(6.0);
@@ -14202,7 +14449,7 @@ impl App {
             });
             if !can_delete_key {
                 ui.add_space(4.0);
-                note(ui, "密钥删除需要 YubiKey 5.7+。");
+                note(ui, &self.translations.ui_string("delete_key_hint").unwrap_or("Key deletion needs YubiKey 5.7+."));
             }
         });
         ui.add_space(12.0);

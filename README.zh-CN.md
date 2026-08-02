@@ -1,127 +1,99 @@
-# keyroost - 中文版
+# keyroost_l10n
 
-基于 [framefilter/keyroost](https://github.com/framefilter/keyroost) 原仓库 `main` 分支创建的完整中文翻译版本。
+keyroost 的中文本地化版本，提供完整的中文界面支持。
 
-其功能未作完整测试,目前仅进行简体中文翻译,如遇bug会尝试修复
+## 功能特性
 
-## 本分支更改内容
-
-### 1. 完整中文本地化
-- **界面翻译**: 所有菜单、标签、按钮、提示信息
-- **对话框翻译**: 所有弹窗标题、内容、按钮
-- **状态消息**: 操作反馈、错误提示
-- **帮助文本**: 所有帮助主题
-
-### 2. i18n 国际化系统
-- `crates/keyroost/locales/app.yml` - 主翻译文件 (YAML格式)
-- `crates/keyroost/locales/zh-CN.json` - 中文翻译 (JSON格式)
-- `crates/keyroost/locales/en.json` - 英文翻译 (JSON格式)
-- 使用 rust-i18n 框架，支持运行时语言切换
-
-### 3. 翻译覆盖模块
-- **FIDO2**: 通行密钥、指纹、设置、存储
-- **OpenPGP**: 卡片详情、密钥槽位、对话框
-- **PIV**: 插槽标签、对话框、证书管理
-- **OATH**: 验证码、凭证管理
-- **OTP**: 设备端 OTP 管理
-
-### 4. UI 优化
-- 统一对话框外观 (使用 `modal_window` 辅助函数)
-- 统一按钮样式 (使用 `theme::button` 函数)
-- 修复花括号占位符显示问题
-
-## 使用方法
-
-### 设置中文语言
-程序启动后，在设置界面选择「简体中文」即可。
-
-或通过环境变量：
-```bash
-set KEYROOST_LANG=zh-CN
-```
+- **FIDO2/CTAP2** - 通行密钥管理
+- **OATH** - 动态验证码 (TOTP/HOTP)
+- **OpenPGP** - 智能卡加密和签名
+- **PIV** - 个人身份验证
+- **设备管理** - 历史设备缓存、自动识别
+- **多语言支持** - 中文/英文界面切换
 
 ## 下载
 
-从 [Releases](https://github.com/Yvhany/keyroost/releases) 页面下载：
-- `keyroost.exe` - Windows x64 中文版
+### Release 文件
+- [keyroost_l10n-v1.0.2-zh-CN_x64.zip](https://github.com/Yvhany/keyroost/releases/download/v1.0.2/keyroost_l10n-v1.0.2-zh-CN_x64.zip) - 64位版本
+- [keyroost_l10n-v1.0.2-zh-CN_x86.zip](https://github.com/Yvhany/keyroost/releases/download/v1.0.2/keyroost_l10n-v1.0.2-zh-CN_x86.zip) - 32位版本
 
-## 编译
+### Release 包内容
+```
+keyroost_l10n-v1.0.2-zh-CN_x64/
+├── keyroost_l10n-v1.0.2-zh-CN_x64.exe
+└── language/
+    ├── en.json
+    └── zh-CN.json
+```
 
-### 环境要求
-- Rust 工具链 (MSRV 1.92)
-- Windows: `libpcsclite-dev` (可选，用于 PC/SC 支持)
+## 使用说明
+
+1. 解压 zip 文件
+2. 运行 `keyroost_l10n-v1.0.2-zh-CN_x64.exe` 或 `_x86.exe`
+3. 语言会自动检测系统语言（优先中文）
+
+## 功能说明
+
+### 密钥保存
+- 支持将当前已连接的密钥保存到本地
+- 下次插入该密钥时自动识别并加载保存的信息
+- 保存内容：密钥名称、序列号、备注信息
+
+### 设备列表排序
+- 已连接的设备始终排在列表最前面
+- 未连接的设备（历史设备）按名称 A → Z 排序
+- 排序规则：已连接 > 未连接（字母序）
+
+### 设备状态显示
+- 标题栏显示设备列表和已连接设备数量
+- 格式："设备列表(X)  已连接:Y"
+
+### 设备列表右键菜单
+- 命名密钥
+- 查看序列号
+- 从历史记录中移除
+
+### 设置页面
+- 语言切换（中文/英文）
+- 文字大小调整（5%步进）
+- 深色模式切换
+- 主题颜色选择
+
+## 开发说明
+
+### 编译环境
+- Rust 1.85+
+- Windows SDK
+- 代码签名证书：yvhan_dev_RSA
 
 ### 编译命令
 ```bash
-# 编译 release 版本
-cargo build --release --package keyroost
-
-# 输出位置
-target/release/keyroost.exe
-```
-
-### 交叉编译 (Windows)
-```bash
-# 在 Linux 上编译 Windows 版本
+# 64位
 cargo build --release --package keyroost --target x86_64-pc-windows-msvc
+
+# 32位
+cargo build --release --package keyroost --target i686-pc-windows-msvc
+
+# 签名
+signtool sign /a /fd SHA256 /sha1 <thumbprint> file.exe
 ```
 
-## 项目结构
+### 翻译文件
+语言包位于 `language/` 目录：
+- `en.json` - 英文翻译
+- `zh-CN.json` - 中文翻译
+- `app.yml` - 翻译键定义
 
-```
-keyroost-zh-CN/
-├── crates/
-│   ├── keyroost/           # 主 GUI 应用
-│   │   ├── src/
-│   │   │   ├── main.rs     # 主代码
-│   │   │   ├── locales.rs  # 翻译模块
-│   │   │   └── settings.rs # 设置模块
-│   │   └── locales/        # 翻译文件
-│   │       ├── app.yml     # 主翻译文件
-│   │       ├── zh-CN.json  # 中文翻译
-│   │       └── en.json     # 英文翻译
-│   ├── keyroost-piv/       # PIV 模块
-│   ├── keyroost-transport/ # 传输层
-│   ├── keyroost-ctap/      # FIDO2/CTAP 模块
-│   └── ...
-└── docs/                   # 文档
-```
+### 添加新语言
+1. 在 `language/` 目录下创建新的 JSON 文件（如 `ja.json`）
+2. 包含 `language` 和 `language_name` 字段
+3. 添加所有翻译键值对
 
-## 翻译键命名规范
+## 致谢
 
-- 使用蛇形命名法 (snake_case)
-- 语义化命名 (如 `reset_wipes_all`)
-- 保持与英文键名一致
-- 技术术语保持英文 (FIDO2, PIV, OpenPGP 等)
-
-## 如何添加新翻译
-
-1. 在 `locales/app.yml` 中添加新键：
-```yaml
-new_key:
-  en: "New English text"
-  zh-CN: "新的中文文本"
-```
-
-2. 在 `locales/en.json` 中添加：
-```json
-"new_key": "New English text"
-```
-
-3. 在 `locales/zh-CN.json` 中添加：
-```json
-"new_key": "新的中文文本"
-```
-
-4. 在代码中使用：
-```rust
-let text = t!("new_key").to_string();
-```
+- 原始项目: [keyroost](https://github.com/framefilter/keyroost)
+- 作者: framefilter
 
 ## 许可证
 
-与原项目相同：Apache-2.0 / MIT 双许可
-
----
-
-*基于 framefilter/keyroost v0.7.6，由 Mimo V2.5 与人工审查完成中文本地化*
+MIT License
